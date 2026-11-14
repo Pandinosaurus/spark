@@ -42,8 +42,9 @@ class ReplaceNullWithFalseInPredicateSuite extends PlanTest {
   }
 
   private val testRelation =
-    LocalRelation('i.int, 'b.boolean, 'a.array(IntegerType), 'm.map(IntegerType, IntegerType))
-  private val anotherTestRelation = LocalRelation('d.int)
+    LocalRelation($"i".int, $"b".boolean, $"a".array(IntegerType),
+      Symbol("m").map(IntegerType, IntegerType))
+  private val anotherTestRelation = LocalRelation($"d".int)
 
   test("replace null inside filter and join conditions") {
     testFilter(originalCond = Literal(null, BooleanType), expectedCond = FalseLiteral)
@@ -54,10 +55,13 @@ class ReplaceNullWithFalseInPredicateSuite extends PlanTest {
   }
 
   test("Not expected type - replaceNullWithFalse") {
-    val e = intercept[AnalysisException] {
-      testFilter(originalCond = Literal(null, IntegerType), expectedCond = FalseLiteral)
-    }.getMessage
-    assert(e.contains("'CAST(NULL AS INT)' of type int is not a boolean"))
+    checkError(
+      exception = intercept[AnalysisException] {
+        testFilter(originalCond = Literal(null, IntegerType), expectedCond = FalseLiteral)
+      },
+      condition = "DATATYPE_MISMATCH.FILTER_NOT_BOOLEAN",
+      parameters = Map("sqlExpr" -> "\"NULL\"", "filter" -> "\"NULL\"", "type" -> "\"INT\"")
+    )
   }
 
   test("replace null in branches of If") {
@@ -367,33 +371,33 @@ class ReplaceNullWithFalseInPredicateSuite extends PlanTest {
   private def lv(s: Symbol) = UnresolvedNamedLambdaVariable(Seq(s.name))
 
   test("replace nulls in lambda function of ArrayFilter") {
-    testHigherOrderFunc('a, ArrayFilter, Seq(lv('e)))
+    testHigherOrderFunc($"a", ArrayFilter, Seq(lv(Symbol("e"))))
   }
 
   test("replace nulls in lambda function of ArrayExists") {
     withSQLConf(SQLConf.LEGACY_ARRAY_EXISTS_FOLLOWS_THREE_VALUED_LOGIC.key -> "true") {
-      val lambdaArgs = Seq(lv('e))
+      val lambdaArgs = Seq(lv(Symbol("e")))
       val cond = GreaterThan(lambdaArgs.last, Literal(0))
       val lambda = LambdaFunction(
         function = If(cond, Literal(null, BooleanType), TrueLiteral),
         arguments = lambdaArgs)
-      val expr = ArrayExists('a, lambda)
+      val expr = ArrayExists($"a", lambda)
       testProjection(originalExpr = expr, expectedExpr = expr)
     }
     withSQLConf(SQLConf.LEGACY_ARRAY_EXISTS_FOLLOWS_THREE_VALUED_LOGIC.key -> "false") {
-      testHigherOrderFunc('a, ArrayExists.apply, Seq(lv('e)))
+      testHigherOrderFunc($"a", ArrayExists.apply, Seq(lv(Symbol("e"))))
     }
   }
 
   test("replace nulls in lambda function of MapFilter") {
-    testHigherOrderFunc('m, MapFilter, Seq(lv('k), lv('v)))
+    testHigherOrderFunc($"m", MapFilter, Seq(lv(Symbol("k")), lv(Symbol("v"))))
   }
 
   test("inability to replace nulls in arbitrary higher-order function") {
     val lambdaFunc = LambdaFunction(
-      function = If(lv('e) > 0, Literal(null, BooleanType), TrueLiteral),
-      arguments = Seq[NamedExpression](lv('e)))
-    val column = ArrayTransform('a, lambdaFunc)
+      function = If(lv(Symbol("e")) > 0, Literal(null, BooleanType), TrueLiteral),
+      arguments = Seq[NamedExpression](lv(Symbol("e"))))
+    val column = ArrayTransform($"a", lambdaFunc)
     testProjection(originalExpr = column, expectedExpr = column)
   }
 
@@ -448,6 +452,49 @@ class ReplaceNullWithFalseInPredicateSuite extends PlanTest {
     }
   }
 
+  test("rewrite match-all LIKE pattern to IsNotNull in predicate positions") {
+    val rel = LocalRelation($"s".string, $"i".int)
+    val right = LocalRelation($"d".int)
+
+    // A pattern of only `%` matches every non-null value, so in a predicate it is IsNotNull.
+    Seq("%", "%%", "%%%").foreach { p =>
+      comparePlans(
+        Optimize.execute(rel.where($"s".like(p)).analyze),
+        rel.where($"s".isNotNull).analyze)
+    }
+
+    // Through null-preserving operators (And/Or) and in a join condition.
+    comparePlans(
+      Optimize.execute(rel.where(($"i" > 1) && $"s".like("%")).analyze),
+      rel.where(($"i" > 1) && $"s".isNotNull).analyze)
+    comparePlans(
+      Optimize.execute(rel.where(($"i" > 1) || $"s".like("%")).analyze),
+      rel.where(($"i" > 1) || $"s".isNotNull).analyze)
+    comparePlans(
+      Optimize.execute(rel.join(right, Inner, Some($"s".like("%"))).analyze),
+      rel.join(right, Inner, Some($"s".isNotNull)).analyze)
+  }
+
+  test("do not rewrite LIKE when not a match-all pattern or not a predicate position") {
+    val rel = LocalRelation($"s".string, $"i".int)
+
+    // Not match-all: a prefix, the empty pattern, and `%` escaped to a literal.
+    Seq(rel.where($"s".like("a%")),
+        rel.where($"s".like("")),
+        rel.where($"s".like("%%", '%'))).foreach { p =>
+      val analyzed = p.analyze
+      comparePlans(Optimize.execute(analyzed), analyzed)
+    }
+
+    // `Not` flips null semantics, so the match-all LIKE under it must be left intact.
+    val notPlan = rel.where(Not($"s".like("%"))).analyze
+    comparePlans(Optimize.execute(notPlan), notPlan)
+
+    // A projection is not a null-rejecting position: null vs false would be observable.
+    val projPlan = rel.select($"s".like("%").as("f")).analyze
+    comparePlans(Optimize.execute(projPlan), projPlan)
+  }
+
   private def testFilter(originalCond: Expression, expectedCond: Expression): Unit = {
     test((rel, exp) => rel.where(exp), originalCond, expectedCond)
   }
@@ -461,7 +508,7 @@ class ReplaceNullWithFalseInPredicateSuite extends PlanTest {
   }
 
   private def testDelete(originalCond: Expression, expectedCond: Expression): Unit = {
-    test((rel, expr) => DeleteFromTable(rel, Some(expr)), originalCond, expectedCond)
+    test((rel, expr) => DeleteFromTable(rel, expr), originalCond, expectedCond)
   }
 
   private def testUpdate(originalCond: Expression, expectedCond: Expression): Unit = {
@@ -471,18 +518,33 @@ class ReplaceNullWithFalseInPredicateSuite extends PlanTest {
   private def testMerge(originalCond: Expression, expectedCond: Expression): Unit = {
     val func = (target: LogicalPlan, source: LogicalPlan, expr: Expression) => {
       val matchedAssignments = Seq(
-        Assignment('i, 'i),
-        Assignment('b, 'b),
-        Assignment('a, 'a),
-        Assignment('m, 'm)
+        Assignment($"i", $"i"),
+        Assignment($"b", $"b"),
+        Assignment($"a", $"a"),
+        Assignment($"m", $"m")
       )
       val notMatchedAssignments = Seq(
-        Assignment('i, 'd)
+        Assignment($"i", $"d")
+      )
+      val notMatchedBySourceAssignments = Seq(
+        Assignment($"i", $"i"),
+        Assignment($"b", $"b"),
+        Assignment($"a", $"a"),
+        Assignment($"m", $"m")
       )
       val matchedActions = UpdateAction(Some(expr), matchedAssignments) ::
         DeleteAction(Some(expr)) :: Nil
       val notMatchedActions = InsertAction(None, notMatchedAssignments) :: Nil
-      MergeIntoTable(target, source, mergeCondition = expr, matchedActions, notMatchedActions)
+      val notMatchedBySourceActions = UpdateAction(Some(expr), matchedAssignments) ::
+        DeleteAction(Some(expr)) :: Nil
+      MergeIntoTable(
+        target,
+        source,
+        mergeCondition = expr,
+        matchedActions,
+        notMatchedActions,
+        notMatchedBySourceActions,
+        withSchemaEvolution = false)
     }
     val originalPlan = func(testRelation, anotherTestRelation, originalCond).analyze
     val optimizedPlan = Optimize.execute(originalPlan)
@@ -496,9 +558,16 @@ class ReplaceNullWithFalseInPredicateSuite extends PlanTest {
       // Between source and target only one should have i and b as those are used for
       // test expressions and both, source and target, having those columns is ambiguous  .
       // However, the source must have all the columns present in target for star resolution.
-      val source = LocalRelation('i.int, 'b.boolean, 'a.array(IntegerType))
-      val target = LocalRelation('a.array(IntegerType))
-      MergeIntoTable(target, source, mergeCondition = expr, matchedActions, notMatchedActions)
+      val source = LocalRelation($"i".int, $"b".boolean, $"a".array(IntegerType))
+      val target = LocalRelation($"a".array(IntegerType))
+      MergeIntoTable(
+        target,
+        source,
+        mergeCondition = expr,
+        matchedActions,
+        notMatchedActions,
+        notMatchedBySourceActions = Seq.empty,
+        withSchemaEvolution = false)
     }
     val originalPlanWithStar = mergePlanWithStar(originalCond).analyze
     val optimizedPlanWithStar = Optimize.execute(originalPlanWithStar)
@@ -521,8 +590,8 @@ class ReplaceNullWithFalseInPredicateSuite extends PlanTest {
       function = !(cond <=> TrueLiteral),
       arguments = lambdaArgs)
     testProjection(
-      originalExpr = createExpr(argument, lambda1) as 'x,
-      expectedExpr = createExpr(argument, lambda2) as 'x)
+      originalExpr = createExpr(argument, lambda1) as "x",
+      expectedExpr = createExpr(argument, lambda2) as "x")
   }
 
   private def test(

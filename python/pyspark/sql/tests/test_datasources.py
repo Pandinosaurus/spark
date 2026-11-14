@@ -15,15 +15,19 @@
 # limitations under the License.
 #
 
+import os
 import shutil
 import tempfile
+import uuid
 
+from pyspark.errors import PySparkNotImplementedError
 from pyspark.sql import Row
-from pyspark.sql.types import IntegerType, StructField, StructType, LongType, StringType
+from pyspark.sql.datasource import DataSource, InputPartition
+from pyspark.sql.types import IntegerType, LongType, StringType, StructField, StructType
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 
 
-class DataSourcesTests(ReusedSQLTestCase):
+class DataSourcesTestsMixin:
     def test_linesep_text(self):
         df = self.spark.read.text("python/test_support/sql/ages_newlines.csv", lineSep=",")
         expected = [
@@ -89,6 +93,42 @@ class DataSourcesTests(ReusedSQLTestCase):
         finally:
             shutil.rmtree(tpath)
 
+    def test_json_with_dataframe_input(self):
+        json_df = self.spark.createDataFrame(
+            [('{"name": "Alice", "age": 25}',), ('{"name": "Bob", "age": 30}',)],
+            schema="value STRING",
+        )
+        result = self.spark.read.json(json_df)
+        expected = [Row(age=25, name="Alice"), Row(age=30, name="Bob")]
+        self.assertEqual(sorted(result.collect(), key=lambda r: r.name), expected)
+
+    def test_json_with_dataframe_input_and_schema(self):
+        json_df = self.spark.createDataFrame(
+            [('{"name": "Alice", "age": 25}',), ('{"name": "Bob", "age": 30}',)],
+            schema="value STRING",
+        )
+        result = self.spark.read.json(json_df, schema="name STRING, age INT")
+        expected = [Row(name="Alice", age=25), Row(name="Bob", age=30)]
+        self.assertEqual(sorted(result.collect(), key=lambda r: r.name), expected)
+
+    def test_json_with_dataframe_input_non_string_column(self):
+        int_df = self.spark.createDataFrame([(1,), (2,)], schema="value INT")
+        with self.assertRaisesRegex(Exception, "DATAFRAME_INPUT_NOT_STRING_TYPE"):
+            self.spark.read.json(int_df).collect()
+
+    def test_json_with_dataframe_input_multiple_columns(self):
+        multi_df = self.spark.createDataFrame(
+            [('{"name": "Alice"}', "extra"), ('{"name": "Bob"}', "extra")],
+            schema="value STRING, other STRING",
+        )
+        with self.assertRaisesRegex(Exception, "DATAFRAME_INPUT_NOT_SINGLE_COLUMN"):
+            self.spark.read.json(multi_df).collect()
+
+    def test_json_with_dataframe_input_zero_columns(self):
+        empty_schema_df = self.spark.range(1).select()
+        with self.assertRaisesRegex(Exception, "DATAFRAME_INPUT_NOT_SINGLE_COLUMN"):
+            self.spark.read.json(empty_schema_df).collect()
+
     def test_multiline_csv(self):
         ages_newlines = self.spark.read.csv(
             "python/test_support/sql/ages_newlines.csv", multiLine=True
@@ -111,6 +151,137 @@ class DataSourcesTests(ReusedSQLTestCase):
         readback = self.spark.read.text(tmpPath)
         self.assertEqual(readback.collect(), expected)
         shutil.rmtree(tmpPath)
+
+    def test_csv_with_dataframe_input(self):
+        csv_df = self.spark.createDataFrame(
+            [("Alice,25",), ("Bob,30",)],
+            schema="value STRING",
+        )
+        result = self.spark.read.csv(csv_df)
+        expected = [Row(_c0="Alice", _c1="25"), Row(_c0="Bob", _c1="30")]
+        self.assertEqual(sorted(result.collect(), key=lambda r: r._c0), expected)
+
+    def test_csv_with_dataframe_input_and_schema(self):
+        csv_df = self.spark.createDataFrame(
+            [("Alice,25",), ("Bob,30",)],
+            schema="value STRING",
+        )
+        result = self.spark.read.csv(csv_df, schema="name STRING, age INT")
+        expected = [Row(name="Alice", age=25), Row(name="Bob", age=30)]
+        self.assertEqual(sorted(result.collect(), key=lambda r: r.name), expected)
+
+    def test_csv_with_dataframe_input_non_string_column(self):
+        int_df = self.spark.createDataFrame([(1,), (2,)], schema="value INT")
+        with self.assertRaisesRegex(Exception, "DATAFRAME_INPUT_NOT_STRING_TYPE"):
+            self.spark.read.csv(int_df).collect()
+
+    def test_csv_with_dataframe_input_multiple_columns(self):
+        multi_df = self.spark.createDataFrame(
+            [("Alice,25", "extra"), ("Bob,30", "extra")],
+            schema="value STRING, other STRING",
+        )
+        with self.assertRaisesRegex(Exception, "DATAFRAME_INPUT_NOT_SINGLE_COLUMN"):
+            self.spark.read.csv(multi_df).collect()
+
+    def test_csv_with_dataframe_input_zero_columns(self):
+        empty_schema_df = self.spark.range(1).select()
+        with self.assertRaisesRegex(Exception, "DATAFRAME_INPUT_NOT_SINGLE_COLUMN"):
+            self.spark.read.csv(empty_schema_df).collect()
+
+    def test_xml(self):
+        tmpPath = tempfile.mkdtemp()
+        shutil.rmtree(tmpPath)
+        xsdPath = tempfile.mkdtemp()
+        xsdString = """<?xml version="1.0" encoding="UTF-8" ?>
+          <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="person">
+              <xs:complexType>
+                <xs:sequence>
+                  <xs:element name="name" type="xs:string" />
+                  <xs:element name="age" type="xs:long" />
+                </xs:sequence>
+              </xs:complexType>
+            </xs:element>
+          </xs:schema>"""
+        try:
+            with open(os.path.join(xsdPath, "people.xsd"), "w") as f:
+                _ = f.write(xsdString)
+            df = self.spark.createDataFrame([("Hyukjin", 100), ("Aria", 101), ("Arin", 102)]).toDF(
+                "name", "age"
+            )
+            df.write.xml(tmpPath, rootTag="people", rowTag="person")
+            people = self.spark.read.xml(
+                tmpPath, rowTag="person", rowValidationXSDPath=os.path.join(xsdPath, "people.xsd")
+            )
+            expected = [
+                Row(age=100, name="Hyukjin"),
+                Row(age=101, name="Aria"),
+                Row(age=102, name="Arin"),
+            ]
+            self.assertEqual(people.sort("age").collect(), expected)
+            self.assertEqual(
+                people.schema,
+                StructType(
+                    [StructField("age", LongType(), True), StructField("name", StringType(), True)]
+                ),
+            )
+        finally:
+            shutil.rmtree(tmpPath)
+            shutil.rmtree(xsdPath)
+
+    def test_xml_sampling_ratio(self):
+        rdd = self.spark.sparkContext.range(0, 100, 1, 1).map(
+            lambda x: "<p><a>0.1</a></p>" if x == 1 else "<p><a>%s</a></p>" % str(x)
+        )
+        schema = self.spark.read.option("samplingRatio", 0.5).xml(rdd).schema
+        self.assertEqual(schema, StructType([StructField("a", LongType(), True)]))
+
+    def test_xml_with_dataframe_input(self):
+        xml_df = self.spark.createDataFrame(
+            [
+                ("<person><name>Alice</name><age>25</age></person>",),
+                ("<person><name>Bob</name><age>30</age></person>",),
+            ],
+            schema="value STRING",
+        )
+        result = self.spark.read.option("rowTag", "person").xml(xml_df)
+        expected = [Row(age=25, name="Alice"), Row(age=30, name="Bob")]
+        self.assertEqual(sorted(result.collect(), key=lambda r: r.name), expected)
+
+    def test_xml_with_dataframe_input_and_schema(self):
+        xml_df = self.spark.createDataFrame(
+            [
+                ("<person><name>Alice</name><age>25</age></person>",),
+                ("<person><name>Bob</name><age>30</age></person>",),
+            ],
+            schema="value STRING",
+        )
+        result = self.spark.read.option("rowTag", "person").xml(
+            xml_df, schema="name STRING, age INT"
+        )
+        expected = [Row(name="Alice", age=25), Row(name="Bob", age=30)]
+        self.assertEqual(sorted(result.collect(), key=lambda r: r.name), expected)
+
+    def test_xml_with_dataframe_input_non_string_column(self):
+        int_df = self.spark.createDataFrame([(1,), (2,)], schema="value INT")
+        with self.assertRaisesRegex(Exception, "DATAFRAME_INPUT_NOT_STRING_TYPE"):
+            self.spark.read.option("rowTag", "person").xml(int_df).collect()
+
+    def test_xml_with_dataframe_input_multiple_columns(self):
+        multi_df = self.spark.createDataFrame(
+            [
+                ("<person><name>Alice</name></person>", "extra"),
+                ("<person><name>Bob</name></person>", "extra"),
+            ],
+            schema="value STRING, other STRING",
+        )
+        with self.assertRaisesRegex(Exception, "DATAFRAME_INPUT_NOT_SINGLE_COLUMN"):
+            self.spark.read.option("rowTag", "person").xml(multi_df).collect()
+
+    def test_xml_with_dataframe_input_zero_columns(self):
+        empty_schema_df = self.spark.range(1).select()
+        with self.assertRaisesRegex(Exception, "DATAFRAME_INPUT_NOT_SINGLE_COLUMN"):
+            self.spark.read.option("rowTag", "person").xml(empty_schema_df).collect()
 
     def test_read_multiple_orc_file(self):
         df = self.spark.read.orc(
@@ -160,6 +331,7 @@ class DataSourcesTests(ReusedSQLTestCase):
             )
             df = (
                 self.spark.read.option("header", "true")
+                .option("quote", None)
                 .schema(schema)
                 .csv(path, enforceSchema=False)
             )
@@ -192,15 +364,101 @@ class DataSourcesTests(ReusedSQLTestCase):
         finally:
             shutil.rmtree(path)
 
+    def test_jdbc(self):
+        db = f"memory:{uuid.uuid4()}"
+        url = f"jdbc:derby:{db}"
+        dbtable = "test_table"
+
+        try:
+            df = self.spark.range(10)
+            df.write.jdbc(url=f"{url};create=true", table=dbtable)
+
+            readback = self.spark.read.jdbc(url=url, table=dbtable)
+            self.assertEqual(sorted(df.collect()), sorted(readback.collect()))
+
+            additional_arguments = dict(column="id", lowerBound=3, upperBound=8, numPartitions=10)
+            readback = self.spark.read.jdbc(url=url, table=dbtable, **additional_arguments)
+            self.assertEqual(sorted(df.collect()), sorted(readback.collect()))
+
+            additional_arguments = dict(predicates=['"id" < 5'])
+            readback = self.spark.read.jdbc(url=url, table=dbtable, **additional_arguments)
+            self.assertEqual(sorted(df.filter("id < 5").collect()), sorted(readback.collect()))
+        finally:
+            # Clean up.
+            with self.assertRaisesRegex(Exception, f"Database '{db}' dropped."):
+                self.spark.read.jdbc(url=f"{url};drop=true", table=dbtable).collect()
+
+    def test_jdbc_format(self):
+        db = f"memory:{uuid.uuid4()}"
+        url = f"jdbc:derby:{db}"
+        dbtable = "test_table"
+
+        try:
+            df = self.spark.range(10)
+            df.write.format("jdbc").options(url=f"{url};create=true", dbtable=dbtable).save()
+            readback = self.spark.read.format("jdbc").options(url=url, dbtable=dbtable).load()
+            self.assertEqual(sorted(df.collect()), sorted(readback.collect()))
+        finally:
+            # Clean up.
+            with self.assertRaisesRegex(Exception, f"Database '{db}' dropped."):
+                self.spark.read.format("jdbc").options(
+                    url=f"{url};drop=true", dbtable=dbtable
+                ).load().collect()
+
+    def test_custom_data_source(self):
+        class MyCustomDataSource(DataSource):
+            pass
+
+        custom_data_source = MyCustomDataSource(options={"path": "/path/to/custom/data"})
+
+        with self.assertRaises(PySparkNotImplementedError) as pe:
+            custom_data_source.schema()
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="NOT_IMPLEMENTED",
+            messageParameters={"feature": "schema"},
+        )
+
+        with self.assertRaises(PySparkNotImplementedError) as pe:
+            custom_data_source.reader(schema=None)
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="NOT_IMPLEMENTED",
+            messageParameters={"feature": "reader"},
+        )
+
+        with self.assertRaises(PySparkNotImplementedError) as pe:
+            custom_data_source.writer(schema=None, overwrite=False)
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="NOT_IMPLEMENTED",
+            messageParameters={"feature": "writer"},
+        )
+
+    def test_input_partition(self):
+        partition = InputPartition(1)
+        expected_repr = "InputPartition(value=1)"
+        actual_repr = repr(partition)
+        self.assertEqual(expected_repr, actual_repr)
+
+        class RangeInputPartition(InputPartition):
+            def __init__(self, start, end):
+                super().__init__((start, end))
+
+        partition = RangeInputPartition(1, 3)
+        expected_repr = "RangeInputPartition(value=(1, 3))"
+        actual_repr = repr(partition)
+        self.assertEqual(expected_repr, actual_repr)
+
+
+class DataSourcesTests(DataSourcesTestsMixin, ReusedSQLTestCase):
+    pass
+
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.sql.tests.test_datasources import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -24,6 +24,7 @@ import org.apache.hadoop.fs.permission.{AclEntry, AclEntryScope, AclEntryType, F
 
 import org.apache.spark.sql.{AnalysisException, Row}
 import org.apache.spark.sql.catalyst.{QualifiedTableName, TableIdentifier}
+import org.apache.spark.sql.connector.catalog.CatalogManager
 import org.apache.spark.sql.execution.command
 import org.apache.spark.sql.execution.command.FakeLocalFsFileSystem
 import org.apache.spark.sql.internal.SQLConf
@@ -84,7 +85,7 @@ trait TruncateTableSuiteBase extends command.TruncateTableSuiteBase {
           }
           val aclEntries = fs.getAclStatus(tablePath).getEntries()
           if (ignore) {
-            assert(aclEntries.size() == 0)
+            assert(aclEntries.isEmpty)
           } else {
             assert(aclEntries.size() == 4)
             assert(aclEntries.get(0) == customAcl.get(0))
@@ -146,7 +147,8 @@ trait TruncateTableSuiteBase extends command.TruncateTableSuiteBase {
           spark.table(t)
 
           val catalog = spark.sessionState.catalog
-          val qualifiedTableName = QualifiedTableName("ns", "tbl")
+          val qualifiedTableName =
+            QualifiedTableName(CatalogManager.SESSION_CATALOG_NAME, "ns", "tbl")
           val cachedPlan = catalog.getCachedTable(qualifiedTableName)
           assert(cachedPlan.stats.sizeInBytes == 0)
         }
@@ -195,10 +197,13 @@ class TruncateTableSuite extends TruncateTableSuiteBase with CommandSuiteBase {
       withNamespaceAndTable("ns", "tbl") { t =>
         (("a", "b") :: Nil).toDF().write.parquet(tempDir.getCanonicalPath)
         sql(s"CREATE TABLE $t $defaultUsing LOCATION '${tempDir.toURI}'")
-        val errMsg = intercept[AnalysisException] {
-          sql(s"TRUNCATE TABLE $t")
-        }.getMessage
-        assert(errMsg.contains("Operation not allowed: TRUNCATE TABLE on external tables"))
+        checkError(
+          exception = intercept[AnalysisException] {
+            sql(s"TRUNCATE TABLE $t")
+          },
+          condition = "CANNOT_TRUNCATE_EXTERNAL_TABLE",
+          parameters = Map("tableName" -> "`spark_catalog`.`ns`.`tbl`")
+        )
       }
     }
   }

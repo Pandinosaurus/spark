@@ -22,16 +22,248 @@ license: |
 * Table of contents
 {:toc}
 
+## Upgrading from Spark SQL 4.4 to 5.0
+
+- Since Spark 5.0, the Spark Thrift Server refuses to start when `hive.server2.enable.doAs` is `true` and `hive.server2.authentication` verifies user identities (any recognized type other than `NONE`/`NOSASL`). It impersonates the connecting user for Hive metastore calls and driver-side file system access, but executor-side data access still runs as the server's own service identity, so storage-level permissions are checked against the service principal rather than the connecting user (SPARK-5159). Spark 4.4 logs a warning for the same configuration. To restore the previous behavior, set `spark.sql.hive.thriftServer.allowIneffectiveDoAs` to `true`. Setting `hive.server2.enable.doAs` to `false` also starts the server, but note that it stops impersonating metastore calls as well, so it is not a no-op.
+- Since Spark 5.0, Spark requires Java 21 or later. Users who ran Spark 4.x on Java 17 can see two differences that come from Java. The datetime pattern letter `F` is the aligned week of month instead of the aligned day of week in month (JDK-8282081). For example, `date_format(date '2019-12-31', 'F')` returns `5` instead of `3`. Converting a `FLOAT` or `DOUBLE` value to a string gives the shortest decimal that represents the value (JDK-4511638). For example, `CAST(CAST(4567890123456789 AS FLOAT) AS STRING)` returns `4.56789E15` instead of `4.5678899E15`. A cast from `FLOAT` or `DOUBLE` to `DECIMAL` goes through this string, so its result can change as well. For example, `CAST(1.0751133388005187E17D AS DECIMAL(38, 0))` returns `107511333880051870` instead of `107511333880051872`.
+
+## Upgrading from Spark SQL 4.3 to 4.4
+
+- Since Spark 4.4, when `spark.sql.cbo.enabled` is `true`, the optimizer estimates plans over analyzed `CHAR` columns from their column statistics, as it does for `STRING` columns. Since Spark 3.4, read-side `CHAR` padding (`spark.sql.readSideCharPadding`, `true` by default) hid these statistics, so, for example, a filter on a `CHAR` partition column was estimated to keep every row. The estimate assumes evenly distributed values, so for a skewed partition it can now be smaller than the data, and the pruned relation can become small enough to be broadcast. This also applies to partition pruning when only `spark.sql.cbo.planStats.enabled` is `true`. None of this applies yet when `spark.sql.charVarchar.standardSemantics.enabled` is `true`, under which `CHAR` columns keep their previous estimates.
+- Since Spark 4.4, a predicate evaluated through generated code outside of whole-stage codegen, such as a filter condition with whole-stage codegen disabled or a join condition, evaluates a subexpression common to its top-level conjuncts, whether several of them share it or one of them repeats it, just before the first conjunct that references it, instead of before the whole condition. So a `FALSE` conjunct before them stops the evaluation, as `AND` does when evaluated directly, and an error the subexpression raises on the row, such as `ARITHMETIC_OVERFLOW` in ANSI mode, is no longer raised. For example, `SELECT a FROM t WHERE b < 0 AND y + 1 > 0 AND y + 1 > -1` no longer fails on a row where `b` is `1` and `y` is `2147483647`. A subexpression whose first occurrence is in a conditional branch of a conjunct, such as a branch of `CASE WHEN`, is still evaluated before that conjunct.
+- Since Spark 4.4, `make_timestamp`, `make_timestamp_ltz` and `make_timestamp_ntz` return `NULL` for a seconds value above 2147.483647 or below -2147.483648, or raise `DATETIME_FIELD_OUT_OF_BOUNDS` when `spark.sql.ansi.enabled` is `true`, as they do for other out-of-range seconds such as 61; `try_make_timestamp`, `try_make_timestamp_ltz` and `try_make_timestamp_ntz` return `NULL`. Previously, such a value wrapped around modulo 2^32 microseconds and could return a wrong timestamp, for example `make_timestamp_ntz(2020, 1, 1, 0, 0, 4324.967296)` returned `2020-01-01 00:00:30`.
+- Since Spark 4.4, dividing an ANSI interval by a number raises `INTERVAL_ARITHMETIC_OVERFLOW.WITH_SUGGESTION` (SQLSTATE 22015) whenever the result does not fit the interval type, in every evaluation mode. Previously, dividing the minimum year-month or day-time interval by `-1` raised `ARITHMETIC_OVERFLOW` (SQLSTATE 22003) in generated code, and dividing an interval by a decimal or a floating-point number whose quotient, once rounded, does not fit the type, or is infinite, raised a `java.lang.ArithmeticException` without an error condition.
+- Since Spark 4.4, when a file source reads a partition column with a user-specified `DECIMAL` type from directory names, it converts each value to the precision and scale of that type, rounding half up as `CAST` does. Previously, the vectorized Parquet and ORC readers applied the declared scale to the digits in the directory name without an error, for example `d=1.5` read as `DECIMAL(10,2)` returned `0.15`. Data derived from affected query results may need to be recomputed. A value that does not fit the declared precision now fails with `INVALID_PARTITION_VALUE` regardless of `spark.sql.ansi.enabled`. Previously, those readers returned a wrong value and the other readers returned `NULL`. To get `NULL` for such a value, set `spark.sql.sources.validatePartitionColumns` to `false`. Partitions tracked in the catalog are not affected.
+- Since Spark 4.4, when a file source reads a partition column with a user-specified `TINYINT` or `SMALLINT` type from directory names, a value out of the range of that type fails with `INVALID_PARTITION_VALUE` regardless of `spark.sql.ansi.enabled`, as it does for `INT`. Previously, the value wrapped around without an error, for example `b=300` read as `TINYINT` returned `44`. Data derived from affected query results may need to be recomputed. To get `NULL` for such a value, set `spark.sql.sources.validatePartitionColumns` to `false`. Reading partitions tracked in the catalog is not affected, but writing to a table whose catalog tracks such a partition, for example one added by `MSCK REPAIR TABLE`, can now fail with `NumberFormatException` unless `spark.sql.sources.validatePartitionColumns` is `false`.
+- Since Spark 4.4, a cast from `DECIMAL(19, 0)` to `BIGINT` is no longer treated as an up-cast because it can overflow. Previously, the optimizer could remove such a cast or unwrap it in a comparison, so a query returned a wrong result for a value out of the range of `BIGINT` instead of failing with `CAST_OVERFLOW`, or instead of using the wrapped-around value when `spark.sql.ansi.enabled` is `false`. For example, for a `DECIMAL(19, 0)` column `d` with the value `9999999999999999999`, `try_cast(d AS BIGINT) IS NOT NULL` returned `true` and `CAST(CAST(d AS BIGINT) AS DOUBLE)` returned `1.0E19`. Data derived from affected query results may need to be recomputed. Also, the checks that allow only up-casts now reject `DECIMAL(19, 0)` for `BIGINT` as they do for `DECIMAL(20, 0)`. For example, `Dataset.as[Long]` fails with `CANNOT_UP_CAST_DATATYPE` on a `DECIMAL(19, 0)` column, such as an Oracle `NUMBER(19)` column that the JDBC data source reads as `DECIMAL(19, 0)`, or the result of `sum` over a `DECIMAL(9, 0)` column. With Spark Connect, the Scala client instead fails when it reads the result, with `Reading 'LongType' values from a class org.apache.arrow.vector.DecimalVector instance is not supported.` The `STRICT` store assignment policy fails with `INCOMPATIBLE_DATA_FOR_TABLE.CANNOT_SAFELY_CAST`. To keep converting such values, cast them to `BIGINT` explicitly.
+- Since Spark 4.4, `size` and `cardinality` of a map built by `map(...)` return the number of entries of the built map. Previously, the optimizer could return the number of key-value pairs instead, for example `size(map(1, 'a', 1, 'b'))` returned `2` instead of `1` when `spark.sql.mapKeyDedupPolicy` is `LAST_WIN`. Data derived from affected query results may need to be recomputed. Under the default `EXCEPTION` policy, such a query now fails with `DUPLICATED_MAP_KEY`, and a NULL key fails with `NULL_MAP_KEY`, as building the map does. This also applies to a map inside `array(...)`, for example `size(array(map(k, 1)))`.
+- Since Spark 4.4, when `spark.sql.ansi.enabled` is `false`, `size` and `cardinality` of an array built by `array(...)` evaluate the LEGACY casts in it that can fail, such as a cast from an interval to `TINYINT`, from a string to an interval, or, when `spark.sql.preserveCharVarcharTypeInfo` or `spark.sql.charVarchar.standardSemantics.enabled` is `true`, to `VARCHAR(n)`. Previously, the optimizer could return the number of elements without evaluating such a cast. For example, for an `INTERVAL SECOND` column `i` with the value `INTERVAL '1000' SECOND`, `size(array(CAST(i AS TINYINT)))` returned `1` instead of failing with `CAST_OVERFLOW`, and `try_add(DATE'2020-01-01', size(array(CAST(i AS TINYINT))))` returned `2020-01-02` instead of `NULL`. Data derived from affected query results may need to be recomputed.
+- Since Spark 4.4, Data Source V2 file scans correctly evaluate deterministic Python UDF filter predicates that reference only partition columns. Previously, these predicates could be dropped, returning rows that did not satisfy the filter (SPARK-60486). Data derived from affected query results may need to be recomputed.
+- Since Spark 4.4, when a file source reads a partition column with a user-specified datetime type such as `DATE` or `TIMESTAMP` from directory names, a value that cannot be cast to that type fails with `INVALID_PARTITION_VALUE` regardless of `spark.sql.ansi.enabled`. Previously, such a value became `NULL` when `spark.sql.ansi.enabled` was `false`. When it was `true`, a `TIMESTAMP_NTZ` value with a valid date and an invalid time, such as `2020-01-01 25:00:00`, became the start of that day. To get `NULL` for such a value, set `spark.sql.sources.validatePartitionColumns` to `false`. Partitions tracked in the catalog are not affected.
+- Since Spark 4.4, quoted Variant path keys decode `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, `\uXXXX` (including valid surrogate pairs), and escapes of the enclosing quote (`\'` or `\"`). Previously, backslashes were literal, so existing paths can match different keys or become invalid. For example, use `$['a\\']` instead of `$['a\']`. Unknown escapes and unpaired surrogate escapes stay literal. Dot-notation keys are unchanged. To keep the old behavior, set `spark.sql.legacy.variantPathBackslashAsLiteral` to `true` before creating the query.
+- Since Spark 4.4, `variant_get` and `try_variant_get` with an explicitly collated target type, such as `'STRING COLLATE UTF8_LCASE'`, compare and combine their result using that collation, as a column of that type does. Previously the target collation was ignored, so `variant_get(v, '$.a', 'STRING COLLATE UTF8_LCASE') = 'abc'` was case-sensitive. Combining such a result with a string of a different implicit collation, such as a `STRING` column, now fails with `INDETERMINATE_COLLATION_IN_EXPRESSION` in a comparison or `IN`, and in `||`, `COALESCE` or `CASE` gives a result with indeterminate collation that fails when it is compared or stored, for example by `CREATE TABLE AS SELECT`; use a `COLLATE` clause to choose the collation. In a view or table with a `DEFAULT COLLATION`, a result with an explicit `'STRING COLLATE UTF8_BINARY'` target now uses UTF8_BINARY; previously it used the default collation. A stream-stream join on such a result with a non-binary collation, such as UTF8_LCASE, now fails with `STATE_STORE_UNSUPPORTED_OPERATION_BINARY_INEQUALITY`.
+- Since Spark 4.4, a write to a Data Source V2 table that parses the SQL text of a generation expression binds an unqualified built-in function name to `system.builtin`, regardless of the SQL path and `spark.sql.functionResolution.sessionOrder`. Previously, a temporary function or a function in the SQL path with the same name could shadow the built-in function, so that the write could silently store a value of an auto-filled generated column that does not match the generation expression, and it checked a provided value against that function (SPARK-60866). Rows that are already stored keep their values, and data derived from them may need to be recomputed.
+- Since Spark 4.4, `CREATE TABLE` and `REPLACE TABLE` on a Data Source V2 table fail with `UNSUPPORTED_EXPRESSION_GENERATED_COLUMN` when a generation expression calls a Data Source V2 scalar function that has a magic `invoke` method. Previously, they accepted such a call, and a write could resolve the function name in its own session, so that it stored another value or failed (SPARK-60866). To run these statements, change the expression to call only built-in functions. Existing generated columns that call such a function are not rejected.
+- Since Spark 4.4, an auto-filled generated column of a Data Source V2 table reads a column referenced in a lambda function, such as `i` in `transform(a, x -> x + i)`, or with `IDENTIFIER`, such as `IDENTIFIER('i')`, from the value stored in that column. Previously, it read the value of the query before the store assignment cast, so it could silently store a value that does not match the stored column, and a later write of that row failed with `CHECK_CONSTRAINT_VIOLATION` (SPARK-60817). Rows that are already stored keep their values, and data derived from them may need to be recomputed.
+- Since Spark 4.4, an auto-filled generated column of a Data Source V2 table reads a field of another column, such as `s.f`, from the value stored in that column. Previously, it read the value of the query before the store assignment cast, so it could silently store a value that does not match the stored column, and a later write of that row failed with `CHECK_CONSTRAINT_VIOLATION` (SPARK-60803). Rows that are already stored keep their values, and data derived from them may need to be recomputed.
+- Since Spark 4.4, `spark.addArtifact` and `spark.addArtifacts` take a file whose name ends with `.sparkpkg` as a [native data source package](sql-native-data-sources.html), also when it is added with `file=True`, `pyfile=True` or `archive=True` in Python without Spark Connect, or with `file=True` from a Spark Connect client, and fail with `INVALID_NATIVE_DATA_SOURCE_PACKAGE` for such a file that is not a valid package, or whose version Spark does not support, or that has no library for the platform of the driver. Previously, it was added as a file, a Python file or an archive, or ignored without a flag in Python without Spark Connect. To add such a file as before, rename it. To add it as a file of the session without the check, set the static configuration `spark.sql.dataSource.native.enabled` to `false`, which disables native data sources; in Python, it is then still not added as a Python file or an archive.
+- Since Spark 4.4, `vector_avg` avoids intermediate subtraction overflow when updating running averages for `ARRAY<FLOAT>` inputs. Extreme finite inputs that previously produced infinity or `NaN` during updates may now produce a finite average. An infinite running average combined with a finite value or an infinity of the same sign now produces infinity with that sign instead of `NaN`. Opposite infinities and `NaN` inputs continue to produce `NaN`.
+- Since Spark 4.4, `spark.sql.execution.arrow.pythonUDF.columnarInput.enabled` is `false` by default: Arrow-based Python UDFs read rows from an Arrow-backed upstream operator, such as a Data Source V2 scan or the Arrow cache, as before Spark 4.2. With columnar input, they kept the columns that they pass through until the results of their batch came back from Python, and failed or returned wrong results when the operator reused or released the vectors of the batch in the meantime. To enable columnar input again, set `spark.sql.execution.arrow.pythonUDF.columnarInput.enabled` to `true`. They then copy the columns that they pass through as rows, so that the results are correct for every operator.
+- Since Spark 4.4, the conversion of columnar batches to rows releases each batch with `ColumnVector.closeIfFreeable` once its rows are consumed also when it is not whole-stage code-generated, e.g. when the query has more than `spark.sql.codegen.maxFields` fields or `spark.sql.codegen.wholeStage` is `false`, as the generated code has done since Spark 3.5.4 and 4.0. A `ColumnVector` that a Data Source V2 source reuses across batches, such as an `ArrowColumnVector` over a `VectorSchemaRoot` that is refilled for every batch, must override `closeIfFreeable` to do nothing.
+- Since Spark 4.4, `spark.sql.charVarchar.standardSemantics.enabled` (default `false`) is a preview feature that may change in future releases. When true, it enables first-class `CHAR(n)` and `VARCHAR(n)` semantics throughout schemas and query plans: `CHAR` -> `VARCHAR` -> `STRING` form a type-precedence family, explicit casts can return constrained types, least-common-type resolution for `COALESCE`/`CASE`/`UNION` can return `CHAR` or `VARCHAR`, and string expressions that transform their input return `STRING`. Assignment and reads enforce the declared length, padding `CHAR` to `n` characters and raising `EXCEED_LIMIT_LENGTH` when non-space content does not fit. Comparing a CHAR column with a string literal no longer pads the literal, so `WHERE char_col = 'ab'` does not match a stored `'ab  '`. The default remains the Spark 3.1 table-schema overlay on `STRING`. This opt-in mode is preferred over the experimental `spark.sql.preserveCharVarcharTypeInfo`, which instead keeps constrained types through transforming expressions. See [Character String Types](sql-ref-character-string-types.html) for the preview semantics; the entries below note area-specific behavior that changed. Later CHAR/VARCHAR bullets that do not name `preserveCharVarcharTypeInfo` apply when the preview flag is true, except `from_avro` value assignment, which also runs when only `preserveCharVarcharTypeInfo` is true.
+- Since Spark 4.4, when `spark.sql.charVarchar.standardSemantics.enabled` is true, `from_json` length-checks JSON object names used as `MAP<CHAR(n), _>` or `MAP<VARCHAR(n), _>` keys without padding or trimming them. A `CHAR(n)` key must already be exactly `n` characters, and a `VARCHAR(n)` key must already be at most `n` characters; duplicate names are kept, exactly as for STRING keys, and `spark.sql.mapKeyDedupPolicy` is not applied. A key that fails the check makes the enclosing map a bad record: in `PERMISSIVE` mode the nearest enclosing struct field becomes `null` (its sibling fields are preserved), and if the map is inside an array or another map, that whole array or map becomes `null`; in `FAILFAST` mode parsing fails with `UNSUPPORTED_JSON_CHAR_VARCHAR_MAP_KEY` (SQLSTATE `0A000`) as the cause of `MALFORMED_RECORD_IN_PARSING`. The same parser-level check runs for any JSON scan whose reader schema carries a CHAR/VARCHAR map key, including catalog JSON tables, since under standard semantics those keys stay CHAR/VARCHAR all the way to the scan: an off-width key becomes a bad record there too, rather than being padded or raising `EXCEED_LIMIT_LENGTH`. Unlike `from_json`, keys that pass the check are then rebuilt read-side, so on the scan path `spark.sql.mapKeyDedupPolicy` does apply and a duplicate name can raise `DUPLICATED_MAP_KEY`. JSON file scans, including scans inside persisted views, read the flag from the executing session. The optimizer no longer folds `from_json(to_json(m))` to `m` when that schema has a CHAR/VARCHAR map key, so the length check still runs on the round trip.
+- Since Spark 4.4, `schema_of_json`, `schema_of_csv`, and `schema_of_xml` accept CHAR/VARCHAR document arguments when CHAR/VARCHAR are first-class. In Spark 4.3, with `spark.sql.preserveCharVarcharTypeInfo` on, they rejected those arguments because the child type was not STRING.
+- Since Spark 4.4, when `spark.sql.preserveCharVarcharTypeInfo` is true and `spark.sql.charVarchar.standardSemantics.enabled` is false, ORC reads that apply a CHAR/VARCHAR schema over STRING storage return the stored values without ORC truncation, matching Parquet. Previously the ORC reader requested `char(n)`/`varchar(n)` and truncated STRING-stored values to `n`. Read-side length checks (`EXCEED_LIMIT_LENGTH`) apply only when `spark.sql.charVarchar.standardSemantics.enabled` is true.
+- Since Spark 4.4, when `spark.sql.charVarchar.standardSemantics.enabled` is true, XML names used as `MAP<CHAR(n), _>` or `MAP<VARCHAR(n), _>` keys in `from_xml` and the XML datasource are length-checked without padding or trimming. The checked names are element names, `attributePrefix` plus attribute names (default prefix `_`), and the `valueTag` (default `_VALUE`) when mixed text is present. A `CHAR(n)` key must already be exactly `n` characters, and a `VARCHAR(n)` key must already be at most `n` characters. Mismatched keys fail with `UNSUPPORTED_XML_CHAR_VARCHAR_MAP_KEY` (SQLSTATE `0A000`) and follow the XML parse mode (`PERMISSIVE` or `FAILFAST`). Exact repeated names last-win; `spark.sql.mapKeyDedupPolicy` is not applied. XML CHAR/VARCHAR values use the same pad and `EXCEED_LIMIT_LENGTH` checks as other parsed text. Empty, attribute-only, and text-only map elements stay SQL NULL or a malformed record; they do not become an empty map or a `valueTag` entry. In Spark 4.3, `from_xml` and XML reader schemas rejected CHAR/VARCHAR with `UNSUPPORTED_CHAR_OR_VARCHAR_AS_STRING`, or replaced them with STRING when `spark.sql.legacy.charVarcharAsString` was true, so CHAR/VARCHAR map keys did not reach the parser. When the standard-semantics flag is false and `spark.sql.preserveCharVarcharTypeInfo` is true, short CHAR keys are padded and over-length CHAR or VARCHAR keys raise `EXCEED_LIMIT_LENGTH`.
+- Since Spark 4.4, when CHAR/VARCHAR are first-class (`spark.sql.charVarchar.standardSemantics.enabled` or `spark.sql.preserveCharVarcharTypeInfo`), `from_avro` assigns CHAR/VARCHAR on STRING values (pad, then trim-and-`EXCEED_LIMIT_LENGTH`; Avro ENUM symbols are not assigned). Avro map keys of CHAR/VARCHAR are length-checked without padding or trimming only when the preview flag is true, in `from_avro` and Avro file scans, matching JSON/XML object names; an off-width key fails with `UNSUPPORTED_AVRO_CHAR_VARCHAR_MAP_KEY` (SQLSTATE `0A000`). `from_avro` PERMISSIVE returns a struct with every field NULL (NULL for a non-struct schema); file scans do not wrap per-row PERMISSIVE around the error. `to_avro` does not pad or trim. Avro file scans still leave CHAR padding of STRING values to read-side CHAR padding rather than the deserializer.
+- Since Spark 4.4, Hive `TRANSFORM` / `MAP` / `REDUCE` with CHAR/VARCHAR `AS` types keeps script I/O as unbounded STRING and applies Spark assignment (CHAR padding and `EXCEED_LIMIT_LENGTH` on overflow) in a `Project` when `spark.sql.charVarchar.standardSemantics.enabled` or `spark.sql.preserveCharVarcharTypeInfo` is true. Previously, with only `spark.sql.preserveCharVarcharTypeInfo` set, scalar CHAR/VARCHAR output without a SerDe failed with an unsupported-type error, nested CHAR/VARCHAR output without a SerDe kept the declared type with no padding or length check, and Hive SerDe deserialized `char(n)`/`varchar(n)` with Hive truncation. When both configs are false, `AS (c CHAR(n))` remains STRING with no pad and no length check.
+- Since Spark 4.4, the options maps passed to `from_csv`, `to_csv`, `schema_of_csv`, `from_json`, `to_json`, `schema_of_json`, `from_xml`, `to_xml`, and `schema_of_xml` must be foldable after replacing `RuntimeReplaceable` expressions. Previously, Spark evaluated non-foldable options during analysis, which allowed some constant expressions but could fail with an internal error or incorrectly evaluate row-dependent expressions. To allow deterministic and row-independent non-foldable options, set `spark.sql.legacy.allowNonFoldableOptions` to `true`. Row-dependent, unevaluable, and nondeterministic options are always rejected.
+- Since Spark 4.4, when an already-analyzed Data Source V2 query is refreshed after a compatible schema change, connectors can return more data columns from the current table schema in `Scan.readSchema()` than requested by `SupportsPushDownRequiredColumns.pruneColumns`. Previously, this partial pruning could fail planning because the scan reported columns absent from the analyzed relation output.
+- Since Spark 4.4, when an already-analyzed Data Source V2 query is refreshed, if rebinding an expanded struct used as a map key causes distinct current keys to collide under the analyzed schema, the query fails with `DUPLICATED_MAP_KEY` by default instead of returning duplicate keys. With `spark.sql.mapKeyDedupPolicy=LAST_WIN`, the last value is kept.
+- Since Spark 4.4, the Oracle JDBC datasource maps bare `NUMBER` columns (declared without explicit precision or scale) to `DecimalType(38, 18)` instead of `DecimalType(38, 10)`. This uses `DecimalType.DEFAULT_SCALE` and preserves up to 18 fractional digits instead of 10, reducing silent precision loss. However, the integer range shrinks from 28 to 20 digits; bare `NUMBER` values with more than 20 integer digits that previously read correctly will raise `NUMERIC_VALUE_OUT_OF_RANGE`. The same change applies to Oracle `FLOAT` columns, which JDBC reports as `NUMERIC` with `scale = -127`. Columns with explicit `NUMBER(p,s)` are not affected. To restore the previous `DecimalType(38, 10)` mapping, set `spark.sql.legacy.oracle.numberMapping.enabled` to `true`.
+- Since Spark 4.4, when `spark.sql.charVarchar.standardSemantics.enabled` is false and `spark.sql.readSideCharPadding` is true (the default), JDBC Data Source V2 catalog tables on H2, PostgreSQL, SQL Server, and Oracle push CHAR equality, inequality, null-safe equality, and `IN`/`NOT IN`. In 4.3 the default read-side padding wrap kept those filters in Spark. Pushed predicates use the remote collation, so a case-insensitive SQL Server collation can match a stored `'ABC'` with `flag = 'abc'` while a Spark-local comparison would not. The V1 path (`spark.read.jdbc` and `USING jdbc`) still evaluates these CHAR filters in Spark. PostgreSQL's internal `"char"` type (JDBC type name `char`) is mapped to `STRING` instead of `CHAR(1)`, so Spark no longer blank-pads its empty value.
+- Since Spark 4.4, when `spark.sql.charVarchar.standardSemantics.enabled` is false and `spark.sql.readSideCharPadding` is true (the default), `IS [NOT] NULL` over a CHAR scan column is unwrapped to the raw column for every Data Source V2 source, including every JDBC dialect. Previously the padding wrap kept that null check in Spark.
+- Since Spark 4.4, when `spark.sql.charVarchar.standardSemantics.enabled` is false and `spark.sql.readSideCharPadding` is true (the default), an overwrite of a Data Source V2 table by a condition on a CHAR column, such as `INSERT INTO t REPLACE WHERE dep = 'hr'`, `INSERT OVERWRITE t PARTITION (dep = 'hr')` or `DataFrameWriterV2.overwrite`, compares the column values padded as a read returns them. For a `CHAR(8)` column `dep`, the data source receives `CHAR_READ_SIDE_PADDING(dep, 8, ' ') = 'hr      '`. Previously it received `dep = 'hr      '`, which compared the stored values with the padded literal and silently kept the rows whose values were stored without padding, so a table written by such an overwrite may still contain rows that it should have replaced. A data source that does not accept `CHAR_READ_SIDE_PADDING`, such as one that implements `SupportsOverwrite` with V1 filters, now fails such an overwrite with `_LEGACY_ERROR_TEMP_2245`, also when the values are stored with padding. A condition that uses a CHAR column in another way, such as `dep >= 'h'`, `dep LIKE 'h%'` or `rtrim(dep) = 'hr'`, now fails with `_LEGACY_ERROR_TEMP_1109` on every data source. `IS [NOT] NULL` on a CHAR column is not affected. To restore the previous behavior, set `spark.sql.legacy.noCharPaddingInOverwriteCondition` to `true`.
+- Since Spark 4.4, a CHAR/VARCHAR column of the outer query that a LATERAL or correlated subquery returns keeps its CHAR/VARCHAR type, as an inner column does. Previously it became `STRING`: comparisons against it were not padded and could silently return no rows, and CTAS and views over it stored `STRING`. Inside a LATERAL subquery this affected `t.c AS k`, `t.c` and `t.*` in all earlier versions; in other correlated subqueries it affected `t.c AS k` in all earlier versions, `t.*` since Spark 4.2 and `t.c` since Spark 4.3. A table created with CTAS over such a column now gets `CHAR(n)`/`VARCHAR(n)`, so later inserts are length-checked (`EXCEED_LIMIT_LENGTH`) and CHAR values are padded. To keep `STRING`, cast the column in the query, for example `CAST(t.c AS STRING) AS k`. Permanent views created by an earlier version keep the `STRING` type they stored, so a view column that came from an outer CHAR column is still compared without CHAR padding, and a comparison such as `k = 'ab'` can return no rows until the view is recreated with `CREATE OR REPLACE VIEW` or `ALTER VIEW ... AS`. Views created `WITH SCHEMA EVOLUTION` are the exception: they take the CHAR/VARCHAR type from their query on the first read after the upgrade, although `DESCRIBE` still shows the stored `STRING`.
+- Since Spark 4.4, the optimizer rule `SimplifyCaseConversionExpressions` no longer simplifies mixed case conversions `LOWER(UPPER(str))` to `LOWER(str)` or `UPPER(LOWER(str))` to `UPPER(str)`. This preserves standard Unicode case mapping semantics for non-ASCII characters such as Latin small letter dotless i (`ı` U+0131) and micro sign (`µ` U+00B5).
+- Since Spark 4.4, the Oracle JDBC datasource maps Oracle DATE and TIMESTAMP to TimestampNTZType by default, ignoring the JDBC read option `preferTimestampNTZ` (DATE only when the driver default `oracle.jdbc.mapDateToTimestamp=true` surfaces it as TIMESTAMP; otherwise DATE stays DateType). In 4.3 and earlier these were read as TimestampType, or as TimestampNTZType only when `preferTimestampNTZ=true`. This faithfully represents these zoneless Oracle types. Unaffected: Oracle DATE read with `oracle.jdbc.mapDateToTimestamp=false` (mapped to DateType, as before), and TIMESTAMP WITH TIME ZONE / TIMESTAMP WITH LOCAL TIME ZONE. Symmetrically, a TimestampNTZType column written to Oracle is now bound zoneless via `setObject` rather than a JVM-default-zone `java.sql.Timestamp`, so the stored value may differ depending on the JVM default time zone. To restore the previous read and write behavior, set `spark.sql.legacy.oracle.timestampNTZMapping.enabled` to `true`. The JDBC options `zonelessTimestampAsNTZ` (type mapping) and `timestampNTZAsWallClock` (read and write conversion) control the two behaviors separately per read or write, and take precedence over this configuration. For tables in a JDBC catalog, set `zonelessTimestampAsNTZ` as a catalog option instead, as there per-query values do not apply. For tables created with `CREATE TABLE ... USING jdbc`, set these options in the table's `OPTIONS`; per-query values may not apply, since the table's resolved relation is cached.
+- Since Spark 4.4, a nondeterministic common expression that a conditional branch reads more than once is evaluated once, and every read sees that one value. `BETWEEN` and `NULLIF` read their input twice, so an expression such as `CASE WHEN c THEN monotonically_increasing_id() BETWEEN 3 AND 5 END` previously gave each read its own value and could return a different result. Queries whose results depended on the earlier behaviour change, and an optimized or physical plan may now show a `with` node for such a branch. A definition that is cheap to evaluate and reports itself deterministic is still substituted at every read, as before.
+- Since Spark 4.4, `CREATE FUNCTION` for a persistent SQL function fails with `INVALID_TEMP_OBJ_REFERENCE` when the function body reads a session variable through an `IDENTIFIER` clause, matching the existing rejection of a direct variable reference. Such a function previously succeeded at creation and failed when called from a session where the variable did not exist. To restore the previous behavior, set `spark.sql.legacy.allowSessionVariableInPersistedView` to `true`.
+- Since Spark 4.4, `format_string` and `printf` pass a decimal argument to `java.util.Formatter` as a `java.math.BigDecimal`, so the floating-point conversions `%f`, `%e`, and `%g` format decimals instead of failing with `IllegalFormatConversionException`. `%a` still rejects a decimal, because `Formatter` supports it only for `float` and `double`. As a side effect, `%h` on a decimal now hashes the `java.math.BigDecimal` (unscaled value and scale) rather than Spark's internal `Decimal` (which hashes consistently with `Double`), so it can print a different hash than earlier releases; the two coincide for some values, such as zero at scale zero. `%s` output and `NULL` handling are unchanged.
+- Since Spark 4.4, a Hive table that is read through its Hive SerDe, e.g. `STORED AS TEXTFILE` or Parquet with `spark.sql.hive.convertMetastoreParquet` set to `false`, returns `NULL` for the partition column of the default partition `__HIVE_DEFAULT_PARTITION__`. This matches data source tables and the Hive Parquet and ORC tables that Spark converts by default. Previously, a string partition column returned the name itself, so that a predicate on rows such as `a = 1 OR p IS NULL` skipped the partition, and a non-string partition column failed with `CAST_INVALID_INPUT` under ANSI mode. To select the default partition, use `p IS NULL` instead of comparing the column with the name.
+- Since Spark 4.4, for storage-partitioned joins, `spark.sql.requireAllClusterKeysForCoPartition` requires every join key to be covered by some partition key instead of matching the partition keys positionally. As a result, a join-key column partitioned by more than one transform no longer prevents shuffle elimination, and `spark.sql.sources.v2.bucketing.allowKeysSubsetOfPartitionKeys.enabled` no longer additionally requires `spark.sql.requireAllClusterKeysForCoPartition` to be `false` when the join keys are a subset of the partition keys. As before, when the partition keys cover only part of the join keys, eliminating the shuffle still requires `spark.sql.requireAllClusterKeysForCoPartition` to be `false`. If `spark.sql.sources.v2.bucketing.requireAllClusterKeysForCoPartition.enabled` is set, it decides this instead, see the next entry.
+- Since Spark 4.4, the one-side shuffle that `spark.sql.sources.v2.bucketing.shuffle.enabled` turns on follows the new `spark.sql.sources.v2.bucketing.requireAllClusterKeysForCoPartition.enabled`, as the storage-partitioned join does. It defaults to `spark.sql.requireAllClusterKeysForCoPartition`, which is `true`. A join runs on one side's partition keys only if they cover every join key. Previously, a join could run on partition keys that covered only some of the join keys. Now it runs on the layout of a side that covers every join key, or both sides are shuffled on all the join keys. So the number of partitions can change too. A cogroup changes the same way. To let such a join run on those partition keys again, set `spark.sql.sources.v2.bucketing.requireAllClusterKeysForCoPartition.enabled` to `false`. That also lifts the requirement for the storage-partitioned join, but keeps it for hash partitionings.
+- Since Spark 4.4, the CSV `extension` option must be non-empty and contain only letters. In Spark 4.3 and earlier, due to a bug in the extension validation check, empty strings and three-character suffixes containing non-letters (for example `ab1`) were accepted. This affects both writes and reads of CSV tables whose persisted `OPTIONS` contain such values; update the option to a non-empty letters-only suffix to restore access.
+- Since Spark 4.4, when `array_repeat` or `array_insert` is asked to build an array larger than the maximum supported array length, generated code raises the same error as interpreted evaluation. `array_repeat` now fails with `COLLECTION_SIZE_LIMIT_EXCEEDED.PARAMETER` instead of the internal error `_LEGACY_ERROR_TEMP_2176`, and `array_insert` fails with `COLLECTION_SIZE_LIMIT_EXCEEDED.FUNCTION` instead of `COLLECTION_SIZE_LIMIT_EXCEEDED.PARAMETER`, which named a `count` parameter that `array_insert` does not have. Both functions raise an error under exactly the same conditions as before; only the reported error condition changes.
+- Since Spark 4.4, `/*+ ... */` inside a bracketed comment is parsed as a nested comment, so its closing `*/` no longer closes the outer comment. For example, `/* note /*+ x */ SELECT 1` previously returned `1`, but now raises `UNCLOSED_BRACKETED_COMMENT`. Close the outer comment explicitly, for example `/* note /*+ x */ */ SELECT 1`.
+- Since Spark 4.4, `spark.sql.sources.v2.bucketing.partition.filter.enabled` defaults to `true`. In a storage-partitioned join, the partition key groups pushed down to both sides may now be narrowed to those that can produce output for the join type, instead of always taking the union of the two sides' groups: an inner or semi join may keep only the groups present on both sides, a join that keeps or tests every left row (left outer, left anti, left single, existence) keeps the left side's groups, a right outer join keeps the right side's, and a full outer join is unaffected; a CROSS join carrying an equality condition is treated like an inner join. The narrowing is skipped when either side's partitioning may contain unknown partition keys, as after a shuffle on one side, so such a join keeps the full union. A group that is dropped is not scanned at all, so a query may read fewer files. To restore the previous behavior, set `spark.sql.sources.v2.bucketing.partition.filter.enabled` to `false`.
+- Since Spark 4.4, `spark.sql.sources.v2.bucketing.partitionKeyOrdering.enabled` defaults to `true`. A V2 scan that reports a keyed partitioning and no ordering that Spark keeps for the scan output now also reports itself sorted by its partition key expressions, because every row of such a partition evaluates them to the same value. That includes a scan that reports an empty ordering, or one that starts with a sort order on a column pruned from the scan output or on a partition transform and has no later sort order on a partition key other than a transform. It relies on each partition of the source holding a single partition key value, as `KeyGroupedPartitioning` requires. Partition transforms such as `days(ts)` or `bucket(8, id)` are left out of that ordering. This lets Spark drop a `Sort` it would otherwise place above the scan. An aggregate that groups by a leading run of the other key expressions, in key order, may also be planned as a sort aggregate rather than a hash aggregate. This is because `spark.sql.execution.replaceHashWithSortAgg` keys off the reported ordering. To restore the previous behavior, set `spark.sql.sources.v2.bucketing.partitionKeyOrdering.enabled` to `false`.
+- Since Spark 4.4, `spark.sql.sources.v2.bucketing.preserveKeyOrderingOnCoalesce.enabled` defaults to `true`. When `GroupPartitionsExec` merges several input partitions that share one partition key value into a single output partition, it now keeps sort orders over the partition key expressions in the ordering it reports, since those expressions are constant within the merged partition. Sort orders over partition transforms such as `days(ts)` or `bucket(8, id)` are left out. Orders over other columns are still dropped, as the concatenation invalidates them, and a join that reduced the partition keys onto a common key space (see `spark.sql.sources.v2.bucketing.allowCompatibleTransforms.enabled`) reports no order, since the merged partitions then share only the reduced key. This can remove a `Sort` downstream of the merge. To restore the previous behavior, set `spark.sql.sources.v2.bucketing.preserveKeyOrderingOnCoalesce.enabled` to `false`.
+- Since Spark 4.4, when the `from_protobuf` option `unwrap.primitive.wrapper.types` is enabled, `from_protobuf` unwraps a present Protobuf primitive wrapper (such as `google.protobuf.Int32Value` or `StringValue`) whose inner `value` is unset or set to its default to the type's default value (`0`, `false`, `""`, or empty binary), regardless of the `emit.default.values` option. Previously such a wrapper unwrapped to `NULL` unless the `emit.default.values` option was enabled, which could also place a `NULL` into a non-nullable array element or map value. An absent wrapper field still unwraps to `NULL`.
+- Since Spark 4.4, the value columns of `UNPIVOT` and `Dataset.unpivot` merge the nested nullability (array element, map value, and struct field nullability) of all unpivoted values. Previously, a value column took the nested nullability of the first listed value, so a `NULL` array element, map value, or struct field of a later value could be returned as a non-`NULL` value such as `0`, and `IS NULL` on it returned `false`. A view created by an earlier Spark version over such an `UNPIVOT` may have recorded the non-nullable nested type in its schema and can fail to read; recreate it with `CREATE OR REPLACE VIEW`. To restore the previous behavior, set `spark.sql.legacy.unpivot.useFirstValueNestedNullability` to `true`.
+- Since Spark 4.4, when `spark.sql.parquet.fieldId.read.enabled` is true, a Parquet read fails with `PARQUET_FIELD_REQUESTED_MORE_THAN_ONCE` if two or more requested fields of a struct (or of the top-level schema) resolve to the same Parquet field. This happens when one requested field is matched by field ID and another by name, or when two requested fields have the same field ID. In Spark 4.3 and earlier, such a read returned wrong values without an error: with the vectorized reader one of the fields read as non-null default values (for example `0`) or uninitialized data, and with the parquet-mr reader (`spark.sql.parquet.enableVectorizedReader` set to `false`) one of the fields read as `null`. To read the Parquet field more than once, request it once and refer to the resulting column more than once in the query.
+- Since Spark 4.4, when `spark.sql.groupByOrdinal` is true (the default), the pipe `AGGREGATE` operator rejects an aliased integer literal in its `GROUP BY` clause, such as `TABLE t |> AGGREGATE sum(x) AS s GROUP BY 2 AS grp`, with `UNSUPPORTED_FEATURE.PIPE_OPERATOR_AGGREGATE_UNSUPPORTED_CASE`, because a bare integer literal in the same position is an ordinal. Previously the aliased literal was grouped as a constant. Bare ordinals and aliases on other grouping expressions are not affected. To restore the previous behavior, set `spark.sql.legacy.allowAliasedPipeAggregateOrdinals` to `true`.
+- Since Spark 4.4, with whole-stage codegen enabled, a filter condition, including the `FILTER` clause of an aggregate function, evaluates the remaining top-level conjuncts of the condition on a row after one of them evaluates to `NULL`, as the SQL standard requires, and does so in the order they appear in the condition, as Spark already did with whole-stage codegen disabled. Only a `FALSE` conjunct stops the evaluation. One exception: an `IS NOT NULL` check on a column, or on an expression over it, that a later conjunct references is still evaluated before that conjunct and the conjuncts up to the check's own position, even when it is written after them, and can drop the row before an error one of them raises. Once a condition has a conjunct that can be `NULL`, the `IS NOT NULL` checks after that conjunct are evaluated in the order of the condition on every row, not only on rows where a conjunct is `NULL`. A row whose condition is `NULL` is still dropped, but an error raised by a later conjunct on that row, such as `ARITHMETIC_OVERFLOW` in ANSI mode, now fails the query. For example, `SELECT a FROM t WHERE NOT (a > 0 AND b > 0) AND y + 1 > 0` can fail with `ARITHMETIC_OVERFLOW` on a row where `a` is `NULL`, `b` is `1`, and `y` is `2147483647`, unless the row is dropped earlier by a `FALSE` conjunct or `IS NOT NULL` check that precedes `y + 1 > 0` in the condition, or skipped before the filter, for example by data source filter pushdown such as Parquet row group statistics. Previously the query skipped such a row with whole-stage codegen enabled. The later conjuncts also run on more rows than before, so a nondeterministic conjunct such as `rand(seed)` can return different values on the remaining rows, and a side-effecting user-defined function is called on rows that are dropped. To restore the previous behavior, set `spark.sql.legacy.filterShortCircuitOnNullConjunct` to `true`.
+- Since Spark 4.4, the optimizer no longer infers a filter from data constraints when evaluating the filter can fail, such as, in ANSI mode, integral or decimal arithmetic, a division or a narrowing cast, or when it calls a user-defined function. The check is conservative, so a few filters that cannot fail are not inferred either, such as `upper(s) = 'A'`. For example, with ANSI mode on, `SELECT * FROM t WHERE x = y AND 10 / y > 0` no longer adds the filter `10 / x > 0`, which failed with `DIVIDE_BY_ZERO` on a row where `x` is `0` and `y` is `6`, although the query itself never divides by `x`. As a result, such a query no longer fails, a user-defined function is no longer evaluated twice per row, and such a filter no longer reaches the other side of a join, a data source, or partition pruning, so the query can read more data. Filters on plain comparisons, `IN`, `BETWEEN`, widening numeric casts, integral remainders by a non-zero constant such as `x % 2 = 0`, constants, subqueries whose correlation condition cannot fail, and many other expressions that cannot fail, such as `LIKE 'a%'`, `year(d) = 2024`, numeric arithmetic with ANSI mode off, and `+`, `-` and `*` over `FLOAT` and `DOUBLE` in any mode, are still inferred. To restore the previous behavior, set `spark.sql.legacy.inferFailableFiltersFromConstraints` to `true`.
+- Since Spark 4.4, when a format is specified, `to_timestamp`, `try_to_timestamp`, and `to_timestamp_ltz` cast a numeric first argument to a string and parse it with the format, for example `to_timestamp(20201231, 'yyyyMMdd')` returns `2020-12-31 00:00:00`. This matches the existing behavior when `spark.sql.timestampType` is `TIMESTAMP_NTZ`. Previously, with the default `TIMESTAMP_LTZ` timestamp type, such calls failed with `INTERNAL_ERROR`. Note that the string form of the number is parsed, so a DECIMAL `1.5` is parsed as `"1.5"`.
+- Since Spark 4.4, the Spark Thrift Server logs a warning at startup when `hive.server2.enable.doAs` is `true` and `hive.server2.authentication` verifies user identities (any recognized type other than `NONE`/`NOSASL`), because executor-side data access still runs as the server's own service identity rather than the connecting user (SPARK-5159). Set `spark.sql.hive.thriftServer.allowIneffectiveDoAs` to `true` to acknowledge the limitation and silence the warning. Spark 5.0 is expected to refuse to start on this configuration unless that option is set.
+- Since Spark 4.4, `UPDATE` and `MERGE` on a Data Source V2 table fail with `DATATYPE_MISMATCH.INVALID_ROW_LEVEL_OPERATION_ASSIGNMENTS` when they assign to a metadata column of the table. This includes `UPDATE SET *` and `INSERT *` in `MERGE WITH SCHEMA EVOLUTION` when the source has a column with the name of a metadata column of the target table. Previously, these assignments passed analysis and were usually ignored. To restore the previous behavior, set `spark.sql.legacy.ignoreMetadataColumnAssignments` to `true`.
+- Since Spark 4.4, `CREATE TABLE`, `REPLACE TABLE`, and `ALTER TABLE ... ADD CONSTRAINT` on a Data Source V2 table fail with `USER_DEFINED_FUNCTION_IN_CHECK_CONSTRAINT` when the condition of a CHECK constraint calls a user-defined scalar function, including a Data Source V2 function. `ALTER TABLE ... ADD CONSTRAINT` keeps failing with `UNSUPPORTED_SQL_UDF_USAGE` on a SQL function. Previously, a write could resolve the function name in its own session, so that it enforced another rule or failed (SPARK-60777). To run these statements, change the condition to call only built-in functions. Existing constraints that call a user-defined function are not rejected.
+- Since Spark 4.4, a write to a Data Source V2 table with the `GENERATE_COLUMN_VALUES_ON_WRITE` capability uses a modeled connector generation expression when Spark can convert it, for both auto-filling missing generated values and validating provided values. Only when the modeled expression is absent or cannot be converted does Spark read the SQL text. A converted modeled expression is analyzed with ANSI mode on and keeps the explicit and implicit casts stored by the connector. For example, for `b STRING GENERATED ALWAYS AS (coalesce(s, 1))` with `s = '007'`, a convertible modeled expression stored by `CREATE TABLE` with ANSI mode off generates `'007'`; one stored with ANSI mode on generates `'7'`. Folded constants also retain their creation-time results: for example, with ANSI mode off at `CREATE TABLE`, `coalesce(a, CAST('x' AS INT))` can be stored as `COALESCE(a, NULL)` and still generate `NULL` for `a = NULL` under an ANSI writer. These stored casts and constants do not capture every creation-time SQL config. Analysis or evaluation errors in a converted modeled expression fail the write without falling back to SQL text or the writing session's type coercion. There is no config to restore SQL-text-first evaluation of a convertible modeled expression. To preserve an intended result, define the expression with explicit casts and typed literals; for example, use `coalesce(s, '1')` to keep string semantics. Previously, auto-fill used only SQL text. Validation already preferred modeled expressions, but analyzed them under the writing session and compared against the expression before its cast to the column type (SPARK-61495).
+- Since Spark 4.4, when a write to a Data Source V2 table reads the SQL text of a generation expression, it parses and analyzes that text with ANSI mode on and the default values of the SQL configs that change how a text reads, such as `spark.sql.parser.escapedStringLiterals`, regardless of the session of the write. Only the following still follow that session: the session time zone, case sensitivity, `spark.sql.timestampType`, `spark.sql.decimalOperations.allowPrecisionLoss`, the configs that a view also takes from the session that reads it, the functions found through `SET PATH`, and the configs that an expression reads during evaluation, such as `spark.sql.legacy.timeParserPolicy`. Any other config that the parsing or the analysis reads takes its default value, also one that a function reads while it is built, such as `spark.sql.legacy.negativeIndexInArrayInsert`. A text that does not resolve under these settings, such as `flag = 1` on a `BOOLEAN` column, is parsed with the ANSI mode of that session and analyzed under that session, and a text that does not parse under them is parsed under that session. Previously, the session of the write decided how the text read, so a write could silently store a wrong value (SPARK-60757). As a result, when SQL text is read, with `spark.sql.ansi.enabled=false`, also for a table created with that setting, a write can fail with an error such as `CAST_INVALID_INPUT` where Spark 4.3 stored `NULL`, and an implicit cast can change the stored value. The validation of a provided value compares it with the value that the write would store, so a value that only casts to it now fails with `CHECK_CONSTRAINT_VIOLATION`, also with ANSI mode on. For example, for a SQL-only `b STRING GENERATED ALWAYS AS (coalesce(s, 1))` with `s = '007'`, which stores `'7'`, a provided `'07'` fails. A table created with a non-default value of a config such as `spark.sql.parser.escapedStringLiterals` also gets the default reading of its text on every write, without an error. A table CHECK constraint that reads SQL text still uses the session that writes, so a constraint that repeats the text of a generation expression can fail a write whose session sets such a config. A row that Spark 4.3 stored differently can fail with such an error or with `CHECK_CONSTRAINT_VIOLATION` when a later write provides it again, such as an `INSERT ... SELECT` from the same table. A `DELETE` does not check the generated columns of the rows that it carries. To fix such a table, create a new table with a text that reads as intended under these settings, and copy the other columns into it with `INSERT ... SELECT`. To read the text under the session of the write, as Spark 4.3 does, set `spark.sql.legacy.useCurrentConfigsForGeneratedColumn` to `true`. This flag affects only columns whose SQL text is read; it does not change auto-fill or validation of a convertible modeled expression.
+- Since Spark 4.4, `CREATE TABLE` and `REPLACE TABLE` fail with `UNSUPPORTED_EXPRESSION_GENERATED_COLUMN` on a generation expression that the session reads differently than a write does, for example with `spark.sql.parser.escapedStringLiterals=true` or `spark.sql.ansi.enforceReservedKeywords=true`. This also applies to a table without the `GENERATE_COLUMN_VALUES_ON_WRITE` capability, which computes the values itself (SPARK-60757). To restore the previous behavior, set `spark.sql.legacy.useCurrentConfigsForGeneratedColumn` to `true`.
+- Since Spark 4.4, `CREATE TABLE` and `REPLACE TABLE` on a Data Source V2 table fail with `AGGREGATE_OR_WINDOW_FUNCTION_IN_CHECK_CONSTRAINT` when the condition of a CHECK constraint calls an aggregate or window function, including a user-defined aggregate function, `grouping`, and `grouping_id`. `ALTER TABLE ... ADD CONSTRAINT` keeps failing with its existing errors, such as `INVALID_WHERE_CONDITION` and `WINDOW_FUNCTION_NOT_ALLOWED_IN_CLAUSE`. Previously, these statements succeeded and every later write to the table failed (SPARK-60800). To run these statements, remove the function from the condition. Existing constraints that call these functions are not rejected.
+- Since Spark 4.4, `CREATE TABLE` and `REPLACE TABLE` on a Data Source V2 table fail with `GENERATOR_IN_CHECK_CONSTRAINT` when the condition of a CHECK constraint calls a generator function, such as `explode`, `posexplode`, and `inline`. `ALTER TABLE ... ADD CONSTRAINT` keeps failing with `UNSUPPORTED_GENERATOR.OUTSIDE_SELECT`. Previously, these statements succeeded and every later write to the table failed (SPARK-60821). To run these statements, remove the function from the condition. Existing constraints that call a generator function are not rejected.
+- Since Spark 4.4, `CREATE TABLE` and `REPLACE TABLE` fail with `UNSUPPORTED_EXPRESSION_GENERATED_COLUMN` when the data type of a generation expression names its struct fields differently from the column type, in name, including letter case, or in order, for example `named_struct('y', a, 'x', b)`, `named_struct('X', b, 'Y', a)`, or `struct(a, b)` for a `STRUCT<x: INT, y: INT>` column. Previously, such an expression was accepted, although Spark lines up the struct fields by name, with the case sensitivity of the writing session, when it computes the value of a generated column of a Data Source V2 table, and by position when it checks a provided value (SPARK-60857). To line up the fields by position, cast the expression to the column type, for example `CAST(struct(a, b) AS STRUCT<x: INT, y: INT>)`. Existing tables with such an expression are not rejected, and this change does not affect writes to them.
+- Since Spark 4.4, `ALTER TABLE ... ADD CONSTRAINT` with a CHECK constraint fails with `EXPECT_TABLE_NOT_VIEW.NO_ALTERNATIVE` when the target is a view, as it does with the other constraint types. Previously, when the view only projected or filtered a Data Source V2 table, the statement added the constraint to that table after validating only the rows of the view (SPARK-60822). To add the constraint, run the statement on the table.
+- Since Spark 4.4, a write to a Data Source V2 table that parses the SQL text of a CHECK constraint binds an unqualified built-in function name to `system.builtin`, regardless of the SQL path and `spark.sql.functionResolution.sessionOrder` (SPARK-60777). Previously, an existing constraint could call another function with the same name.
+- Since Spark 4.4, `CREATE TABLE`, `REPLACE TABLE`, and `ALTER TABLE ... ADD CONSTRAINT` on a Data Source V2 table fail with `SUBQUERY_IN_CHECK_CONSTRAINT` when the condition of a CHECK constraint contains a subquery. `ALTER TABLE ... ADD CONSTRAINT` keeps failing with `UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.HIGHER_ORDER_FUNCTION` on a subquery in a lambda function. Previously, most of these statements failed with `INTERNAL_ERROR`, but a subquery that needed no resolution, such as `id > (SELECT 0 AS a)`, was accepted and every write evaluated it again (SPARK-60781). Existing constraints that contain a subquery are not rejected.
+- Since Spark 4.4, a CHECK constraint that `ALTER TABLE ... ADD CONSTRAINT` adds to a Data Source V2 table, and whose condition reads the current time, date, catalog, user and the like, such as `ts <= current_timestamp()` or `db = current_database()`, is checked against their values at the time of each write. Previously, it was checked against their values at the time of the `ALTER TABLE`, unless a write could not read back a predicate for its condition, such as one with a lambda function or one that passes a column to `datediff`, `year` or `upper` (SPARK-60032). Such a constraint is stored without a predicate, so each write parses and analyzes its SQL text under the session of the write, as it does for a constraint without a predicate that `CREATE TABLE` adds. A setting of the write such as `spark.sql.ansi.enforceReservedKeywords`, which reserves `TIME`, or `spark.sql.ansi.doubleQuotedIdentifiers` can then make it fail to parse the text or read it differently. A row-level operation that copies unchanged rows, such as a `DELETE` or `UPDATE` on a copy-on-write table, fails with `CHECK_CONSTRAINT_VIOLATION` on a copied row that no longer satisfies the condition. For example, `ts >= current_timestamp() - INTERVAL 30 DAYS` now fails such a `DELETE` once a copied row is older than 30 days. A condition that Spark detects a write could resolve differently is stored as before, so a write accepts and rejects the same rows for it as before. Examples are conditions that also read a variable, a `CHAR` column, a name with more than one part such as a column qualified by the table name, or a constant that depends on the session time zone, such as `'2024-01-01 00:00:00'` cast to a timestamp. So are conditions with a name such as `current_date` or `user` without parentheses, which a write can read as a column name, and conditions whose text the parser settings of the `ALTER TABLE`, such as `spark.sql.ansi.doubleQuotedIdentifiers` or `spark.sql.parser.escapedStringLiterals`, read differently from their default values. ANSI mode, `spark.sql.timestampType` and the session time zone are taken from the session for this comparison, as for a generation expression. A condition that reads the current date or time only through a typed literal such as `DATE 'today'` is also stored as before. An existing constraint keeps its stored predicate until it is dropped and added again. `Check.predicate()` is null for a constraint stored without a predicate, so a connector that validates or enforces it itself has to evaluate `Check.predicateSql()`. To restore the previous behavior, set `spark.sql.legacy.freezeCurrentValuesInCheckConstraint` to `true` before adding the constraint. A constraint added without it is not changed.
+- Since Spark 4.4, a function created by `CREATE FUNCTION ... AS 'class'` whose class implements `org.apache.spark.sql.connector.catalog.functions.UnboundFunction` and extends either a Hive UDF class (such as `UDF` or `GenericUDF`) or `org.apache.spark.sql.expressions.UserDefinedAggregateFunction` runs as a DataSource V2 function instead of a Hive UDF or Spark UDAF, including functions created in earlier versions. Its result type, argument coercion, and null handling are defined by the V2 implementation selected by `UnboundFunction.bind`. Hive's `@UDFType` and Spark UDAF's `deterministic` property do not control the V2 path. For scalar functions, determinism uses `BoundFunction.isDeterministic()` (default `true`) and the arguments' determinism. A call with constant arguments can therefore become eligible for constant folding during query planning instead of being evaluated per row.
+- Since Spark 4.4, `next_day` and `last_day` fail with `DATETIME_OVERFLOW` when the result is later than the maximum `DATE`, `+5881580-07-11`, and `trunc` fails with it when the result is earlier than the minimum `DATE`, `-5877641-06-23`, regardless of `spark.sql.ansi.enabled`. Previously, these functions silently returned a wrong date, in most cases one at the other end of the `DATE` range; for example, `last_day(DATE'+5881580-07-11')` returned `-5877641-07-12` and `trunc(DATE'-5877641-06-23', 'MONTH')` returned `+5881580-06-20`, while `trunc` to `QUARTER` failed with `ARITHMETIC_OVERFLOW`. `next_day` and `trunc` to `WEEK` also returned a wrong date for the first days of the `DATE` range; for example, `next_day(DATE'-5877641-06-23', 'MO')` and `trunc(DATE'-5877641-07-01', 'WEEK')` returned `-5877641-06-25`, a Thursday, and now return `-5877641-06-29`.
+
+## Upgrading from Spark SQL 4.3.0 to 4.3.1
+
+- Since Spark 4.3.1, `spark.sql.execution.arrow.pythonUDF.columnarInput.enabled` is `false` by default: Arrow-based Python UDFs read rows from an Arrow-backed upstream operator, such as a Data Source V2 scan or the Arrow cache, as in Spark 4.1. With columnar input, they kept the columns that they pass through until the results of their batch came back from Python, and failed or returned wrong results when the operator reused or released the vectors of the batch in the meantime. To enable columnar input again, set `spark.sql.execution.arrow.pythonUDF.columnarInput.enabled` to `true`.
+
+## Upgrading from Spark SQL 4.2 to 4.3
+
+- Since Spark 4.3, map-typed arguments to distinct aggregates are normalized by key order. As a result, `COUNT(DISTINCT m)` treats maps with the same entries in different orders as the same value, and aggregates that return distinct input values, such as `COLLECT_LIST(DISTINCT m)`, return maps sorted by key.
+- Since Spark 4.3, zero-length files are skipped during Parquet schema inference instead of failing with a `FAILED_READ_FILE.CANNOT_READ_FILE_FOOTER` error.
+- Since Spark 4.3, metrics produced by `Dataset.observe` include values from only the last successful task attempts instead of aggregating values from all attempts. To restore the previous behavior, set `spark.sql.legacy.observeMetricsAggregateAllAttempts` to `true`.
+- Since Spark 4.3, the configuration key `spark.sql.sources.v2.bucketing.allowJoinKeysSubsetOfPartitionKeys.enabled` has been renamed to `spark.sql.sources.v2.bucketing.allowKeysSubsetOfPartitionKeys.enabled` to reflect that it now applies to storage-partitioned joins, aggregates, and windows. The old key continues to work as an alias.
+- Since Spark 4.3, the Spark Thrift Server rejects setting JVM system properties through the `set:system:` session configuration overlay (for example, in a JDBC connection string). To restore the previous behavior, set `spark.sql.legacy.hive.thriftServer.allowSettingSystemProperties` to `true`.
+- Since Spark 4.3, the adaptive execution rule `org.apache.spark.sql.execution.adaptive.DynamicJoinSelection` has been renamed to `DemoteBroadcastHashJoin`, which now only demotes broadcast hash joins (emitting `NO_BROADCAST_HASH`). Its selection of shuffled hash join over sort merge join has moved to a new physical rule gated by `spark.sql.adaptive.convertSortMergeJoinToShuffledHashJoin.enabled` (default `true`). If you previously disabled the shuffled-hash-join preference by listing `org.apache.spark.sql.execution.adaptive.DynamicJoinSelection` in `spark.sql.adaptive.optimizer.excludedRules`, that name no longer matches any rule (unknown names are silently ignored); set `spark.sql.adaptive.convertSortMergeJoinToShuffledHashJoin.enabled` to `false` instead.
+- Since Spark 4.3, the optimizer rule `MergeSubplans` has moved from package `org.apache.spark.sql.catalyst.optimizer` to `org.apache.spark.sql.execution.planmerging`, so its fully qualified name is now `org.apache.spark.sql.execution.planmerging.MergeSubplans` (the rule was itself renamed from `MergeScalarSubqueries` to `MergeSubplans` in Spark 4.2). If you previously disabled it by listing `org.apache.spark.sql.catalyst.optimizer.MergeSubplans`, or the older `org.apache.spark.sql.catalyst.optimizer.MergeScalarSubqueries`, in `spark.sql.optimizer.excludedRules`, that name no longer matches any rule (unknown names are silently ignored); use `org.apache.spark.sql.execution.planmerging.MergeSubplans` instead.
+- Since Spark 4.3, `spark.sql.execution.replaceHashWithSortAgg` defaults to `true`. Spark now replaces a hash-based aggregate with a sort aggregate when the aggregate's child is already sorted on the grouping keys. To restore the previous behavior, set `spark.sql.execution.replaceHashWithSortAgg` to `false`.
+- Since Spark 4.3, `spark.sql.execution.combineAdjacentAggregation` defaults to `true`. Spark now merges an adjacent partial/final aggregate pair (with no shuffle between them) into a single complete-mode aggregate. This setting is independent of `spark.sql.execution.replaceHashWithSortAgg`, so disabling only `replaceHashWithSortAgg` still leaves adjacent aggregation combined; to fully restore the previous partial/final staging, set both `spark.sql.execution.replaceHashWithSortAgg` and `spark.sql.execution.combineAdjacentAggregation` to `false`.
+- Since Spark 4.3, the exact `percentile`, `percentile_cont`, and `median` aggregate functions (including their `WITHIN GROUP (ORDER BY ...)` forms) compute the linear interpolation between two neighboring values as `lower + fraction * (higher - lower)` instead of `(1 - fraction) * lower + fraction * higher`. The two are equal in exact arithmetic, but the new form is monotonically non-decreasing in the requested percentage and avoids a rounding error the old form could introduce. As a result these functions may return a value that differs from earlier releases in the last ULP. `percentile_disc` and `percentile_approx` are unaffected.
+- Since Spark 4.3, non-deterministic filters (for example predicates involving `rand()`) are no longer pushed down to DataSource V2 sources: neither at query compilation to sources that implement `SupportsPushDownV2Filters`, nor as runtime filters to sources that implement `SupportsRuntimeV2Filtering`; they are evaluated by Spark after the scan instead. This prevents a source from evaluating such a predicate a different number of times than Spark, or using it for pruning while also returning it for post-scan re-evaluation.
+- Since Spark 4.3, the new `COMMENT ON COLUMN ... IS NULL` syntax removes a column comment by passing a `null` comment to `TableChange.updateColumnComment(String[], String)`, so a `UpdateColumnComment` table change may now carry a `null` `newComment()`. Previously `newComment()` was always non-null. DataSource V2 catalogs that handle `UpdateColumnComment` should null-check `newComment()` and treat `null` as "remove the column comment" (mirroring how `UpdateColumnDefaultValue` already carries a `null` value to drop a default).
+- Since Spark 4.3, `unix_seconds`, `unix_millis`, and `unix_micros` accept `TIMESTAMP_NTZ` and the nanosecond-precision timestamp types directly, reading them with no time-zone shift. Previously these functions accepted only `TIMESTAMP_LTZ`; a `TIMESTAMP_NTZ` or nanosecond-timestamp argument was rejected with a `DATATYPE_MISMATCH` error. This is a new capability and does not change the result of any query that previously succeeded.
+- Since Spark 4.3, `hash()` and `xxhash64()` include the `days` field of `CalendarInterval` when computing the hash, so their output for interval values differs from earlier releases. Previously the codegen path dropped `days`, disagreeing with interpreted evaluation.
+- Since Spark 4.3, when a `SELECT` or `INSERT` statement references the same table more than once with different `WITH (...)` options (for example a self-join, or `INSERT INTO t WITH (...) SELECT * FROM t WITH (...)`), each reference now uses its own options instead of the second reference silently inheriting the first reference's options via the analyzer's relation cache.
+- Since Spark 4.3, `DataFrameWriter.save()` on a `SupportsCatalogOptions` source loads its write target with the required `TableWritePrivilege`s (`INSERT`, or `INSERT` and `DELETE` for `SaveMode.Overwrite`), matching `insertInto` and `saveAsTable`. A catalog that enforces these privileges may now reject an unauthorized `save()` that previously bypassed this authorization check.
+- Since Spark 4.3, the Spark-recognized time-travel options (`versionAsOf` and `timestampAsOf`, or the keys configured by `spark.sql.timeTravelVersionKey` and `spark.sql.timeTravelTimestampKey`) are rejected with `UNSUPPORTED_FEATURE.TIME_TRAVEL` on catalog-backed Data Source V2 writes, including table creation and replacement through `DataFrameWriterV2`, because writes must target the current table state rather than a historical version. Previously, Spark passed them to the connector as ordinary write options.
+- Since Spark 4.3, `HAVING` is evaluated before window functions when the `SELECT` list also contains generator functions such as `explode`. Previously, window functions could include groups removed by `HAVING` and produce incorrect results.
+- Since Spark 4.3, the Spark Connect session errors `INVALID_HANDLE.SESSION_CHANGED`/`SESSION_CLOSED`/`SESSION_NOT_FOUND` carry SQLSTATE `08003` instead of `HY000`; the condition names are unchanged. Code matching these errors on SQLSTATE should match `08003` or class `08`.
+- Since Spark 4.3, [Declarative Pipelines](declarative-pipelines-programming-guide.html) honors `spark.sql.caseSensitive` when inferring and evolving pipeline table schemas. Under case-insensitive resolution (the default), column names that differ only in case now identify the same column: flows writing to one table contribute a single column rather than one per spelling, and a column that differs only in case from one already persisted in the target is written to that column instead of being added alongside it. Previously such names were always treated as distinct, producing a table schema that Spark's own resolver could not disambiguate and that could fail later with errors such as `COLUMN_ALREADY_EXISTS` or `AMBIGUOUS_REFERENCE`. When two flows' columns fold together but their types are incompatible, the update now fails at validation with `UNABLE_TO_INFER_PIPELINE_TABLE_SCHEMA`. Where the spellings differ, the surviving one comes from the flow with the lowest identifier. An explicitly declared table schema keeps its spelling over the inferred one. Incremental streaming tables keep the persisted spelling of an existing column; materialized views re-infer the schema on every update. Set `spark.sql.caseSensitive` to `true` to keep names differing only in case distinct, as before.
+- Since Spark 4.3, all flows writing to the same pipeline table must agree on the effective `spark.sql.caseSensitive`, which each flow takes from its own SQL configuration (a `SET` in pipeline source, which never reaches the session) and otherwise from the session. A disagreement fails the update with `CONFLICTING_PIPELINE_FLOW_CASE_SENSITIVITY`, because that value decides whether names differing only in case identify the same column and would otherwise make the table's schema depend on the order the flows are evaluated in. Set `spark.sql.caseSensitive` to the same value for every flow writing to the table, remembering that a flow which does not set it inherits the session's value.
+- Since Spark 4.3, Spark fixes a correctness bug in the Data Source V2 `PartitionPredicate` introduced in Spark 4.2.0. For scans, `PartitionPredicate` is the additional predicate type Spark sends during the second pass of iterative pushdown. When a data source opts into iterative pushdown by returning `true` from `supportsIterativePushdown()`, Spark may call its pushdown API again with a `PartitionPredicate` that evaluates a filter against the full partition key described by `Table.partitioning()`. Spark also uses `PartitionPredicate` separately for metadata-only `DELETE`. On either path, once the data source accepts the predicate, there is no later evaluator for the condition. In Spark 4.2.0, `PartitionPredicate.eval(InternalRow)` incorrectly returned `true` when evaluation failed, for example when an ANSI cast of a partition value failed, or when the partition key width did not match `Table.partitioning()`. This could produce incorrect results in two ways:
+  - For a `SELECT` over partitions `dep = 'hr'` and `dep = '1'` with the filter `CAST(dep AS INT) = 1`, evaluating the predicate for `dep = 'hr'` fails. Returning `true` kept that partition, and because Spark had removed the post-scan filter, the query incorrectly returned its rows.
+  - For a metadata-only `DELETE` with the same condition, returning `true` could delete the `dep = 'hr'` partition even though the condition never matched it.
+  Spark now propagates the evaluation error in these cases. Queries that previously returned an incorrect result may therefore fail, and the error can surface while the scan is built rather than while rows are read. Runtime filters are unaffected because Spark still evaluates their condition after pruning.
+- Since Spark 4.3, when the preview flag `spark.sql.timestampNanosTypes.enabled` is `true`, Parquet schema inference maps `INT64 (TIMESTAMP(NANOS, true))` columns to `TIMESTAMP_LTZ(9)` and `INT64 (TIMESTAMP(NANOS, false))` columns to `TIMESTAMP_NTZ(9)`, instead of failing with `PARQUET_TYPE_ILLEGAL`. `spark.sql.legacy.parquet.nanosAsLong` still takes precedence: while it is `true`, these columns are inferred as `BIGINT` holding the number of nanoseconds since the epoch, so leave it set to keep the previous behavior. To migrate a workflow that relies on it, set `spark.sql.timestampNanosTypes.enabled` to `true` and `spark.sql.legacy.parquet.nanosAsLong` to `false` (the default), and update code that expects `BIGINT`. An explicit `BIGINT` read schema still returns the raw nanoseconds, and so does a table created while `spark.sql.legacy.parquet.nanosAsLong` was `true`, because its stored schema says `BIGINT`; recreate such tables to pick up the new types. A view defined directly over such files while `spark.sql.legacy.parquet.nanosAsLong` was `true` fails to resolve after the change and must be recreated, unless it was created `WITH SCHEMA EVOLUTION` or `WITH SCHEMA TYPE EVOLUTION`, in which case its column type changes too. To convert existing `BIGINT` values, use `timestamp_nanos(col)` for `TIMESTAMP_LTZ(9)`. For `TIMESTAMP_NTZ(9)`, run `CAST(timestamp_nanos(col) AS TIMESTAMP_NTZ(9))` while `spark.sql.session.timeZone` is `UTC`: the cast applies the session time zone, so in any other time zone it shifts the values. `CAST(unix_nanos(ts) AS BIGINT)` converts back.
+
+## Upgrading from Spark SQL 4.2.1 to 4.2.2
+
+- Since Spark 4.2.2, `spark.sql.execution.arrow.pythonUDF.columnarInput.enabled` is `false` by default: Arrow-based Python UDFs read rows from an Arrow-backed upstream operator, such as a Data Source V2 scan, as in Spark 4.1. With columnar input, they kept the columns that they pass through until the results of their batch came back from Python, and failed or returned wrong results when the operator reused or released the vectors of the batch in the meantime. To enable columnar input again, set `spark.sql.execution.arrow.pythonUDF.columnarInput.enabled` to `true`.
+
+## Upgrading from Spark SQL 4.2.0 to 4.2.1
+
+- Spark 4.2.0 contains a correctness bug in the Data Source V2 `PartitionPredicate`. For scans, `PartitionPredicate` is the additional predicate type Spark sends during the second pass of iterative pushdown. When a data source opts into iterative pushdown by returning `true` from `supportsIterativePushdown()`, Spark may call its pushdown API again with a `PartitionPredicate` that evaluates a filter against the full partition key described by `Table.partitioning()`. Spark also uses `PartitionPredicate` separately for metadata-only `DELETE`. On either path, once the data source accepts the predicate, there is no later evaluator for the condition. In Spark 4.2.0, `PartitionPredicate.eval(InternalRow)` incorrectly returns `true` when evaluation fails, for example when an ANSI cast of a partition value fails, or when the partition key width does not match `Table.partitioning()`. This can produce incorrect results in two ways:
+  - For a `SELECT` over partitions `dep = 'hr'` and `dep = '1'` with the filter `CAST(dep AS INT) = 1`, evaluating the predicate for `dep = 'hr'` fails. Returning `true` keeps that partition, and because Spark removes the post-scan filter, the query incorrectly returns its rows.
+  - For a metadata-only `DELETE` with the same condition, returning `true` can delete the `dep = 'hr'` partition even though the condition never matches it.
+  Spark 4.2.1 propagates the evaluation error in these cases. Queries that previously returned an incorrect result may therefore fail, and the error can surface while the scan is built rather than while rows are read. Runtime filters are unaffected because Spark still evaluates their condition after pruning.
+
+## Upgrading from Spark SQL 4.1 to 4.2
+
+- Since Spark 4.2, Spark enables order-independent checksums for shuffle outputs by default to detect data inconsistencies during indeterminate shuffle stage retries. If a checksum mismatch is detected, Spark rolls back and re-executes all succeeding stages that depend on the shuffle output. If rolling back is not possible for some succeeding stages, the job will fail. To restore the previous behavior, set `spark.sql.shuffle.orderIndependentChecksum.enabled` and `spark.sql.shuffle.orderIndependentChecksum.enableFullRetryOnMismatch` to `false`.
+- Since Spark 4.2, support for Derby JDBC datasource is deprecated.
+- Since Spark 4.2, a new default method `mergeWith` has been added to the `CustomTaskMetric` interface. The default implementation sums the two metric values, which is correct for count-type metrics. Data source connector implementations that report non-additive metrics (e.g., maximum, average, compression ratio, or gauge values) must override `mergeWith` to provide correct merge semantics.
+- Since Spark 4.2, the virtual `system` catalog hosts the new `system.builtin` and `system.session` namespaces. `system.builtin` exposes built-in functions and functions injected through `SparkSessionExtensions`; `system.session` exposes temporary views, temporary functions, and session variables created in the current session. As a result, 2-part references like `builtin.func()` and `session.func()` now follow a mini-path that tries the system namespace first and the current catalog second, so a persistent schema named `builtin` or `session` is no longer reached by `builtin.func()` / `session.func()` when the system namespace contains an object of the same name. To restore the previous behavior (current catalog first), set `spark.sql.legacy.persistentCatalogFirst` to `true`. Persistent schemas with these names are still allowed but should be reached with an explicit catalog prefix (for example, `spark_catalog.session.x`). See [Reserved system names](sql-ref-identifier.html#reserved-system-names).
+- Since Spark 4.2, `CREATE TEMPORARY VIEW`, `CREATE TEMPORARY FUNCTION`, and the corresponding `DROP` statements accept the `session` and `system.session` qualifiers on the object name (in addition to the previously supported unqualified form); for example, `CREATE TEMPORARY VIEW system.session.v AS ...` and `DROP TEMPORARY FUNCTION session.f` are now valid. Any other qualifier on a temporary object is rejected with `INVALID_TEMP_OBJ_QUALIFIER`.
+- Since Spark 4.2, the SQL standard `PATH` feature is available: the `SET PATH` statement, the `current_path()` function, path-based resolution of unqualified routines, tables, views, and session variables, and the configurations `spark.sql.path.enabled` (default `false`) and `spark.sql.defaultPath`. The feature is opt-in; when `spark.sql.path.enabled` is `false`, unqualified resolution falls back to a fixed default path and `SET PATH` is rejected with `UNSUPPORTED_FEATURE.SET_PATH_WHEN_DISABLED`. See [SET PATH](sql-ref-syntax-aux-conf-mgmt-set-path.html) and [Name Resolution](sql-ref-name-resolution.html).
+- Since Spark 4.2, duplicate Common Table Expression (CTE) names within a single `WITH` clause are detected case-insensitively at parse time, so names that differ only in case (for example, `WITH a AS (...), A AS (...)`) are rejected with `DUPLICATED_CTE_NAMES`. This check is always case-insensitive and does not depend on `spark.sql.caseSensitive`. Rename the conflicting CTEs.
+- Since Spark 4.2, `NATURAL JOIN` honors the `spark.sql.caseSensitive` configuration when determining the common columns to join on. This can change which columns are used as join keys, and therefore the query result, when column names differ only in case.
+- Since Spark 4.2, when a SQL UDF has a parameter whose name matches a parameterless built-in function (`current_user`, `current_date`, `current_time`, `current_timestamp`, `user`, `session_user`, `grouping__id`), a bare reference to that name in the function body resolves to the built-in function instead of the parameter, matching the documented name resolution rules. Rename the parameter to avoid the collision, or set `spark.sql.legacy.allowUdfParameterToShadowParameterlessFunction` to `true` to restore the previous behavior.
+- Since Spark 4.2, `SET CATALOG <name>` resolves a bare (unquoted) name as a session variable first, using the variable's value as the catalog name when such a variable exists, and otherwise treats the name as a literal catalog name. Use a string literal (`SET CATALOG 'name'`) to force it to be interpreted literally.
+- Since Spark 4.2, when an error occurs while collecting observed metrics, `Observation.get` raises the underlying exception (for example, `SparkRuntimeException` in Scala or `PySparkException` in Python) instead of silently returning an empty result. Add error handling if your code relied on receiving an empty result on failure.
+- Since Spark 4.2, `GROUP BY GROUPING SETS (())` (and the equivalent empty `GROUP BY CUBE()` / `GROUP BY ROLLUP()`) is treated as a grand total and returns one row over empty input, matching an aggregation with no `GROUP BY` clause; previously it returned no rows. To restore the previous behavior, set `spark.sql.analyzer.lowerEmptyGroupingSetToGlobalAggregate.enabled` to `false`.
+
+## Upgrading from Spark SQL 4.0 to 4.1
+
+- Since Spark 4.1, the Parquet reader no longer assumes all struct values to be null, if all the requested fields are missing in the parquet file. The new default behavior is to read an additional struct field that is present in the file to determine nullness. To restore the previous behavior, set `spark.sql.legacy.parquet.returnNullStructIfAllFieldsMissing` to `true`.
+- Since Spark 4.1, the Spark Thrift Server returns the corrected 1-based ORDINAL_POSITION in the result of GetColumns operation, instead of the wrongly 0-based. To restore the previous behavior, set `spark.sql.legacy.hive.thriftServer.useZeroBasedColumnOrdinalPosition` to `true`.
+
+## Upgrading from Spark SQL 3.5 to 4.0
+
+- Since Spark 4.0, `spark.sql.ansi.enabled` is on by default. To restore the previous behavior, set `spark.sql.ansi.enabled` to `false` or `SPARK_ANSI_SQL_MODE` to `false`.
+- Since Spark 4.0, `CREATE TABLE` syntax without `USING` and `STORED AS` will use the value of `spark.sql.sources.default` as the table provider instead of `Hive`. To restore the previous behavior, set `spark.sql.legacy.createHiveTableByDefault` to `true` or `SPARK_SQL_LEGACY_CREATE_HIVE_TABLE` to `true`.
+- Since Spark 4.0, the default behaviour when inserting elements in a map is changed to first normalize keys -0.0 to 0.0. The affected SQL functions are `create_map`, `map_from_arrays`, `map_from_entries`, and `map_concat`. To restore the previous behaviour, set `spark.sql.legacy.disableMapKeyNormalization` to `true`.
+- Since Spark 4.0, the default value of `spark.sql.maxSinglePartitionBytes` is changed from `Long.MaxValue` to `128m`. To restore the previous behavior, set `spark.sql.maxSinglePartitionBytes` to `9223372036854775807`(`Long.MaxValue`).
+- Since Spark 4.0, any read of SQL tables takes into consideration the SQL configs `spark.sql.files.ignoreCorruptFiles`/`spark.sql.files.ignoreMissingFiles` instead of the core config `spark.files.ignoreCorruptFiles`/`spark.files.ignoreMissingFiles`.
+- Since Spark 4.0, when reading SQL tables hits `org.apache.hadoop.security.AccessControlException` and `org.apache.hadoop.hdfs.BlockMissingException`, the exception will be thrown and fail the task, even if `spark.sql.files.ignoreCorruptFiles` is set to `true`.
+- Since Spark 4.0, `spark.sql.hive.metastore` drops the support of Hive prior to 2.0.0 as they require JDK 8 that Spark does not support anymore. Users should migrate to higher versions.
+- Since Spark 4.0, Spark removes `hive-llap-common` dependency. To restore the previous behavior, add `hive-llap-common` jar to the class path.
+- Since Spark 4.0, `spark.sql.parquet.compression.codec` drops the support of codec name `lz4raw`, please use `lz4_raw` instead.
+- Since Spark 4.0, when overflowing during casting timestamp to byte/short/int under non-ansi mode, Spark will return null instead a wrapping value.
+- Since Spark 4.0, the `encode()` and `decode()` functions support only the following charsets 'US-ASCII', 'ISO-8859-1', 'UTF-8', 'UTF-16BE', 'UTF-16LE', 'UTF-16', 'UTF-32'. To restore the previous behavior when the function accepts charsets of the current JDK used by Spark, set `spark.sql.legacy.javaCharsets` to `true`.
+- Since Spark 4.0, the `encode()` and `decode()` functions raise `MALFORMED_CHARACTER_CODING` error when handling unmappable characters, while in Spark 3.5 and earlier versions, these characters will be replaced with mojibakes. To restore the previous behavior, set `spark.sql.legacy.codingErrorAction` to `true`. For example, if you try to `decode` a string value `tést` / [116, -23, 115, 116] (encoded in latin1) with 'UTF-8', you get `t�st`.
+- Since Spark 4.0, the legacy datetime rebasing SQL configs with the prefix `spark.sql.legacy` are removed. To restore the previous behavior, use the following configs:
+  - `spark.sql.parquet.int96RebaseModeInWrite` instead of `spark.sql.legacy.parquet.int96RebaseModeInWrite`
+  - `spark.sql.parquet.datetimeRebaseModeInWrite` instead of `spark.sql.legacy.parquet.datetimeRebaseModeInWrite`
+  - `spark.sql.parquet.int96RebaseModeInRead` instead of `spark.sql.legacy.parquet.int96RebaseModeInRead`
+  - `spark.sql.avro.datetimeRebaseModeInWrite` instead of `spark.sql.legacy.avro.datetimeRebaseModeInWrite`
+  - `spark.sql.avro.datetimeRebaseModeInRead` instead of `spark.sql.legacy.avro.datetimeRebaseModeInRead`
+- Since Spark 4.0, the default value of `spark.sql.orc.compression.codec` is changed from `snappy` to `zstd`. To restore the previous behavior, set `spark.sql.orc.compression.codec` to `snappy`.
+- Since Spark 4.0, the SQL config `spark.sql.legacy.allowZeroIndexInFormatString` is deprecated. Consider to change `strfmt` of the `format_string` function to use 1-based indexes. The first argument must be referenced by `1$`, the second by `2$`, etc.
+- Since Spark 4.0, Postgres JDBC datasource will read JDBC read TIMESTAMP WITH TIME ZONE as TimestampType regardless of the JDBC read option `preferTimestampNTZ`, while in 3.5 and previous, TimestampNTZType when `preferTimestampNTZ=true`. To restore the previous behavior, set `spark.sql.legacy.postgres.datetimeMapping.enabled` to `true`.
+- Since Spark 4.0, Postgres JDBC datasource will write TimestampType as TIMESTAMP WITH TIME ZONE, while in 3.5 and previous, it wrote as TIMESTAMP a.k.a. TIMESTAMP WITHOUT TIME ZONE. To restore the previous behavior, set `spark.sql.legacy.postgres.datetimeMapping.enabled` to `true`.
+- Since Spark 4.0, MySQL JDBC datasource will read TIMESTAMP as TimestampType regardless of the JDBC read option `preferTimestampNTZ`, while in 3.5 and previous, TimestampNTZType when `preferTimestampNTZ=true`. To restore the previous behavior, set `spark.sql.legacy.mysql.timestampNTZMapping.enabled` to `true`, MySQL DATETIME is not affected.
+- Since Spark 4.0, MySQL JDBC datasource will read SMALLINT as ShortType, while in Spark 3.5 and previous, it was read as IntegerType. MEDIUMINT UNSIGNED is read as IntegerType, while in Spark 3.5 and previous, it was read as LongType. To restore the previous behavior, you can cast the column to the old type.
+- Since Spark 4.0, MySQL JDBC datasource will read FLOAT as FloatType, while in Spark 3.5 and previous, it was read as DoubleType. To restore the previous behavior, you can cast the column to the old type.
+- Since Spark 4.0, MySQL JDBC datasource will read BIT(n > 1) as BinaryType, while in Spark 3.5 and previous, read as LongType. To restore the previous behavior, set `spark.sql.legacy.mysql.bitArrayMapping.enabled` to `true`.
+- Since Spark 4.0, MySQL JDBC datasource will write ShortType as SMALLINT, while in Spark 3.5 and previous, write as INTEGER. To restore the previous behavior, you can replace the column with IntegerType whenever before writing.
+- Since Spark 4.0, MySQL JDBC datasource will write TimestampNTZType as MySQL DATETIME because they both represent TIMESTAMP WITHOUT TIME ZONE, while in 3.5 and previous, it wrote as MySQL TIMESTAMP. To restore the previous behavior, set `spark.sql.legacy.mysql.timestampNTZMapping.enabled` to `true`.
+- Since Spark 4.0, Oracle JDBC datasource will write TimestampType as TIMESTAMP WITH LOCAL TIME ZONE, while in Spark 3.5 and previous, write as TIMESTAMP. To restore the previous behavior, set `spark.sql.legacy.oracle.timestampMapping.enabled` to `true`.
+- Since Spark 4.0, MsSQL Server JDBC datasource will read TINYINT as ShortType, while in Spark 3.5 and previous, read as IntegerType. To restore the previous behavior, set `spark.sql.legacy.mssqlserver.numericMapping.enabled` to `true`.
+- Since Spark 4.0, MsSQL Server JDBC datasource will read DATETIMEOFFSET as TimestampType, while in Spark 3.5 and previous, read as StringType. To restore the previous behavior, set `spark.sql.legacy.mssqlserver.datetimeoffsetMapping.enabled` to `true`.
+- Since Spark 4.0, DB2 JDBC datasource will read SMALLINT as ShortType, while in Spark 3.5 and previous, it was read as IntegerType. To restore the previous behavior, set `spark.sql.legacy.db2.numericMapping.enabled` to `true`.
+- Since Spark 4.0, DB2 JDBC datasource will write BooleanType as BOOLEAN, while in Spark 3.5 and previous, write as CHAR(1). To restore the previous behavior, set `spark.sql.legacy.db2.booleanMapping.enabled` to `true`.
+- Since Spark 4.0, The default value for `spark.sql.legacy.ctePrecedencePolicy` has been changed from `EXCEPTION` to `CORRECTED`. Instead of raising an error, inner CTE definitions take precedence over outer definitions.
+- Since Spark 4.0, The default value for `spark.sql.legacy.timeParserPolicy` has been changed from `EXCEPTION` to `CORRECTED`. Instead of raising an `INCONSISTENT_BEHAVIOR_CROSS_VERSION` error, `CANNOT_PARSE_TIMESTAMP` will be raised if ANSI mode is enable. `NULL` will be returned if ANSI mode is disabled. See [Datetime Patterns for Formatting and Parsing](sql-ref-datetime-pattern.html).
+- Since Spark 4.0, A bug falsely allowing `!` instead of `NOT` when `!` is not a prefix operator has been fixed. Clauses such as `expr ! IN (...)`, `expr ! BETWEEN ...`, or `col ! NULL` now raise syntax errors. To restore the previous behavior, set `spark.sql.legacy.bangEqualsNot` to `true`. 
+- Since Spark 4.0, By default views tolerate column type changes in the query and compensate with casts. To restore the previous behavior, allowing up-casts only, set `spark.sql.legacy.viewSchemaCompensation` to `false`.
+- Since Spark 4.0, Views allow control over how they react to underlying query changes. By default views tolerate column type changes in the query and compensate with casts. To disable this feature set `spark.sql.legacy.viewSchemaBindingMode` to `false`. This also removes the clause from `DESCRIBE EXTENDED` and `SHOW CREATE TABLE`.
+- Since Spark 4.0, The Storage-Partitioned Join feature flag `spark.sql.sources.v2.bucketing.pushPartValues.enabled` is set to `true`. To restore the previous behavior, set `spark.sql.sources.v2.bucketing.pushPartValues.enabled` to `false`.
+- Since Spark 4.0, the `sentences` function uses `Locale(language)` instead of `Locale.US` when `language` parameter is not `NULL` and `country` parameter is `NULL`.
+- Since Spark 4.0, reading from a file source table will correctly respect query options, e.g. delimiters. Previously, the first query plan was cached and subsequent option changes ignored. To restore the previous behavior, set `spark.sql.legacy.readFileSourceTableCacheIgnoreOptions` to `true`.
+
+## Upgrading from Spark SQL 3.5.3 to 3.5.4
+
+- Since Spark 3.5.4, when reading SQL tables hits `org.apache.hadoop.security.AccessControlException` and `org.apache.hadoop.hdfs.BlockMissingException`, the exception will be thrown and fail the task, even if `spark.sql.files.ignoreCorruptFiles` is set to `true`.
+
+## Upgrading from Spark SQL 3.5.1 to 3.5.2
+
+- Since 3.5.2, MySQL JDBC datasource will read TINYINT UNSIGNED as ShortType, while in 3.5.1, it was wrongly read as ByteType.
+
+## Upgrading from Spark SQL 3.5.0 to 3.5.1
+
+- Since Spark 3.5.1, MySQL JDBC datasource will read TINYINT(n > 1) and TINYINT UNSIGNED as ByteType, while in Spark 3.5.0 and below, they were read as IntegerType. To restore the previous behavior, you can cast the column to the old type.
+
+## Upgrading from Spark SQL 3.4 to 3.5
+
+- Since Spark 3.5, the JDBC options related to DS V2 pushdown are `true` by default. These options include: `pushDownAggregate`, `pushDownLimit`, `pushDownOffset` and `pushDownTableSample`. To restore the legacy behavior, please set them to `false`. e.g. set `spark.sql.catalog.your_catalog_name.pushDownAggregate` to `false`.
+- Since Spark 3.5, Spark thrift server will interrupt task when canceling a running statement. To restore the previous behavior, set `spark.sql.thriftServer.interruptOnCancel` to `false`.
+- Since Spark 3.5, Row's json and prettyJson methods are moved to `ToJsonUtil`.
+- Since Spark 3.5, the `plan` field is moved from `AnalysisException` to `EnhancedAnalysisException`.
+- Since Spark 3.5, `spark.sql.optimizer.canChangeCachedPlanOutputPartitioning` is enabled by default. To restore the previous behavior, set `spark.sql.optimizer.canChangeCachedPlanOutputPartitioning` to `false`.
+- Since Spark 3.5, the `array_insert` function is 1-based for negative indexes. It inserts new element at the end of input arrays for the index -1. To restore the previous behavior, set `spark.sql.legacy.negativeIndexInArrayInsert` to `true`.
+- Since Spark 3.5, the Avro will throw `AnalysisException` when reading Interval types as Date or Timestamp types, or reading Decimal types with lower precision. To restore the legacy behavior, set `spark.sql.legacy.avro.allowIncompatibleSchema` to `true`
+
+## Upgrading from Spark SQL 3.3 to 3.4
+
+  - Since Spark 3.4, INSERT INTO commands with explicit column lists comprising fewer columns than the target table will automatically add the corresponding default values for the remaining columns (or NULL for any column lacking an explicitly-assigned default value). In Spark 3.3 or earlier, these commands would have failed returning errors reporting that the number of provided columns does not match the number of columns in the target table. Note that disabling `spark.sql.defaultColumn.useNullsForMissingDefaultValues` will restore the previous behavior.
+  - Since Spark 3.4, Number or Number(\*) from Teradata will be treated as Decimal(38,18). In Spark 3.3 or earlier, Number or Number(\*) from Teradata will be treated as Decimal(38, 0), in which case the fractional part will be removed.
+  - Since Spark 3.4, v1 database, table, permanent view and function identifier will include 'spark_catalog' as the catalog name if database is defined, e.g. a table identifier will be: `spark_catalog.default.t`. To restore the legacy behavior, set `spark.sql.legacy.v1IdentifierNoCatalog` to `true`.
+  - Since Spark 3.4, when ANSI SQL mode(configuration `spark.sql.ansi.enabled`) is on, Spark SQL always returns NULL result on getting a map value with a non-existing key. In Spark 3.3 or earlier, there will be an error.
+  - Since Spark 3.4, the SQL CLI `spark-sql` does not print the prefix `Error in query:` before the error message of `AnalysisException`.
+  - Since Spark 3.4, `split` function ignores trailing empty strings when `regex` parameter is empty.
+  - Since Spark 3.4, the `to_binary` function throws error for a malformed `str` input. Use `try_to_binary` to tolerate malformed input and return NULL instead.
+    - Valid Base64 string should include symbols from in base64 alphabet (A-Za-z0-9+/), optional padding (`=`), and optional whitespaces. Whitespaces are skipped in conversion except when they are preceded by padding symbol(s). If padding is present it should conclude the string and follow rules described in RFC 4648 § 4.
+    - Valid hexadecimal strings should include only allowed symbols (0-9A-Fa-f).
+    - Valid values for `fmt` are case-insensitive `hex`, `base64`, `utf-8`, `utf8`.
+  - Since Spark 3.4, Spark throws only `PartitionsAlreadyExistException` when it creates partitions but some of them exist already. In Spark 3.3 or earlier, Spark can throw either `PartitionsAlreadyExistException` or `PartitionAlreadyExistsException`.
+  - Since Spark 3.4, Spark will do validation for partition spec in ALTER PARTITION to follow the behavior of `spark.sql.storeAssignmentPolicy` which may cause an exception if type conversion fails, e.g. `ALTER TABLE .. ADD PARTITION(p='a')` if column `p` is int type. To restore the legacy behavior, set `spark.sql.legacy.skipTypeValidationOnAlterPartition` to `true`.
+  - Since Spark 3.4, vectorized readers are enabled by default for the nested data types (array, map and struct). To restore the legacy behavior, set `spark.sql.orc.enableNestedColumnVectorizedReader` and `spark.sql.parquet.enableNestedColumnVectorizedReader` to `false`.
+  - Since Spark 3.4, `BinaryType` is not supported in CSV datasource. In Spark 3.3 or earlier, users can write binary columns in CSV datasource, but the output content in CSV files is `Object.toString()` which is meaningless; meanwhile, if users read CSV tables with binary columns, Spark will throw an `Unsupported type: binary` exception.
+  - Since Spark 3.4, bloom filter joins are enabled by default. To restore the legacy behavior, set `spark.sql.optimizer.runtime.bloomFilter.enabled` to `false`.
+  - Since Spark 3.4, when schema inference on external Parquet files, INT64 timestamps with annotation `isAdjustedToUTC=false` will be inferred as TimestampNTZ type instead of Timestamp type. To restore the legacy behavior, set `spark.sql.parquet.inferTimestampNTZ.enabled` to `false`.
+  - Since Spark 3.4, the behavior for `CREATE TABLE AS SELECT ...` is changed from OVERWRITE to APPEND when `spark.sql.legacy.allowNonEmptyLocationInCTAS` is set to `true`. Users are recommended to avoid CTAS with a non-empty table location.
+
 ## Upgrading from Spark SQL 3.2 to 3.3
+
+  - Since Spark 3.3, the `histogram_numeric` function in Spark SQL returns an output type of an array of structs (x, y), where the type of the 'x' field in the return value is propagated from the input values consumed in the aggregate function. In Spark 3.2 or earlier, 'x' always had double type. Optionally, use the configuration `spark.sql.legacy.histogramNumericPropagateInputType` since Spark 3.3 to revert back to the previous behavior.
 
   - Since Spark 3.3, `DayTimeIntervalType` in Spark SQL is mapped to Arrow's `Duration` type in `ArrowWriter` and `ArrowColumnVector` developer APIs. Previously, `DayTimeIntervalType` was mapped to Arrow's `Interval` type which does not match with the types of other languages Spark SQL maps. For example, `DayTimeIntervalType` is mapped to `java.time.Duration` in Java.
 
-  - Since Spark 3.3, the functions `lpad` and `rpad` have been overloaded to support byte sequences. When the first argument is a byte sequence, the optional padding pattern must also be a byte sequence and the result is a BINARY value. The default padding pattern in this case is the zero byte.
+  - Since Spark 3.3, the functions `lpad` and `rpad` have been overloaded to support byte sequences. When the first argument is a byte sequence, the optional padding pattern must also be a byte sequence and the result is a BINARY value. The default padding pattern in this case is the zero byte. To restore the legacy behavior of always returning string types, set `spark.sql.legacy.lpadRpadAlwaysReturnString` to `true`.
 
-  - Since Spark 3.3, Spark turns a non-nullable schema into nullable for API `DataFrameReader.schema(schema: StructType).json(jsonDataset: Dataset[String])` and `DataFrameReader.schema(schema: StructType).csv(csvDataset: Dataset[String])` when the schema is specified by the user and contains non-nullable fields.
+  - Since Spark 3.3, Spark turns a non-nullable schema into nullable for API `DataFrameReader.schema(schema: StructType).json(jsonDataset: Dataset[String])` and `DataFrameReader.schema(schema: StructType).csv(csvDataset: Dataset[String])` when the schema is specified by the user and contains non-nullable fields. To restore the legacy behavior of respecting the nullability, set `spark.sql.legacy.respectNullabilityInTextDatasetConversion` to `true`.
 
   - Since Spark 3.3, when the date or timestamp pattern is not specified, Spark converts an input string to a date/timestamp using the `CAST` expression approach. The changes affect CSV/JSON datasources and parsing of partition values. In Spark 3.2 or earlier, when the date or timestamp pattern is not set, Spark uses the default patterns: `yyyy-MM-dd` for dates and `yyyy-MM-dd HH:mm:ss` for timestamps. After the changes, Spark still recognizes the pattern together with
-    
+
     Date patterns:
       * `[+-]yyyy*`
       * `[+-]yyyy*-[m]m`
@@ -39,7 +271,7 @@ license: |
       * `[+-]yyyy*-[m]m-[d]d `
       * `[+-]yyyy*-[m]m-[d]d *`
       * `[+-]yyyy*-[m]m-[d]dT*`
-    
+
     Timestamp patterns:
       * `[+-]yyyy*`
       * `[+-]yyyy*-[m]m`
@@ -50,7 +282,27 @@ license: |
       * `[h]h:[m]m:[s]s.[ms][ms][ms][us][us][us][zone_id]`
       * `T[h]h:[m]m:[s]s.[ms][ms][ms][us][us][us][zone_id]`
 
-  - Since Spark 3.3, the `strfmt` in `format_string(strfmt, obj, ...)` and `printf(strfmt, obj, ...)` will no longer support to use "0$" to specify the first argument, the first argument should always reference by "1$" when use argument index to indicating the position of the argument in the argument list.
+  - Since Spark 3.3, the `strfmt` in `format_string(strfmt, obj, ...)` and `printf(strfmt, obj, ...)` will no longer support to use `0$` to specify the first argument, the first argument should always reference by `1$` when use argument index to indicating the position of the argument in the argument list.
+
+  - Since Spark 3.3, nulls are written as empty strings in CSV data source by default. In Spark 3.2 or earlier, nulls were written as empty strings as quoted empty strings, `""`. To restore the previous behavior, set `nullValue` to `""`, or set the configuration `spark.sql.legacy.nullValueWrittenAsQuotedEmptyStringCsv` to `true`.
+
+  - Since Spark 3.3, DESCRIBE FUNCTION fails if the function does not exist. In Spark 3.2 or earlier, DESCRIBE FUNCTION can still run and print "Function: func_name not found".
+
+  - Since Spark 3.3, the table property `external` becomes reserved. Certain commands will fail if you specify the `external` property, such as `CREATE TABLE ... TBLPROPERTIES` and `ALTER TABLE ... SET TBLPROPERTIES`. In Spark 3.2 and earlier, the table property `external` is silently ignored. You can set `spark.sql.legacy.notReserveProperties` to `true` to restore the old behavior.
+
+  - Since Spark 3.3, DROP FUNCTION fails if the function name matches one of the built-in functions' name and is not qualified. In Spark 3.2 or earlier, DROP FUNCTION can still drop a persistent function even if the name is not qualified and is the same as a built-in function's name.
+
+  - Since Spark 3.3, when reading values from a JSON attribute defined as `FloatType` or `DoubleType`, the strings `"+Infinity"`, `"+INF"`, and `"-INF"` are now parsed to the appropriate values, in addition to the already supported `"Infinity"` and `"-Infinity"` variations. This change was made to improve consistency with Jackson's parsing of the unquoted versions of these values. Also, the `allowNonNumericNumbers` option is now respected so these strings will now be considered invalid if this option is disabled.
+
+  - Since Spark 3.3, Spark will try to use built-in data source writer instead of Hive serde in `INSERT OVERWRITE DIRECTORY`. This behavior is effective only if `spark.sql.hive.convertMetastoreParquet` or `spark.sql.hive.convertMetastoreOrc` is enabled respectively for Parquet and ORC formats. To restore the behavior before Spark 3.3, you can set `spark.sql.hive.convertMetastoreInsertDir` to `false`.
+
+  - Since Spark 3.3, the precision of the return type of round-like functions has been fixed. This may cause Spark throw `AnalysisException` of the `CANNOT_UP_CAST_DATATYPE` error class when using views created by prior versions. In such cases, you need to recreate the views using ALTER VIEW AS or CREATE OR REPLACE VIEW AS with newer Spark versions.
+
+  - Since Spark 3.3, the `unbase64` function throws error for a malformed `str` input. Use `try_to_binary(<str>, 'base64')` to tolerate malformed input and return NULL instead. In Spark 3.2 and earlier, the `unbase64` function returns a best-efforts result for a malformed `str` input.
+
+  - Since Spark 3.3, when reading Parquet files that were not produced by Spark, Parquet timestamp columns with annotation `isAdjustedToUTC = false` are inferred as TIMESTAMP_NTZ type during schema inference. In Spark 3.2 and earlier, these columns are inferred as TIMESTAMP type. To restore the behavior before Spark 3.3, you can set `spark.sql.parquet.inferTimestampNTZ.enabled` to `false`.
+
+  - Since Spark 3.3.1 and 3.2.3, for `SELECT ... GROUP BY a GROUPING SETS (b)`-style SQL statements, `grouping__id` returns different values from Apache Spark 3.2.0, 3.2.1, 3.2.2, and 3.3.0. It computes based on user-given group-by expressions plus grouping set columns. To restore the behavior before 3.3.1 and 3.2.3, you can set `spark.sql.legacy.groupingIdWithAppendedUserGroupBy`. For details, see [SPARK-40218](https://issues.apache.org/jira/browse/SPARK-40218) and [SPARK-40562](https://issues.apache.org/jira/browse/SPARK-40562).
 
 ## Upgrading from Spark SQL 3.1 to 3.2
 
@@ -58,13 +310,15 @@ license: |
 
   - Since Spark 3.2, all the supported JDBC dialects use StringType for ROWID. In Spark 3.1 or earlier, Oracle dialect uses StringType and the other dialects use LongType.
 
+  - Since Spark 3.2, Parquet files with nanosecond precision for timestamp type (`INT64 (TIMESTAMP(NANOS, true))`) are not readable. To restore the behavior before Spark 3.2, you can set `spark.sql.legacy.parquet.nanosAsLong` to `true`. Since Spark 4.3, with the preview flag `spark.sql.timestampNanosTypes.enabled`, these files can be read as nanosecond-precision timestamp types instead; see [Upgrading from Spark SQL 4.2 to 4.3](#upgrading-from-spark-sql-42-to-43).
+
   - In Spark 3.2, PostgreSQL JDBC dialect uses StringType for MONEY and MONEY[] is not supported due to the JDBC driver for PostgreSQL can't handle those types properly. In Spark 3.1 or earlier, DoubleType and ArrayType of DoubleType are used respectively.
 
   - In Spark 3.2, `spark.sql.adaptive.enabled` is enabled by default. To restore the behavior before Spark 3.2, you can set `spark.sql.adaptive.enabled` to `false`.
 
   - In Spark 3.2, the following meta-characters are escaped in the `show()` action. In Spark 3.1 or earlier, the following metacharacters are output as it is.
     * `\n` (new line)
-    * `\r` (carrige ret)
+    * `\r` (carriage ret)
     * `\t` (horizontal tab)
     * `\f` (form feed)
     * `\b` (backspace)
@@ -76,9 +330,9 @@ license: |
   - In Spark 3.2, script transform default FIELD DELIMIT is `\u0001` for no serde mode, serde property `field.delim` is `\t` for Hive serde mode when user specifies serde. In Spark 3.1 or earlier, the default FIELD DELIMIT is `\t`, serde property `field.delim` is `\u0001` for Hive serde mode when user specifies serde.
 
   - In Spark 3.2, the auto-generated `Cast` (such as those added by type coercion rules) will be stripped when generating column alias names. E.g., `sql("SELECT floor(1)").columns` will be `FLOOR(1)` instead of `FLOOR(CAST(1 AS DOUBLE))`.
-  
+
   - In Spark 3.2, the output schema of `SHOW TABLES` becomes `namespace: string, tableName: string, isTemporary: boolean`. In Spark 3.1 or earlier, the `namespace` field was named `database` for the builtin catalog, and there is no `isTemporary` field for v2 catalogs. To restore the old schema with the builtin catalog, you can set `spark.sql.legacy.keepCommandOutputSchema` to `true`.
-  
+
   - In Spark 3.2, the output schema of `SHOW TABLE EXTENDED` becomes `namespace: string, tableName: string, isTemporary: boolean, information: string`. In Spark 3.1 or earlier, the `namespace` field was named `database` for the builtin catalog, and no change for the v2 catalogs. To restore the old schema with the builtin catalog, you can set `spark.sql.legacy.keepCommandOutputSchema` to `true`.
 
   - In Spark 3.2, the output schema of `SHOW TBLPROPERTIES` becomes `key: string, value: string` whether you specify the table property key or not. In Spark 3.1 and earlier, the output schema of `SHOW TBLPROPERTIES` is `value: string` when you specify the table property key. To restore the old schema with the builtin catalog, you can set `spark.sql.legacy.keepCommandOutputSchema` to `true`.
@@ -100,7 +354,7 @@ license: |
   - In Spark 3.2, the usage of `count(tblName.*)` is blocked to avoid producing ambiguous results. Because `count(*)` and `count(tblName.*)` will output differently if there is any null values. To restore the behavior before Spark 3.2, you can set `spark.sql.legacy.allowStarWithSingleTableIdentifierInCount` to `true`.
 
   - In Spark 3.2, we support typed literals in the partition spec of INSERT and ADD/DROP/RENAME PARTITION. For example, `ADD PARTITION(dt = date'2020-01-01')` adds a partition with date value `2020-01-01`. In Spark 3.1 and earlier, the partition value will be parsed as string value `date '2020-01-01'`, which is an illegal date value, and we add a partition with null value at the end.
-      
+
   - In Spark 3.2, `DataFrameNaFunctions.replace()` no longer uses exact string match for the input column names, to match the SQL syntax and support qualified column names. Input column name having a dot in the name (not nested) needs to be escaped with backtick \`. Now, it throws `AnalysisException` if the column is not found in the data frame schema. It also throws `IllegalArgumentException` if the input column name is a nested column. In Spark 3.1 and earlier, it used to ignore invalid input column name and nested column name.
 
   - In Spark 3.2, the dates subtraction expression such as `date1 - date2` returns values of `DayTimeIntervalType`. In Spark 3.1 and earlier, the returned type is `CalendarIntervalType`. To restore the behavior before Spark 3.2, you can set `spark.sql.legacy.interval.enabled` to `true`.
@@ -111,11 +365,11 @@ license: |
 
   - In Spark 3.2, `TRANSFORM` operator can't support alias in inputs. In Spark 3.1 and earlier, we can write script transform like `SELECT TRANSFORM(a AS c1, b AS c2) USING 'cat' FROM TBL`.
 
-  - In Spark 3.2, `TRANSFORM` operator can support `ArrayType/MapType/StructType` without Hive SerDe, in this mode, we use `StructsToJosn` to convert `ArrayType/MapType/StructType` column to `STRING` and use `JsonToStructs` to parse `STRING` to `ArrayType/MapType/StructType`. In Spark 3.1, Spark just support case `ArrayType/MapType/StructType` column as `STRING` but can't support parse `STRING` to `ArrayType/MapType/StructType` output columns.
+  - In Spark 3.2, `TRANSFORM` operator can support `ArrayType/MapType/StructType` without Hive SerDe, in this mode, we use `StructsToJson` to convert `ArrayType/MapType/StructType` column to `STRING` and use `JsonToStructs` to parse `STRING` to `ArrayType/MapType/StructType`. In Spark 3.1, Spark just support case `ArrayType/MapType/StructType` column as `STRING` but can't support parse `STRING` to `ArrayType/MapType/StructType` output columns.
 
   - In Spark 3.2, the unit-to-unit interval literals like `INTERVAL '1-1' YEAR TO MONTH` and the unit list interval literals like `INTERVAL '3' DAYS '1' HOUR` are converted to ANSI interval types: `YearMonthIntervalType` or `DayTimeIntervalType`. In Spark 3.1 and earlier, such interval literals are converted to `CalendarIntervalType`. To restore the behavior before Spark 3.2, you can set `spark.sql.legacy.interval.enabled` to `true`.
 
-  - In Spark 3.2, the unit list interval literals can not mix year-month fields (YEAR and MONTH) and day-time fields (WEEK, DAY, ..., MICROSECOND). For example, `INTERVAL 1 day 1 hour` is invalid in Spark 3.2. In Spark 3.1 and earlier, there is no such limitation and the literal returns value of `CalendarIntervalType`. To restore the behavior before Spark 3.2, you can set `spark.sql.legacy.interval.enabled` to `true`.
+  - In Spark 3.2, the unit list interval literals can not mix year-month fields (YEAR and MONTH) and day-time fields (WEEK, DAY, ..., MICROSECOND). For example, `INTERVAL 1 month 1 hour` is invalid in Spark 3.2. In Spark 3.1 and earlier, there is no such limitation and the literal returns value of `CalendarIntervalType`. To restore the behavior before Spark 3.2, you can set `spark.sql.legacy.interval.enabled` to `true`.
 
   - In Spark 3.2, Spark supports `DayTimeIntervalType` and `YearMonthIntervalType` as inputs and outputs of `TRANSFORM` clause in Hive `SERDE` mode, the behavior is different between Hive `SERDE` mode and `ROW FORMAT DELIMITED` mode when these two types are used as inputs. In Hive `SERDE` mode, `DayTimeIntervalType` column is converted to `HiveIntervalDayTime`, its string format is `[-]?d h:m:s.n`, but in `ROW FORMAT DELIMITED` mode the format is `INTERVAL '[-]?d h:m:s.n' DAY TO TIME`. In Hive `SERDE` mode, `YearMonthIntervalType` column is converted to `HiveIntervalYearMonth`, its string format is `[-]?y-m`, but in `ROW FORMAT DELIMITED` mode the format is `INTERVAL '[-]?y-m' YEAR TO MONTH`.
 
@@ -124,14 +378,16 @@ license: |
   - In Spark 3.2, `CREATE TABLE AS SELECT` with non-empty `LOCATION` will throw `AnalysisException`. To restore the behavior before Spark 3.2, you can set `spark.sql.legacy.allowNonEmptyLocationInCTAS` to `true`.
 
   - In Spark 3.2, special datetime values such as `epoch`, `today`, `yesterday`, `tomorrow`, and `now` are supported in typed literals or in cast of foldable strings only, for instance, `select timestamp'now'` or `select cast('today' as date)`. In Spark 3.1 and 3.0, such special values are supported in any casts of strings to dates/timestamps. To keep these special values as dates/timestamps in Spark 3.1 and 3.0, you should replace them manually, e.g. `if (c in ('now', 'today'), current_date(), cast(c as date))`.
-  
-  - In Spark 3.2, `FloatType` is mapped to `FLOAT` in MySQL. Prior to this, it used to be mapped to `REAL`, which is by default a synonym to `DOUBLE PRECISION` in MySQL. 
+
+  - In Spark 3.2, `FloatType` is mapped to `FLOAT` in MySQL. Prior to this, it used to be mapped to `REAL`, which is by default a synonym to `DOUBLE PRECISION` in MySQL.
 
   - In Spark 3.2, the query executions triggered by `DataFrameWriter` are always named `command` when being sent to `QueryExecutionListener`. In Spark 3.1 and earlier, the name is one of `save`, `insertInto`, `saveAsTable`.
-  
+
   - In Spark 3.2, `Dataset.unionByName` with `allowMissingColumns` set to true will add missing nested fields to the end of structs. In Spark 3.1, nested struct fields are sorted alphabetically.
 
   - In Spark 3.2, create/alter view will fail if the input query output columns contain auto-generated alias. This is necessary to make sure the query output column names are stable across different spark versions. To restore the behavior before Spark 3.2, set `spark.sql.legacy.allowAutoGeneratedAliasForView` to `true`.
+
+  - In Spark 3.2, date +/- interval with only day-time fields such as `date '2011-11-11' + interval 12 hours` returns timestamp. In Spark 3.1 and earlier, the same expression returns date. To restore the behavior before Spark 3.2, you can use `cast` to convert timestamp as date.
 
 ## Upgrading from Spark SQL 3.0 to 3.1
 
@@ -140,9 +396,9 @@ license: |
   - In Spark 3.1, grouping_id() returns long values. In Spark version 3.0 and earlier, this function returns int values. To restore the behavior before Spark 3.1, you can set `spark.sql.legacy.integerGroupingId` to `true`.
 
   - In Spark 3.1, SQL UI data adopts the `formatted` mode for the query plan explain results. To restore the behavior before Spark 3.1, you can set `spark.sql.ui.explainMode` to `extended`.
-  
+
   - In Spark 3.1, `from_unixtime`, `unix_timestamp`,`to_unix_timestamp`, `to_timestamp` and `to_date` will fail if the specified datetime pattern is invalid. In Spark 3.0 or earlier, they result `NULL`.
-  
+
   - In Spark 3.1, the Parquet, ORC, Avro and JSON datasources throw the exception `org.apache.spark.sql.AnalysisException: Found duplicate column(s) in the data schema` in read if they detect duplicate names in top-level columns as well in nested structures. The datasources take into account the SQL config `spark.sql.caseSensitive` while detecting column name duplicates.
 
   - In Spark 3.1, structs and maps are wrapped by the `{}` brackets in casting them to strings. For instance, the `show()` action and the `CAST` expression use such brackets. In Spark 3.0 and earlier, the `[]` brackets are used for the same purpose. To restore the behavior before Spark 3.1, you can set `spark.sql.legacy.castComplexTypesToString.enabled` to `true`.
@@ -156,16 +412,16 @@ license: |
   - In Spark 3.1, `IllegalArgumentException` is returned for the incomplete interval literals, e.g. `INTERVAL '1'`, `INTERVAL '1 DAY 2'`, which are invalid. In Spark 3.0, these literals result in `NULL`s.
 
   - In Spark 3.1, we remove the built-in Hive 1.2. You need to migrate your custom SerDes to Hive 2.3. See [HIVE-15167](https://issues.apache.org/jira/browse/HIVE-15167) for more details.
-  
+
   - In Spark 3.1, loading and saving of timestamps from/to parquet files fails if the timestamps are before 1900-01-01 00:00:00Z, and loaded (saved) as the INT96 type. In Spark 3.0, the actions don't fail but might lead to shifting of the input timestamps due to rebasing from/to Julian to/from Proleptic Gregorian calendar. To restore the behavior before Spark 3.1, you can set `spark.sql.legacy.parquet.int96RebaseModeInRead` or/and `spark.sql.legacy.parquet.int96RebaseModeInWrite` to `LEGACY`.
-  
-  - In Spark 3.1, the `schema_of_json` and `schema_of_csv` functions return the schema in the SQL format in which field names are quoted. In Spark 3.0, the function returns a catalog string without field quoting and in lower case. 
+
+  - In Spark 3.1, the `schema_of_json` and `schema_of_csv` functions return the schema in the SQL format in which field names are quoted. In Spark 3.0, the function returns a catalog string without field quoting and in lower case.
 
   - In Spark 3.1, refreshing a table will trigger an uncache operation for all other caches that reference the table, even if the table itself is not cached. In Spark 3.0 the operation will only be triggered if the table itself is cached.
-  
+
   - In Spark 3.1, creating or altering a permanent view will capture runtime SQL configs and store them as view properties. These configs will be applied during the parsing and analysis phases of the view resolution. To restore the behavior before Spark 3.1, you can set `spark.sql.legacy.useCurrentConfigsForView` to `true`.
 
-  - In Spark 3.1, the temporary view will have same behaviors with the permanent view, i.e. capture and store runtime SQL configs, SQL text, catalog and namespace. The capatured view properties will be applied during the parsing and analysis phases of the view resolution. To restore the behavior before Spark 3.1, you can set `spark.sql.legacy.storeAnalyzedPlanForView` to `true`.
+  - In Spark 3.1, the temporary view will have same behaviors with the permanent view, i.e. capture and store runtime SQL configs, SQL text, catalog and namespace. The captured view properties will be applied during the parsing and analysis phases of the view resolution. To restore the behavior before Spark 3.1, you can set `spark.sql.legacy.storeAnalyzedPlanForView` to `true`.
 
   - In Spark 3.1, temporary view created via `CACHE TABLE ... AS SELECT` will also have the same behavior with permanent view. In particular, when the temporary view is dropped, Spark will invalidate all its cache dependents, as well as the cache for the temporary view itself. This is different from Spark 3.0 and below, which only does the latter. To restore the previous behavior, you can set `spark.sql.legacy.storeAnalyzedPlanForView` to `true`.
 
@@ -183,7 +439,7 @@ license: |
 
   - In Spark 3.0.2, `PARTITION(col=null)` is always parsed as a null literal in the partition spec. In Spark 3.0.1 or earlier, it is parsed as a string literal of its text representation, e.g., string "null", if the partition column is string type. To restore the legacy behavior, you can set `spark.sql.legacy.parseNullPartitionSpecAsStringLiteral` as true.
 
-  - In Spark 3.0.0, the output schema of `SHOW DATABASES` becomes `namespace: string`. In Spark version 2.4 and earlier, the schema was `databaseName: string`. Since Spark 3.0.2, you can restore the old schema by setting `spark.sql.legacy.keepCommandOutputSchema` to `true`.
+  - In Spark 3.0.2, the output schema of `SHOW DATABASES` becomes `namespace: string`. In Spark version 3.0.1 and earlier, the schema was `databaseName: string`. Since Spark 3.0.2, you can restore the old schema by setting `spark.sql.legacy.keepCommandOutputSchema` to `true`.
 
 ## Upgrading from Spark SQL 3.0 to 3.0.1
 
@@ -199,7 +455,9 @@ license: |
 
   - In Spark 2.4 and below, `Dataset.groupByKey` results to a grouped dataset with key attribute is wrongly named as "value", if the key is non-struct type, for example, int, string, array, etc. This is counterintuitive and makes the schema of aggregation queries unexpected. For example, the schema of `ds.groupByKey(...).count()` is `(value, count)`. Since Spark 3.0, we name the grouping attribute to "key". The old behavior is preserved under a newly added configuration `spark.sql.legacy.dataset.nameNonStructGroupingKeyAsValue` with a default value of `false`.
 
-  - In Spark 3.0, the column metadata will always be propagated in the API `Column.name` and `Column.as`. In Spark version 2.4 and earlier, the metadata of `NamedExpression` is set as the `explicitMetadata` for the new column at the time the API is called, it won't change even if the underlying `NamedExpression` changes metadata. To restore the behavior before Spark 2.4, you can use the API `as(alias: String, metadata: Metadata)` with explicit metadata.
+  - In Spark 3.0, the column metadata will always be propagated in the API `Column.name` and `Column.as`. In Spark version 2.4 and earlier, the metadata of `NamedExpression` is set as the `explicitMetadata` for the new column at the time the API is called, it won't change even if the underlying `NamedExpression` changes metadata. To restore the behavior before Spark 3.0, you can use the API `as(alias: String, metadata: Metadata)` with explicit metadata.
+
+  - When turning a Dataset to another Dataset, Spark will up cast the fields in the original Dataset to the type of corresponding fields in the target DataSet. In version 2.4 and earlier, this up cast is not very strict, e.g. `Seq("str").toDS.as[Int]` fails, but `Seq("str").toDS.as[Boolean]` works and throw NPE during execution. In Spark 3.0, the up cast is stricter and turning String into something else is not allowed, i.e. `Seq("str").toDS.as[Boolean]` will fail during analysis. To restore the behavior before Spark 3.0, set `spark.sql.legacy.doLooseUpcast` to `true`.
 
 ### DDL Statements
 
@@ -219,7 +477,7 @@ license: |
     | location                 | yes               | yes            | For databases and tables, use the `LOCATION` clause to specify it. |
     | owner                    | yes               | yes            | For databases and tables, it is determined by the user who runs spark and create the table. |
 
- 
+
   - In Spark 3.0, you can use `ADD FILE` to add file directories as well. Earlier you could add only single files using this command. To restore the behavior of earlier versions, set `spark.sql.legacy.addSingleFileInAddFile` to `true`.
 
   - In Spark 3.0, `SHOW TBLPROPERTIES` throws `AnalysisException` if the table does not exist. In Spark version 2.4 and below, this scenario caused `NoSuchTableException`.
@@ -340,6 +598,10 @@ license: |
 
   - In Spark 3.0, datetime pattern letter `F` is **aligned day of week in month** that represents the concept of the count of days within the period of a week where the weeks are aligned to the start of the month. In Spark version 2.4 and earlier, it is **week of month** that represents the concept of the count of weeks within the month where weeks start on a fixed day-of-week, e.g. `2020-07-30` is 30 days (4 weeks and 2 days) after the first day of the month, so `date_format(date '2020-07-30', 'F')` returns 2 in Spark 3.0, but as a week count in Spark 2.x, it returns 5 because it locates in the 5th week of July 2020, where week one is 2020-07-01 to 07-04.
 
+  - In Spark 3.0, Spark will try to use built-in data source writer instead of Hive serde in `CTAS`. This behavior is effective only if `spark.sql.hive.convertMetastoreParquet` or `spark.sql.hive.convertMetastoreOrc` is enabled respectively for Parquet and ORC formats. To restore the behavior before Spark 3.0, you can set `spark.sql.hive.convertMetastoreCtas` to `false`.
+
+  - In Spark 3.0, Spark will try to use built-in data source writer instead of Hive serde to process inserting into partitioned ORC/Parquet tables created by using the HiveSQL syntax. This behavior is effective only if `spark.sql.hive.convertMetastoreParquet` or `spark.sql.hive.convertMetastoreOrc` is enabled respectively for Parquet and ORC formats. To restore the behavior before Spark 3.0, you can set `spark.sql.hive.convertInsertingPartitionedTable` to `false`.
+
 ### Data Sources
 
   - In Spark version 2.4 and below, when reading a Hive SerDe table with Spark native data sources(parquet/orc), Spark infers the actual file schema and update the table schema in metastore. In Spark 3.0, Spark doesn't infer the schema anymore. This should not cause any problems to end users, but if it does, set `spark.sql.hive.caseSensitiveInferenceMode` to `INFER_AND_SAVE`.
@@ -360,7 +622,7 @@ license: |
 
   - In Spark 3.0, when Avro files are written with user provided non-nullable schema, even the catalyst schema is nullable, Spark is still able to write the files. However, Spark throws runtime NullPointerException if any of the records contains null.
 
-  - In Spark version 2.4 and below, CSV datasource can detect encoding of input files automatically when the files have BOM at the beginning. For instance, CSV datasource can recognize UTF-8, UTF-16BE, UTF-16LE, UTF-32BE and UTF-32LE in the multi-line mode (the CSV option `multiLine` is set to `true`). In Spark 3.0, CSV datasource reads input files in encoding specified via the CSV option `encoding` which has the default value of UTF-8. In this way, if file encoding doesn't match to the encoding specified via the CSV option, Spark loads the file incorrectly. To solve the issue, users should either set correct encoding via the CSV option `encoding` or set the option to `null` which fallbacks to encoding auto-detection as in Spark versions before 3.0. 
+  - In Spark version 2.4 and below, CSV datasource can detect encoding of input files automatically when the files have BOM at the beginning. For instance, CSV datasource can recognize UTF-8, UTF-16BE, UTF-16LE, UTF-32BE and UTF-32LE in the multi-line mode (the CSV option `multiLine` is set to `true`). In Spark 3.0, CSV datasource reads input files in encoding specified via the CSV option `encoding` which has the default value of UTF-8. In this way, if file encoding doesn't match to the encoding specified via the CSV option, Spark loads the file incorrectly. To solve the issue, users should either set correct encoding via the CSV option `encoding` or set the option to `null` which fallbacks to encoding auto-detection as in Spark versions before 3.0.
 
 ### Others
 
@@ -387,7 +649,7 @@ license: |
   - In Spark 2.4.8, `AnalysisException` is replaced by its sub-classes that are thrown for tables from Hive external catalog in the following situations:
     * `ALTER TABLE .. ADD PARTITION` throws `PartitionsAlreadyExistException` if new partition exists already
     * `ALTER TABLE .. DROP PARTITION` throws `NoSuchPartitionsException` for not existing partitions
-    
+
 ## Upgrading from Spark SQL 2.4.5 to 2.4.6
 
   - In Spark 2.4.6, the `RESET` command does not reset the static SQL configuration values to the default. It only clears the runtime SQL configuration values.
@@ -410,26 +672,26 @@ license: |
     need to specify a value with units like "30s" now, to avoid being interpreted as milliseconds; otherwise,
     the extremely short interval that results will likely cause applications to fail.
 
-  - When turning a Dataset to another Dataset, Spark will up cast the fields in the original Dataset to the type of corresponding fields in the target DataSet. In version 2.4 and earlier, this up cast is not very strict, e.g. `Seq("str").toDS.as[Int]` fails, but `Seq("str").toDS.as[Boolean]` works and throw NPE during execution. In Spark 3.0, the up cast is stricter and turning String into something else is not allowed, i.e. `Seq("str").toDS.as[Boolean]` will fail during analysis.
-
 ## Upgrading from Spark SQL 2.3 to 2.4
 
   - In Spark version 2.3 and earlier, the second parameter to array_contains function is implicitly promoted to the element type of first array type parameter. This type promotion can be lossy and may cause `array_contains` function to return wrong result. This problem has been addressed in 2.4 by employing a safer type promotion mechanism. This can cause some change in behavior and are illustrated in the table below.
-    <table class="table">
-        <tr>
-          <th>
-            <b>Query</b>
-          </th>
-          <th>
-            <b>Spark 2.3 or Prior</b>
-          </th>
-          <th>
-            <b>Spark 2.4</b>
-          </th>
-          <th>
-            <b>Remarks</b>
-          </th>
-        </tr>
+    <table>
+        <thead>
+          <tr>
+            <th>
+              <b>Query</b>
+            </th>
+            <th>
+              <b>Spark 2.3 or Prior</b>
+            </th>
+            <th>
+              <b>Spark 2.4</b>
+            </th>
+            <th>
+              <b>Remarks</b>
+            </th>
+          </tr>
+        </thead>
         <tr>
           <td>
             <code>SELECT array_contains(array(1), 1.34D);</code>
@@ -527,140 +789,111 @@ license: |
   - Since Spark 2.3, the Join/Filter's deterministic predicates that are after the first non-deterministic predicates are also pushed down/through the child operators, if possible. In prior Spark versions, these filters are not eligible for predicate pushdown.
 
   - Partition column inference previously found incorrect common type for different inferred types, for example, previously it ended up with double type as the common type for double type and date type. Now it finds the correct common type for such conflicts. The conflict resolution follows the table below:
-    <table class="table">
-      <tr>
-        <th>
-          <b>InputA \ InputB</b>
-        </th>
-        <th>
-          <b>NullType</b>
-        </th>
-        <th>
-          <b>IntegerType</b>
-        </th>
-        <th>
-          <b>LongType</b>
-        </th>
-        <th>
-          <b>DecimalType(38,0)*</b>
-        </th>
-        <th>
-          <b>DoubleType</b>
-        </th>
-        <th>
-          <b>DateType</b>
-        </th>
-        <th>
-          <b>TimestampType</b>
-        </th>
-        <th>
-          <b>StringType</b>
-        </th>
-      </tr>
-      <tr>
-        <td>
-          <b>NullType</b>
-        </td>
-        <td>NullType</td>
-        <td>IntegerType</td>
-        <td>LongType</td>
-        <td>DecimalType(38,0)</td>
-        <td>DoubleType</td>
-        <td>DateType</td>
-        <td>TimestampType</td>
-        <td>StringType</td>
-      </tr>
-      <tr>
-        <td>
-          <b>IntegerType</b>
-        </td>
-        <td>IntegerType</td>
-        <td>IntegerType</td>
-        <td>LongType</td>
-        <td>DecimalType(38,0)</td>
-        <td>DoubleType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-      </tr>
-      <tr>
-        <td>
-          <b>LongType</b>
-        </td>
-        <td>LongType</td>
-        <td>LongType</td>
-        <td>LongType</td>
-        <td>DecimalType(38,0)</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-      </tr>
-      <tr>
-        <td>
-          <b>DecimalType(38,0)*</b>
-        </td>
-        <td>DecimalType(38,0)</td>
-        <td>DecimalType(38,0)</td>
-        <td>DecimalType(38,0)</td>
-        <td>DecimalType(38,0)</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-      </tr>
-      <tr>
-        <td>
-          <b>DoubleType</b>
-        </td>
-        <td>DoubleType</td>
-        <td>DoubleType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>DoubleType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-      </tr>
-      <tr>
-        <td>
-          <b>DateType</b>
-        </td>
-        <td>DateType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>DateType</td>
-        <td>TimestampType</td>
-        <td>StringType</td>
-      </tr>
-      <tr>
-        <td>
-          <b>TimestampType</b>
-        </td>
-        <td>TimestampType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>TimestampType</td>
-        <td>TimestampType</td>
-        <td>StringType</td>
-      </tr>
-      <tr>
-        <td>
-          <b>StringType</b>
-        </td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-        <td>StringType</td>
-      </tr>
+
+    <table>
+      <thead>
+        <tr>
+          <th><b>InputA \ InputB</b></th>
+          <th><b>NullType</b></th>
+          <th><b>IntegerType</b></th>
+          <th><b>LongType</b></th>
+          <th><b>DecimalType(38,0)*</b></th>
+          <th><b>DoubleType</b></th>
+          <th><b>DateType</b></th>
+          <th><b>TimestampType</b></th>
+          <th><b>StringType</b></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>NullType</b></td>
+          <td>NullType</td>
+          <td>IntegerType</td>
+          <td>LongType</td>
+          <td>DecimalType(38,0)</td>
+          <td>DoubleType</td>
+          <td>DateType</td>
+          <td>TimestampType</td>
+          <td>StringType</td>
+        </tr>
+        <tr>
+          <td><b>IntegerType</b></td>
+          <td>IntegerType</td>
+          <td>IntegerType</td>
+          <td>LongType</td>
+          <td>DecimalType(38,0)</td>
+          <td>DoubleType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+        </tr>
+        <tr>
+          <td><b>LongType</b></td>
+          <td>LongType</td>
+          <td>LongType</td>
+          <td>LongType</td>
+          <td>DecimalType(38,0)</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+         </tr>
+        <tr>
+          <td><b>DecimalType(38,0)*</b></td>
+          <td>DecimalType(38,0)</td>
+          <td>DecimalType(38,0)</td>
+          <td>DecimalType(38,0)</td>
+          <td>DecimalType(38,0)</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+        </tr>
+        <tr>
+          <td><b>DoubleType</b></td>
+          <td>DoubleType</td>
+          <td>DoubleType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>DoubleType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+        </tr>
+        <tr>
+          <td><b>DateType</b></td>
+          <td>DateType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>DateType</td>
+          <td>TimestampType</td>
+          <td>StringType</td>
+        </tr>
+        <tr>
+          <td><b>TimestampType</b></td>
+          <td>TimestampType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>TimestampType</td>
+          <td>TimestampType</td>
+          <td>StringType</td>
+        </tr>
+        <tr>
+          <td><b>StringType</b></td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+          <td>StringType</td>
+        </tr> 
+      </tbody>
     </table>
 
     Note that, for <b>DecimalType(38,0)*</b>, the table above intentionally does not cover all other combinations of scales and precisions because currently we only infer decimal type like `BigInteger`/`BigInt`. For example, 1.1 is inferred as double type.
@@ -798,11 +1031,11 @@ and deprecated the old APIs (e.g., `SQLContext.parquetFile`, `SQLContext.jsonFil
 See the API docs for `SQLContext.read` (
   <a href="api/scala/org/apache/spark/sql/SQLContext.html#read:DataFrameReader">Scala</a>,
   <a href="api/java/org/apache/spark/sql/SQLContext.html#read()">Java</a>,
-  <a href="api/python/reference/api/pyspark.sql.SparkSession.read.html#pyspark.sql.SparkSession.read">Python</a>
+  <a href="api/python/reference/pyspark.sql/api/pyspark.sql.SparkSession.read.html#pyspark.sql.SparkSession.read">Python</a>
 ) and `DataFrame.write` (
   <a href="api/scala/org/apache/spark/sql/DataFrame.html#write:DataFrameWriter">Scala</a>,
   <a href="api/java/org/apache/spark/sql/Dataset.html#write()">Java</a>,
-  <a href="api/python/reference/api/pyspark.sql.DataFrame.write.html#pyspark.sql.DataFrame.write">Python</a>
+  <a href="api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.write.html#pyspark.sql.DataFrame.write">Python</a>
 ) more information.
 
 
@@ -813,6 +1046,25 @@ Based on user feedback, we changed the default behavior of `DataFrame.groupBy().
 grouping columns in the resulting `DataFrame`. To keep the behavior in 1.3, set `spark.sql.retainGroupColumns` to `false`.
 
 <div class="codetabs">
+
+<div data-lang="python"  markdown="1">
+{% highlight python %}
+
+import pyspark.sql.functions as func
+
+# In 1.3.x, in order for the grouping column "department" to show up,
+# it must be included explicitly as part of the agg function call.
+df.groupBy("department").agg(df["department"], func.max("age"), func.sum("expense"))
+
+# In 1.4+, grouping column "department" is included automatically.
+df.groupBy("department").agg(func.max("age"), func.sum("expense"))
+
+# Revert to 1.3.x behavior (not retaining grouping column) by:
+sqlContext.setConf("spark.sql.retainGroupColumns", "false")
+
+{% endhighlight %}
+</div>
+
 <div data-lang="scala"  markdown="1">
 {% highlight scala %}
 
@@ -841,24 +1093,6 @@ df.groupBy("department").agg(max("age"), sum("expense"));
 
 // Revert to 1.3 behavior (not retaining grouping column) by:
 sqlContext.setConf("spark.sql.retainGroupColumns", "false");
-
-{% endhighlight %}
-</div>
-
-<div data-lang="python"  markdown="1">
-{% highlight python %}
-
-import pyspark.sql.functions as func
-
-# In 1.3.x, in order for the grouping column "department" to show up,
-# it must be included explicitly as part of the agg function call.
-df.groupBy("department").agg(df["department"], func.max("age"), func.sum("expense"))
-
-# In 1.4+, grouping column "department" is included automatically.
-df.groupBy("department").agg(func.max("age"), func.sum("expense"))
-
-# Revert to 1.3.x behavior (not retaining grouping column) by:
-sqlContext.setConf("spark.sql.retainGroupColumns", "false")
 
 {% endhighlight %}
 </div>
@@ -965,7 +1199,7 @@ Python UDF registration is unchanged.
 Spark SQL is designed to be compatible with the Hive Metastore, SerDes and UDFs.
 Currently, Hive SerDes and UDFs are based on built-in Hive,
 and Spark SQL can be connected to different versions of Hive Metastore
-(from 0.12.0 to 2.3.9 and 3.0.0 to 3.1.2. Also see [Interacting with Different Versions of Hive Metastore](sql-data-sources-hive-tables.html#interacting-with-different-versions-of-hive-metastore)).
+(from 2.0.0 to 2.3.10 and 3.0.0 to 4.2.0). Also see [Interacting with Different Versions of Hive Metastore](sql-data-sources-hive-tables.html#interacting-with-different-versions-of-hive-metastore).
 
 #### Deploying in Existing Hive Warehouses
 {:.no_toc}
@@ -1074,12 +1308,6 @@ Spark SQL supports the vast majority of Hive features, such as:
 
 Below is a list of Hive features that we don't support yet. Most of these features are rarely used
 in Hive deployments.
-
-**Major Hive Features**
-
-* Tables with buckets: bucket is the hash partitioning within a Hive table partition. Spark SQL
-  doesn't support buckets yet.
-
 
 **Esoteric Hive Features**
 

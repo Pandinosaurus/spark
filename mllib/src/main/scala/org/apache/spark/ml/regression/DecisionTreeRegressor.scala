@@ -22,18 +22,22 @@ import org.json4s.{DefaultFormats, JObject}
 import org.json4s.JsonDSL._
 
 import org.apache.spark.annotation.Since
+import org.apache.spark.internal.{LogKeys}
+import org.apache.spark.ml.feature.Instance
 import org.apache.spark.ml.linalg.Vector
 import org.apache.spark.ml.param.ParamMap
 import org.apache.spark.ml.tree._
 import org.apache.spark.ml.tree.DecisionTreeModelReadWrite._
 import org.apache.spark.ml.tree.impl.RandomForest
 import org.apache.spark.ml.util._
+import org.apache.spark.ml.util.DatasetUtils._
 import org.apache.spark.ml.util.Instrumentation.instrumented
 import org.apache.spark.mllib.tree.configuration.{Algo => OldAlgo, Strategy => OldStrategy}
 import org.apache.spark.mllib.tree.model.{DecisionTreeModel => OldDecisionTreeModel}
-import org.apache.spark.sql.{Column, DataFrame, Dataset}
+import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.storage.StorageLevel
 
 /**
  * <a href="http://en.wikipedia.org/wiki/Decision_tree_learning">Decision tree</a>
@@ -88,6 +92,10 @@ class DecisionTreeRegressor @Since("1.4.0") (@Since("1.4.0") override val uid: S
   @Since("1.4.0")
   def setCheckpointInterval(value: Int): this.type = set(checkpointInterval, value)
 
+  /** @group expertSetParam */
+  @Since("4.4.0")
+  def setIntermediateStorageLevel(value: String): this.type = set(intermediateStorageLevel, value)
+
   /** @group setParam */
   @Since("1.4.0")
   def setImpurity(value: String): this.type = set(impurity, value)
@@ -114,16 +122,25 @@ class DecisionTreeRegressor @Since("1.4.0") (@Since("1.4.0") override val uid: S
       dataset: Dataset[_]): DecisionTreeRegressionModel = instrumented { instr =>
     val categoricalFeatures: Map[Int, Int] =
       MetadataUtils.getCategoricalFeatures(dataset.schema($(featuresCol)))
-    val instances = extractInstances(dataset)
+
+    val instances = dataset.select(
+      checkRegressionLabels($(labelCol)),
+      checkNonNegativeWeights(get(weightCol)),
+      checkNonNanVectors($(featuresCol))
+    ).rdd.map { case Row(l: Double, w: Double, v: Vector) => Instance(l, w, v)
+    }.setName("training instances")
+
     val strategy = getOldStrategy(categoricalFeatures)
     require(!strategy.bootstrap, "DecisionTreeRegressor does not need bootstrap sampling")
 
     instr.logPipelineStage(this)
     instr.logDataset(instances)
-    instr.logParams(this, params: _*)
+    import org.apache.spark.util.ArrayImplicits._
+    instr.logParams(this, params.toImmutableArraySeq: _*)
 
     val trees = RandomForest.run(instances, strategy, numTrees = 1, featureSubsetStrategy = "all",
-      seed = $(seed), instr = Some(instr), parentUID = Some(uid))
+      seed = $(seed), instr = Some(instr), parentUID = Some(uid),
+      intermediateStorageLevel = StorageLevel.fromString($(intermediateStorageLevel)))
 
     trees.head.asInstanceOf[DecisionTreeRegressionModel]
   }
@@ -176,13 +193,15 @@ class DecisionTreeRegressionModel private[ml] (
   private[ml] def this(rootNode: Node, numFeatures: Int) =
     this(Identifiable.randomUID("dtr"), rootNode, numFeatures)
 
+  // For ml connect only
+  private[ml] def this() = this("", Node.dummyNode, -1)
+
+  override private[ml] val treeStats: NodeStats = rootNode.computeStats
+
+  private[spark] override def estimatedSize: Long = estimateMatadataSize + getEstimatedSize()
+
   override def predict(features: Vector): Double = {
     rootNode.predictImpl(features).prediction
-  }
-
-  /** We need to update this function if we ever add other impurity measures. */
-  protected def predictVariance(features: Vector): Double = {
-    rootNode.predictImpl(features).impurityStats.calculate()
   }
 
   @Since("1.4.0")
@@ -200,36 +219,43 @@ class DecisionTreeRegressionModel private[ml] (
   @Since("2.0.0")
   override def transform(dataset: Dataset[_]): DataFrame = {
     val outputSchema = transformSchema(dataset.schema, logging = true)
+    val localRootNode = rootNode
 
-    var predictionColNames = Seq.empty[String]
-    var predictionColumns = Seq.empty[Column]
+    var predColNames = Seq.empty[String]
+    var predCols = Seq.empty[Column]
 
     if ($(predictionCol).nonEmpty) {
-      val predictUDF = udf { features: Vector => predict(features) }
-      predictionColNames :+= $(predictionCol)
-      predictionColumns :+= predictUDF(col($(featuresCol)))
+      val predUDF = udf { features: Vector =>
+        localRootNode.predictImpl(features).prediction
+      }
+      predColNames :+= $(predictionCol)
+      predCols :+= predUDF(col($(featuresCol)))
         .as($(predictionCol), outputSchema($(predictionCol)).metadata)
     }
 
     if (isDefined(varianceCol) && $(varianceCol).nonEmpty) {
-      val predictVarianceUDF = udf { features: Vector => predictVariance(features) }
-      predictionColNames :+= $(varianceCol)
-      predictionColumns :+= predictVarianceUDF(col($(featuresCol)))
+      val varianceUDF = udf { features: Vector =>
+        localRootNode.predictImpl(features).impurityStats.calculate()
+      }
+      predColNames :+= $(varianceCol)
+      predCols :+= varianceUDF(col($(featuresCol)))
         .as($(varianceCol), outputSchema($(varianceCol)).metadata)
     }
 
     if ($(leafCol).nonEmpty) {
-      val leafUDF = udf { features: Vector => predictLeaf(features) }
-      predictionColNames :+= $(leafCol)
-      predictionColumns :+= leafUDF(col($(featuresCol)))
+      val leafUDF = udf { features: Vector =>
+        DecisionTreeModel.predictLeaf(features, localRootNode)
+      }
+      predColNames :+= $(leafCol)
+      predCols :+= leafUDF(col($(featuresCol)))
         .as($(leafCol), outputSchema($(leafCol)).metadata)
     }
 
-    if (predictionColNames.nonEmpty) {
-      dataset.withColumns(predictionColNames, predictionColumns)
+    if (predColNames.nonEmpty) {
+      dataset.withColumns(predColNames, predCols)
     } else {
-      this.logWarning(s"$uid: DecisionTreeRegressionModel.transform() does nothing" +
-        " because no output columns were set.")
+      this.logWarning(log"${MDC(LogKeys.UUID, uid)}: DecisionTreeRegressionModel.transform() " +
+        log"does nothing because no output columns were set.")
       dataset.toDF()
     }
   }
@@ -291,11 +317,13 @@ object DecisionTreeRegressionModel extends MLReadable[DecisionTreeRegressionMode
     override protected def saveImpl(path: String): Unit = {
       val extraMetadata: JObject = Map(
         "numFeatures" -> instance.numFeatures)
-      DefaultParamsWriter.saveMetadata(instance, path, sc, Some(extraMetadata))
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession, Some(extraMetadata))
       val (nodeData, _) = NodeData.build(instance.rootNode, 0)
       val dataPath = new Path(path, "data").toString
       val numDataParts = NodeData.inferNumPartitions(instance.numNodes)
-      sparkSession.createDataFrame(nodeData).repartition(numDataParts).write.parquet(dataPath)
+      ReadWriteUtils.saveArray(
+        dataPath, nodeData.toArray, sparkSession, NodeData.serializeData, numDataParts
+      )
     }
   }
 
@@ -307,7 +335,7 @@ object DecisionTreeRegressionModel extends MLReadable[DecisionTreeRegressionMode
 
     override def load(path: String): DecisionTreeRegressionModel = {
       implicit val format = DefaultFormats
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val numFeatures = (metadata.metadata \ "numFeatures").extract[Int]
       val root = loadTreeNodes(path, metadata, sparkSession)
       val model = new DecisionTreeRegressionModel(metadata.uid, root, numFeatures)

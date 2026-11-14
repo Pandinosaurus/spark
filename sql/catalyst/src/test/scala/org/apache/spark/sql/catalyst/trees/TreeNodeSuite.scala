@@ -18,9 +18,15 @@
 package org.apache.spark.sql.catalyst.trees
 
 import java.math.BigInteger
-import java.util.UUID
+import java.util.{IdentityHashMap, UUID}
+import java.util.concurrent.{CyclicBarrier, TimeUnit}
+import java.util.concurrent.atomic.AtomicInteger
 
+import scala.annotation.nowarn
 import scala.collection.mutable.ArrayBuffer
+import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration._
+import scala.util.hashing.MurmurHash3
 
 import org.json4s.JsonAST._
 import org.json4s.JsonDSL._
@@ -37,9 +43,12 @@ import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
 import org.apache.spark.sql.catalyst.plans.{LeftOuter, NaturalJoin, SQLHelper}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.plans.physical.{IdentityBroadcastMode, RoundRobinPartitioning, SinglePartition}
+import org.apache.spark.sql.catalyst.rules.RuleId
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.storage.StorageLevel
+import org.apache.spark.util.ThreadUtils
+import org.apache.spark.util.collection.BitSet
 
 case class Dummy(optKey: Option[Expression]) extends Expression with CodegenFallback {
   override def children: Seq[Expression] = optKey.toSeq
@@ -49,6 +58,20 @@ case class Dummy(optKey: Option[Expression]) extends Expression with CodegenFall
   override def eval(input: InternalRow): Any = null.asInstanceOf[Any]
   override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Expression =
     copy(optKey = if (optKey.isDefined) Some(newChildren(0)) else None)
+}
+
+case class SpecializedUnary(child: Expression) extends Expression with CodegenFallback {
+  override def children: Seq[Expression] =
+    throw new IllegalStateException("children should not be materialized")
+  override def mapChildren(f: Expression => Expression): Expression = {
+    val newChild = f(child)
+    if (newChild fastEquals child) this else copy(child = newChild)
+  }
+  override def nullable: Boolean = child.nullable
+  override def dataType: DataType = child.dataType
+  override def eval(input: InternalRow): Any = child.eval(input)
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[Expression]): Expression = copy(child = newChildren.head)
 }
 
 case class ComplexPlan(exprs: Seq[Seq[Expression]])
@@ -97,7 +120,103 @@ case class FakeLeafPlan(child: LogicalPlan)
 
 case class FakeCurryingProduct(x: Expression)(val y: Int)
 
+case class ConcurrentTreeNode(barrier: CyclicBarrier, computeCount: AtomicInteger)
+  extends LeafNode {
+  override def output: Seq[Attribute] = Nil
+
+  override protected def getDefaultTreePatternBits: BitSet = {
+    computeCount.incrementAndGet()
+    barrier.await(10, TimeUnit.SECONDS)
+    new BitSet(TreePattern.maxId)
+  }
+}
+
 class TreeNodeSuite extends SparkFunSuite with SQLHelper {
+  test("constructing unused Literals does not allocate eager cache state") {
+    val literal = Literal(1)
+    val cacheFields = classOf[TreeNode[_]].getDeclaredFields
+      .filter(_.getName.endsWith("CacheValue"))
+
+    assert(cacheFields.length === 5)
+    cacheFields.foreach { field =>
+      field.setAccessible(true)
+      assert(field.get(literal) === null, s"${field.getName} was eagerly initialized")
+    }
+  }
+
+  test("concurrent cache initialization returns and reuses the selected value") {
+    val barrier = new CyclicBarrier(2)
+    val computeCount = new AtomicInteger
+    val node = ConcurrentTreeNode(barrier, computeCount)
+    val executor = ThreadUtils.newDaemonFixedThreadPool(2, "tree-node-cache-test")
+    val executionContext = ExecutionContext.fromExecutorService(executor)
+    try {
+      val first = Future(node.treePatternBits)(executionContext)
+      val second = Future(node.treePatternBits)(executionContext)
+      val firstResult = ThreadUtils.awaitResult(first, 10.seconds)
+      val secondResult = ThreadUtils.awaitResult(second, 10.seconds)
+
+      assert(firstResult eq secondResult)
+      assert(node.treePatternBits eq firstResult)
+      assert(computeCount.get() === 2)
+    } finally {
+      executor.shutdownNow()
+    }
+  }
+
+  test("TreeNode cache accessors retain computed values") {
+    val left = Literal(1)
+    val right = Literal(2)
+    val node = Add(left, right)
+    val expectedTreePatternBits = TreePatternBits.toPatternBits(
+      TreePattern.BINARY_ARITHMETIC, TreePattern.LITERAL)
+
+    def cacheField(name: String): java.lang.reflect.Field = {
+      val field = classOf[TreeNode[_]].getDeclaredField(name)
+      field.setAccessible(true)
+      field
+    }
+
+    val treePatternBits = node.treePatternBits
+    assert(treePatternBits == expectedTreePatternBits)
+    val treePatternBitsCache = cacheField("treePatternBitsCacheValue").get(node)
+    assert(treePatternBitsCache eq treePatternBits)
+    assert(node.treePatternBits eq treePatternBits)
+
+    val containsChild = node.containsChild
+    assert(containsChild == Set(left, right))
+    val containsChildCache = cacheField("containsChildCacheValue").get(node)
+    assert(containsChildCache eq containsChild)
+    assert(node.containsChild eq containsChild)
+
+    val height = node.height
+    assert(height === 2)
+    val heightCache = cacheField("heightCacheValue").get(node)
+    assert(heightCache == Integer.valueOf(height))
+    assert(node.height === height)
+    assert(cacheField("heightCacheValue").get(node) eq heightCache)
+
+    val expectedHashCode = MurmurHash3.caseClassHash(node)
+    val hashCode = node.hashCode()
+    assert(hashCode === expectedHashCode)
+    val hashCodeCache = cacheField("hashCodeCacheValue").get(node)
+    assert(hashCodeCache == Integer.valueOf(hashCode))
+    assert(node.hashCode() === hashCode)
+    assert(cacheField("hashCodeCacheValue").get(node) eq hashCodeCache)
+
+    val allChildrenMethod = classOf[TreeNode[_]].getDeclaredMethod("allChildren")
+    allChildrenMethod.setAccessible(true)
+    val allChildren = allChildrenMethod.invoke(node)
+      .asInstanceOf[IdentityHashMap[TreeNode[_], Any]]
+    assert(allChildren.size() === 2)
+    assert(allChildren.containsKey(left))
+    assert(allChildren.containsKey(right))
+    val allChildrenCache = cacheField("allChildrenCacheValue").get(node)
+    assert(allChildrenCache eq allChildren)
+    val secondAllChildren = allChildrenMethod.invoke(node)
+    assert(secondAllChildren eq allChildren)
+  }
+
   test("top node changed") {
     val after = Literal(1) transform { case Literal(1, _) => Literal(2) }
     assert(after === Literal(2))
@@ -179,6 +298,116 @@ class TreeNodeSuite extends SparkFunSuite with SQLHelper {
     assert(actual === expect)
   }
 
+  test("mapChildren returns the original node when all children are fast equal") {
+    val expression = Coalesce(Seq(Literal(1), Literal(2)))
+    val visited = new ArrayBuffer[Int]()
+    val result = expression.mapChildren {
+      case literal @ Literal(value: Int, _) =>
+        visited += value
+        literal
+      case other => other
+    }
+
+    assert(result eq expression)
+    assert(visited == Seq(1, 2))
+    val leaf = Dummy(None)
+    assert(leaf.mapChildren(identity) eq leaf)
+  }
+
+  test("mapChildren returns the original node when every child is equal but a distinct copy") {
+    val expression = Coalesce(Seq(Literal(1), Literal(2)))
+    // A fresh, structurally-equal copy for every child must still return `this`, since no child
+    // changes materially.
+    val result = expression.mapChildren {
+      case Literal(value: Int, dt) => Literal(value, dt)
+      case other => other
+    }
+    assert(result eq expression)
+  }
+
+  test("mapChildren retains an equal replacement when another child changes") {
+    val tag = TreeNodeTag[String]("equal-copy")
+    val expression = Coalesce(Seq(Literal(1), Literal(2)))
+    val equalCopy = Literal(1)
+    equalCopy.setTagValue(tag, "retained")
+
+    val result = expression.mapChildren {
+      case Literal(1, _) => equalCopy
+      case Literal(2, _) => Literal(3)
+      case other => other
+    }
+
+    assert(result.children.head eq equalCopy)
+    assert(result.children.head.getTagValue(tag).contains("retained"))
+    assert(result.children(1) == Literal(3))
+  }
+
+  test("mapChildren retains non-adjacent equal replacements when a later child changes") {
+    val c0 = Literal(10)
+    val c1 = Literal(11)
+    val c2 = Literal(12)
+    val c3 = Literal(13)
+    val c4 = Literal(14)
+    val origin = Origin(line = Some(10))
+    val expression = CurrentOrigin.withOrigin(origin) {
+      Coalesce(Seq(c0, c1, c2, c3, c4))
+    }
+    val tag = TreeNodeTag[String]("parent")
+    expression.setTagValue(tag, "retained")
+    val copy1 = Literal(11)
+    val copy3 = Literal(13)
+    val visited = new ArrayBuffer[Expression]()
+
+    // Keep a reference-equal prefix, retain non-adjacent equal copies, and change the last child.
+    val result = CurrentOrigin.withOrigin(Origin(line = Some(20))) {
+      expression.mapChildren { child =>
+        visited += child
+        child match {
+          case l if l eq c0 => c0
+          case l if l eq c1 => copy1
+          case l if l eq c2 => c2
+          case l if l eq c3 => copy3
+          case l if l eq c4 => Literal(99)
+          case other => other
+        }
+      }
+    }
+
+    assert(result ne expression)
+    assert(result.origin == origin)
+    assert(result.getTagValue(tag).contains("retained"))
+    assert(visited.size == expression.children.size)
+    visited.zip(expression.children).foreach { case (actual, expected) =>
+      assert(actual eq expected)
+    }
+    assert(result.children(0) eq c0)
+    assert(result.children(1) eq copy1)
+    assert(result.children(2) eq c2)
+    assert(result.children(3) eq copy3)
+    assert(result.children(4) == Literal(99))
+  }
+
+  test("mapChildren stops comparing children after a material change") {
+    var comparisons = 0
+    val last = new Literal(2, IntegerType) {
+      override def fastEquals(other: TreeNode[_]): Boolean = {
+        comparisons += 1
+        super.fastEquals(other)
+      }
+    }
+    val expression = Coalesce(Seq(Literal(1), last))
+    val replacements = Seq(Literal(3), Literal(4))
+    val result = expression.mapChildren {
+      case child if child eq last => replacements(1)
+      case _ => replacements.head
+    }
+
+    assert(comparisons == 0)
+    result.children.zip(replacements).foreach { case (actual, expected) =>
+      assert(actual eq expected)
+    }
+  }
+
   test("preserves origin") {
     CurrentOrigin.setPosition(1, 1)
     val add = Add(Literal(1), Literal(1))
@@ -190,6 +419,68 @@ class TreeNodeSuite extends SparkFunSuite with SQLHelper {
 
     assert(transformed.origin.line.isDefined)
     assert(transformed.origin.startPosition.isDefined)
+  }
+
+  test("transform rules see node origins and restore the previous origin") {
+    val left = CurrentOrigin.withOrigin(Origin(line = Some(1))) {
+      Literal(1)
+    }
+    val right = CurrentOrigin.withOrigin(Origin(line = Some(2))) {
+      Literal(2)
+    }
+    val expression = CurrentOrigin.withOrigin(Origin(line = Some(3))) {
+      Add(left, right)
+    }
+    val previousOrigin = Origin(line = Some(4))
+    val visited = new ArrayBuffer[Expression]()
+
+    CurrentOrigin.set(previousOrigin)
+    try {
+      expression.transformUpWithPruning(AlwaysProcess.fn) {
+        case e =>
+          assert(CurrentOrigin.get == e.origin)
+          visited += e
+          e
+      }
+      assert(visited.size == 3)
+      assert(CurrentOrigin.get == previousOrigin)
+
+      intercept[RuntimeException] {
+        expression.transformDownWithPruning(AlwaysProcess.fn) {
+          case _: Literal => throw new RuntimeException("rule failed")
+        }
+      }
+      assert(CurrentOrigin.get == previousOrigin)
+    } finally {
+      CurrentOrigin.reset()
+    }
+  }
+
+  test("transformUpWithPruning does not materialize specialized children") {
+    val expression = SpecializedUnary(Literal(1))
+    assert(expression.transformUp { case e => e } eq expression)
+  }
+
+  test("transformUpWithPruning preserves pruning and ineffective rule tracking") {
+    val expression = Add(Literal(1), Literal(2))
+    val ruleId = RuleId(0)
+    var visited = 0
+    val rule: PartialFunction[Expression, Expression] = {
+      case e =>
+        visited += 1
+        e
+    }
+
+    expression.transformUpWithPruning(AlwaysProcess.fn, ruleId)(rule)
+    assert(visited == 3)
+
+    visited = 0
+    expression.transformUpWithPruning(AlwaysProcess.fn, ruleId)(rule)
+    assert(visited == 0)
+
+    visited = 0
+    Add(Literal(1), Literal(2)).transformUpWithPruning(_ => false)(rule)
+    assert(visited == 0)
   }
 
   test("foreach up") {
@@ -246,6 +537,44 @@ class TreeNodeSuite extends SparkFunSuite with SQLHelper {
     }
     expected = None
     assert(expected === actual)
+  }
+
+  test("exists") {
+    val expression = Add(Literal(1), Multiply(Literal(2), Subtract(Literal(3), Literal(4))))
+    // Check the top node.
+    var exists = expression.exists {
+      case _: Add => true
+      case _ => false
+    }
+    assert(exists)
+
+    // Check the first children.
+    exists = expression.exists {
+      case Literal(1, IntegerType) => true
+      case _ => false
+    }
+    assert(exists)
+
+    // Check an internal node (Subtract).
+    exists = expression.exists {
+      case _: Subtract => true
+      case _ => false
+    }
+    assert(exists)
+
+    // Check a leaf node.
+    exists = expression.exists {
+      case Literal(3, IntegerType) => true
+      case _ => false
+    }
+    assert(exists)
+
+    // Check not exists.
+    exists = expression.exists {
+      case Literal(100, IntegerType) => true
+      case _ => false
+    }
+    assert(!exists)
   }
 
   test("collectFirst") {
@@ -655,6 +984,7 @@ class TreeNodeSuite extends SparkFunSuite with SQLHelper {
   }
 
   test("transform works on stream of children") {
+    @nowarn("cat=deprecation")
     val before = Coalesce(Stream(Literal(1), Literal(2)))
     // Note it is a bit tricky to exhibit the broken behavior. Basically we want to create the
     // situation in which the TreeNode.mapChildren function's change detection is not triggered. A
@@ -664,14 +994,39 @@ class TreeNodeSuite extends SparkFunSuite with SQLHelper {
       case Literal(v: Int, IntegerType) if v != 1 =>
         Literal(v + 1, IntegerType)
     }
+    @nowarn("cat=deprecation")
     val expected = Coalesce(Stream(Literal(1), Literal(3)))
     assert(result === expected)
   }
 
+  test("SPARK-45685: transform works on LazyList of children") {
+    val before = Coalesce(LazyList(Literal(1), Literal(2)))
+    // Note it is a bit tricky to exhibit the broken behavior. Basically we want to create the
+    // situation in which the TreeNode.mapChildren function's change detection is not triggered. A
+    // stream's first element is typically materialized, so in order to not trip the TreeNode change
+    // detection logic, we should not change the first element in the sequence.
+    val result = before.transform {
+      case Literal(v: Int, IntegerType) if v != 1 =>
+        Literal(v + 1, IntegerType)
+    }
+    val expected = Coalesce(LazyList(Literal(1), Literal(3)))
+    assert(result === expected)
+  }
+
   test("withNewChildren on stream of children") {
+    @nowarn("cat=deprecation")
     val before = Coalesce(Stream(Literal(1), Literal(2)))
+    @nowarn("cat=deprecation")
     val result = before.withNewChildren(Stream(Literal(1), Literal(3)))
+    @nowarn("cat=deprecation")
     val expected = Coalesce(Stream(Literal(1), Literal(3)))
+    assert(result === expected)
+  }
+
+  test("SPARK-45685: withNewChildren on LazyList of children") {
+    val before = Coalesce(LazyList(Literal(1), Literal(2)))
+    val result = before.withNewChildren(LazyList(Literal(1), Literal(3)))
+    val expected = Coalesce(LazyList(Literal(1), Literal(3)))
     assert(result === expected)
   }
 
@@ -782,32 +1137,301 @@ class TreeNodeSuite extends SparkFunSuite with SQLHelper {
     assert(leaf.child.eq(leafCloned.asInstanceOf[FakeLeafPlan].child))
   }
 
-  object MalformedClassObject extends Serializable {
-    case class MalformedNameExpression(child: Expression) extends TaggingExpression {
-      override protected def withNewChildInternal(newChild: Expression): Expression =
-        copy(child = newChild)
+  test("Expression.freshCopyIfContainsStatefulExpression()") {
+    val tag = TreeNodeTag[String]("test")
+
+    def makeExprWithPositionAndTag(block: => Expression): Expression = {
+      CurrentOrigin.setPosition(1, 1)
+      val expr = block
+      CurrentOrigin.reset()
+      expr.setTagValue(tag, "tagValue")
+      expr
+    }
+
+    // Test generic assertions which should always hold for any value returned
+    // from freshCopyIfContainsStatefulExpression()
+    def genericAssertions(before: Expression, after: Expression): Unit = {
+      assert(before == after)
+      assert(before.origin == after.origin)
+      assert(before.getTagValue(tag) == after.getTagValue(tag))
+    }
+
+    // Doesn't transform for non-stateful expressions:
+    val onePlusOneBefore = makeExprWithPositionAndTag(Add(Literal(1), Literal(1)))
+    val onePlusOneAfter = onePlusOneBefore.freshCopyIfContainsStatefulExpression()
+    genericAssertions(onePlusOneBefore, onePlusOneAfter)
+    assert(onePlusOneBefore eq onePlusOneAfter)
+
+    // Transforms stateful expressions with no nesting:
+    val statefulExprBefore = makeExprWithPositionAndTag(Rand(Literal(1)))
+    val statefulExprAfter = statefulExprBefore.freshCopyIfContainsStatefulExpression()
+    genericAssertions(statefulExprBefore, statefulExprAfter)
+    assert(statefulExprBefore ne statefulExprAfter)
+
+    // Transforms expressions nested three levels deep:
+    val withNestedStatefulBefore = makeExprWithPositionAndTag(
+      Add(Literal(1), Add(Literal(1), Rand(Literal(1))))
+    )
+    val withNestedStatefulAfter = withNestedStatefulBefore.freshCopyIfContainsStatefulExpression()
+    genericAssertions(withNestedStatefulBefore, withNestedStatefulAfter)
+    assert(withNestedStatefulBefore ne withNestedStatefulAfter)
+    def getStateful(e: Expression): Expression = {
+      e.collect { case e if e.stateful => e }.head
+    }
+    assert(getStateful(withNestedStatefulBefore) ne getStateful(withNestedStatefulAfter))
+  }
+
+  test("SPARK-37800: TreeNode.argString incorrectly formats arguments of type Set[_]") {
+    case class Node(set: Set[String], nested: Seq[Set[Int]]) extends LeafNode {
+      val output: Seq[Attribute] = Nil
+    }
+    val node = Node(Set("second", "first"), Seq(Set(3, 1), Set(2, 1)))
+    assert(node.argString(10) == "{first, second}, [{1, 3}, {1, 2}]")
+  }
+
+  test("SPARK-38676: truncate before/after sql text if too long") {
+    val text =
+      """
+        |
+        |SELECT
+        |1234567890 + 1234567890 + 1234567890, cast('a'
+        |as /* comment */
+        |int), 1234567890 + 1234567890 + 1234567890
+        |as foo
+        |""".stripMargin
+    val origin = Origin(
+      line = Some(3),
+      startPosition = Some(38),
+      startIndex = Some(47),
+      stopIndex = Some(77),
+      sqlText = Some(text),
+      objectType = Some("VIEW"),
+      objectName = Some("some_view"))
+    val expectedSummary =
+      """== SQL of VIEW some_view (line 3, position 39) ==
+        |...7890 + 1234567890 + 1234567890, cast('a'
+        |                                   ^^^^^^^^
+        |as /* comment */
+        |^^^^^^^^^^^^^^^^
+        |int), 1234567890 + 1234567890 + 12345...
+        |^^^^^
+        |""".stripMargin
+
+    val expectedFragment =
+      """cast('a'
+        |as /* comment */
+        |int),""".stripMargin
+    assert(origin.context.summary == expectedSummary)
+    assert(origin.context.startIndex == origin.startIndex.get)
+    assert(origin.context.stopIndex == origin.stopIndex.get)
+    assert(origin.context.objectType == origin.objectType.get)
+    assert(origin.context.objectName == origin.objectName.get)
+    assert(origin.context.fragment == expectedFragment)
+  }
+
+  test("SPARK-39046: Return an empty context string if TreeNode.origin is wrongly set") {
+    val text = Some("select a + b")
+    // missing start index
+    val origin1 = Origin(
+      startIndex = Some(7),
+      stopIndex = None,
+      sqlText = text)
+    // missing stop index
+    val origin2 = Origin(
+      startIndex = None,
+      stopIndex = Some(11),
+      sqlText = text)
+    // missing text
+    val origin3 = Origin(
+      startIndex = Some(7),
+      stopIndex = Some(11),
+      sqlText = None)
+    // negative start index
+    val origin4 = Origin(
+      startIndex = Some(-1),
+      stopIndex = Some(11),
+      sqlText = text)
+    // stop index >= text.length
+    val origin5 = Origin(
+      startIndex = Some(-1),
+      stopIndex = Some(text.get.length),
+      sqlText = text)
+    // start index > stop index
+    val origin6 = Origin(
+      startIndex = Some(2),
+      stopIndex = Some(1),
+      sqlText = text)
+    Seq(origin1, origin2, origin3, origin4, origin5, origin6).foreach { origin =>
+      assert(origin.context.summary.isEmpty)
     }
   }
 
-  test("SPARK-32999: TreeNode.nodeName should not throw malformed class name error") {
-    val testTriggersExpectedError = try {
-      classOf[MalformedClassObject.MalformedNameExpression].getSimpleName
-      false
-    } catch {
-      case ex: java.lang.InternalError if ex.getMessage.contains("Malformed class name") =>
-        true
-      case ex: Throwable => throw ex
-    }
-    // This test case only applies on older JDK versions (e.g. JDK8u), and doesn't trigger the
-    // issue on newer JDK versions (e.g. JDK11u).
-    assume(testTriggersExpectedError, "the test case didn't trigger malformed class name error")
+  private def newErrorAfterLazyList(es: Expression*) = {
+    es.to(LazyList).lazyAppendedAll(
+      throw new NoSuchElementException("LazyList should not return more elements")
+    )
+  }
 
-    val expr = MalformedClassObject.MalformedNameExpression(Literal(1))
-    try {
-      expr.nodeName
-    } catch {
-      case ex: java.lang.InternalError if ex.getMessage.contains("Malformed class name") =>
-        fail("TreeNode.nodeName should not throw malformed class name error")
+  test("multiTransformDown generates all alternatives") {
+    val e = Add(Add(Literal("a"), Literal("b")), Add(Literal("c"), Literal("d")))
+    val transformed = e.multiTransformDown {
+      case StringLiteral("a") => Seq(Literal(1), Literal(2), Literal(3))
+      case StringLiteral("b") => Seq(Literal(10), Literal(20), Literal(30))
+      case Add(StringLiteral("c"), StringLiteral("d"), _) =>
+        Seq(Literal(100), Literal(200), Literal(300))
     }
+    val expected = for {
+      cd <- Seq(Literal(100), Literal(200), Literal(300))
+      b <- Seq(Literal(10), Literal(20), Literal(30))
+      a <- Seq(Literal(1), Literal(2), Literal(3))
+    } yield Add(Add(a, b), cd)
+    assert(transformed === expected)
+  }
+
+  test("multiTransformDown alternatives are accessed only if needed") {
+    val e = Add(Add(Literal("a"), Literal("b")), Add(Literal("c"), Literal("d")))
+    val transformed = e.multiTransformDown {
+      case StringLiteral("a") => Seq(Literal(1), Literal(2), Literal(3))
+      case StringLiteral("b") => newErrorAfterLazyList(Literal(10))
+      case Add(StringLiteral("c"), StringLiteral("d"), _) => newErrorAfterLazyList(Literal(100))
+    }
+    val expected = for {
+      a <- Seq(Literal(1), Literal(2), Literal(3))
+    } yield Add(Add(a, Literal(10)), Literal(100))
+    // We don't access alternatives for `b` after 10 and for `c` after 100
+    assert(transformed.take(3) == expected)
+    intercept[NoSuchElementException] {
+      transformed.take(3 + 1).toList
+    }
+
+    val transformed2 = e.multiTransformDown {
+      case StringLiteral("a") => Seq(Literal(1), Literal(2), Literal(3))
+      case StringLiteral("b") => Seq(Literal(10), Literal(20), Literal(30))
+      case Add(StringLiteral("c"), StringLiteral("d"), _) => newErrorAfterLazyList(Literal(100))
+    }
+    val expected2 = for {
+      b <- Seq(Literal(10), Literal(20), Literal(30))
+      a <- Seq(Literal(1), Literal(2), Literal(3))
+    } yield Add(Add(a, b), Literal(100))
+    // We don't access alternatives for `c` after 100
+    assert(transformed2.take(3 * 3) === expected2)
+    intercept[NoSuchElementException] {
+      transformed.take(3 * 3 + 1).toList
+    }
+  }
+
+  test("multiTransformDown rule return this") {
+    val e = Add(Add(Literal("a"), Literal("b")), Add(Literal("c"), Literal("d")))
+    val transformed = e.multiTransformDown {
+      case s @ StringLiteral("a") => Seq(Literal(1), Literal(2), s)
+      case s @ StringLiteral("b") => Seq(Literal(10), Literal(20), s)
+      case a @ Add(StringLiteral("c"), StringLiteral("d"), _) => Seq(Literal(100), Literal(200), a)
+    }
+    val expected = for {
+      cd <- Seq(Literal(100), Literal(200), Add(Literal("c"), Literal("d")))
+      b <- Seq(Literal(10), Literal(20), Literal("b"))
+      a <- Seq(Literal(1), Literal(2), Literal("a"))
+    } yield Add(Add(a, b), cd)
+    assert(transformed == expected)
+  }
+
+  test("multiTransformDown doesn't stop generating alternatives of descendants when non-leaf is " +
+    "transformed and itself is in the alternatives") {
+    val e = Add(Add(Literal("a"), Literal("b")), Add(Literal("c"), Literal("d")))
+    val transformed = e.multiTransformDown {
+      case a @ Add(StringLiteral("a"), StringLiteral("b"), _) =>
+        Seq(Literal(11), Literal(12), Literal(21), Literal(22), a)
+      case StringLiteral("a") => Seq(Literal(1), Literal(2))
+      case StringLiteral("b") => Seq(Literal(10), Literal(20))
+      case Add(StringLiteral("c"), StringLiteral("d"), _) => Seq(Literal(100), Literal(200))
+    }
+    val expected = for {
+      cd <- Seq(Literal(100), Literal(200))
+      ab <- Seq(Literal(11), Literal(12), Literal(21), Literal(22)) ++
+        (for {
+          b <- Seq(Literal(10), Literal(20))
+          a <- Seq(Literal(1), Literal(2))
+        } yield Add(a, b))
+    } yield Add(ab, cd)
+    assert(transformed == expected)
+  }
+
+  test("multiTransformDown can prune") {
+    val e = Add(Add(Literal("a"), Literal("b")), Add(Literal("c"), Literal("d")))
+    val transformed = e.multiTransformDown {
+      case StringLiteral("a") => Seq.empty
+    }
+    assert(transformed.isEmpty)
+
+    val transformed2 = e.multiTransformDown {
+      case Add(StringLiteral("c"), StringLiteral("d"), _) => Seq.empty
+    }
+    assert(transformed2.isEmpty)
+  }
+
+  test("multiTransformDown alternatives are generated only if needed") {
+    val e = Add(Add(Literal("a"), Literal("b")), Add(Literal("c"), Literal("d")))
+    val transformed = e.multiTransformDown {
+      case StringLiteral("a") => newErrorAfterLazyList()
+      case StringLiteral("b") => Seq.empty
+    }
+    assert(transformed.isEmpty)
+  }
+
+  test("multiTransformDown can do non-cartesian transformations") {
+    val e = Add(Add(Literal("a"), Literal("b")), Add(Literal("c"), Literal("d")))
+    // Suppose that we want to transform both `a` and `b` to `1` and `2`, but we want to have only
+    // those alternatives where these 2 are transformed equal. The first encounter with `a` or `b`
+    // will keep track of the current alternative in a "global" `a_or_b` cache. If we encounter `a`
+    // or `b` again at other places we can return the cached value to keep the transformations in
+    // sync.
+    var a_or_b = Option.empty[Seq[Expression]]
+    val transformed = e.multiTransformDown {
+      case StringLiteral("a") | StringLiteral("b") =>
+        // Return alternatives from cache if this is not the first encounter
+        a_or_b.getOrElse(
+          // Besides returning the alternatives for the first encounter, also set up a mechanism to
+          // update the cache when the new alternatives are requested.
+          LazyList(Literal(1), Literal(2)).map { x =>
+            a_or_b = Some(Seq(x))
+            x
+          }.lazyAppendedAll {
+            a_or_b = None
+            Seq.empty
+          })
+      case Add(StringLiteral("c"), StringLiteral("d"), _) => Seq(Literal(100), Literal(200))
+    }
+    val expected = for {
+      cd <- Seq(Literal(100), Literal(200))
+      a_or_b <- Seq(Literal(1), Literal(2))
+    } yield Add(Add(a_or_b, a_or_b), cd)
+    assert(transformed == expected)
+
+    var c_or_d = Option.empty[Seq[Expression]]
+    val transformed2 = e.multiTransformDown {
+      case StringLiteral("a") | StringLiteral("b") =>
+        a_or_b.getOrElse(
+          LazyList(Literal(1), Literal(2)).map { x =>
+            a_or_b = Some(Seq(x))
+            x
+          }.lazyAppendedAll {
+            a_or_b = None
+            Seq.empty
+          })
+      case StringLiteral("c") | StringLiteral("d") =>
+        c_or_d.getOrElse(
+          LazyList(Literal(10), Literal(20)).map { x =>
+            c_or_d = Some(Seq(x))
+            x
+          }.lazyAppendedAll {
+            c_or_d = None
+            Seq.empty
+          })
+    }
+    val expected2 = for {
+      c_or_d <- Seq(Literal(10), Literal(20))
+      a_or_b <- Seq(Literal(1), Literal(2))
+    } yield Add(Add(a_or_b, a_or_b), Add(c_or_d, c_or_d))
+    assert(transformed2 == expected2)
   }
 }

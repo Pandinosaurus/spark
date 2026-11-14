@@ -17,18 +17,20 @@
 
 package org.apache.spark.sql.execution.datasources.v2.parquet
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.util.RebaseDateTime.RebaseSpec
 import org.apache.spark.sql.connector.expressions.aggregate.Aggregation
-import org.apache.spark.sql.connector.read.{Scan, SupportsPushDownAggregates}
+import org.apache.spark.sql.connector.read.{SupportsPushDownAggregates, SupportsPushDownVariantExtractions, VariantExtraction}
 import org.apache.spark.sql.execution.datasources.{AggregatePushDownUtils, PartitioningAwareFileIndex}
 import org.apache.spark.sql.execution.datasources.parquet.{ParquetFilters, SparkToParquetSchemaConverter}
 import org.apache.spark.sql.execution.datasources.v2.FileScanBuilder
-import org.apache.spark.sql.internal.SQLConf.LegacyBehaviorPolicy
+import org.apache.spark.sql.internal.LegacyBehaviorPolicy
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.util.ArrayImplicits._
 
 case class ParquetScanBuilder(
     sparkSession: SparkSession,
@@ -37,53 +39,60 @@ case class ParquetScanBuilder(
     dataSchema: StructType,
     options: CaseInsensitiveStringMap)
   extends FileScanBuilder(sparkSession, fileIndex, dataSchema)
-    with SupportsPushDownAggregates{
+    with SupportsPushDownAggregates
+    with SupportsPushDownVariantExtractions {
   lazy val hadoopConf = {
     val caseSensitiveMap = options.asCaseSensitiveMap.asScala.toMap
     // Hadoop Configurations are case sensitive.
     sparkSession.sessionState.newHadoopConfWithOptions(caseSensitiveMap)
   }
 
-  lazy val pushedParquetFilters = {
+  private var finalSchema = new StructType()
+
+  private var pushedAggregations = Option.empty[Aggregation]
+
+  private var pushedVariantExtractions = Array.empty[VariantExtraction]
+
+  override protected val supportsNestedSchemaPruning: Boolean = true
+
+  override def pushDataFilters(dataFilters: Array[Filter]): Array[Filter] = {
     val sqlConf = sparkSession.sessionState.conf
     if (sqlConf.parquetFilterPushDown) {
       val pushDownDate = sqlConf.parquetFilterPushDownDate
       val pushDownTimestamp = sqlConf.parquetFilterPushDownTimestamp
       val pushDownDecimal = sqlConf.parquetFilterPushDownDecimal
-      val pushDownStringStartWith = sqlConf.parquetFilterPushDownStringStartWith
+      val pushDownStringPredicate = sqlConf.parquetFilterPushDownStringPredicate
       val pushDownInFilterThreshold = sqlConf.parquetFilterPushDownInFilterThreshold
       val isCaseSensitive = sqlConf.caseSensitiveAnalysis
+      val readSchema = readDataSchema()
       val parquetSchema =
-        new SparkToParquetSchemaConverter(sparkSession.sessionState.conf).convert(readDataSchema())
+        new SparkToParquetSchemaConverter(sparkSession.sessionState.conf).convert(readSchema)
+      // Shredded-variant predicate pushdown (SPARK-55817) is not wired here: it applies to the
+      // DSv1 path only. DSv2 does rewrite variant extractions into `v.`0`` struct accesses, but
+      // only in `V2ScanRelationPushDown.buildScanWithPushedVariants`, which runs *after*
+      // `pushDownFilters`. So the filters reaching this method are still `variant_get(v, ...)`
+      // predicates, which do not translate to a source `Filter` at all -- there is no
+      // shredded-variant logical name for ParquetFilters to resolve here, and nothing would be
+      // reported convertible even with a variantExtractionSchema. DSv2 reads remain correct (the
+      // variant filter is applied post-scan); they just do not get row-group skipping on shredded
+      // columns.
       val parquetFilters = new ParquetFilters(
         parquetSchema,
         pushDownDate,
         pushDownTimestamp,
         pushDownDecimal,
-        pushDownStringStartWith,
+        pushDownStringPredicate,
         pushDownInFilterThreshold,
         isCaseSensitive,
         // The rebase mode doesn't matter here because the filters are used to determine
         // whether they is convertible.
-        LegacyBehaviorPolicy.CORRECTED)
-      parquetFilters.convertibleFilters(pushedDataFilters).toArray
+        RebaseSpec(LegacyBehaviorPolicy.CORRECTED),
+        readSchema = Some(readSchema))
+      parquetFilters.convertibleFilters(dataFilters.toImmutableArraySeq).toArray
     } else {
       Array.empty[Filter]
     }
   }
-
-  private var finalSchema = new StructType()
-
-  private var pushedAggregations = Option.empty[Aggregation]
-
-  override protected val supportsNestedSchemaPruning: Boolean = true
-
-  override def pushDataFilters(dataFilters: Array[Filter]): Array[Filter] = dataFilters
-
-  // Note: for Parquet, the actual filter push down happens in [[ParquetPartitionReaderFactory]].
-  // It requires the Parquet physical schema to determine whether a filter is convertible.
-  // All filters that can be converted to Parquet are pushed down.
-  override def pushedFilters(): Array[Filter] = pushedParquetFilters
 
   override def pushAggregation(aggregation: Aggregation): Boolean = {
     if (!sparkSession.sessionState.conf.parquetAggregatePushDown) {
@@ -104,7 +113,17 @@ case class ParquetScanBuilder(
     }
   }
 
-  override def build(): Scan = {
+  // SupportsPushDownVariantExtractions API implementation
+  override def supportsDeferCastError(): Boolean = true
+
+  override def pushVariantExtractions(extractions: Array[VariantExtraction]): Array[Boolean] = {
+    // Parquet supports variant pushdown for all variant extractions
+    pushedVariantExtractions = extractions
+    // Return true for all extractions (Parquet can handle all of them)
+    Array.fill(extractions.length)(true)
+  }
+
+  override def build(): ParquetScan = {
     // the `finalSchema` is either pruned in pushAggregation (if aggregates are
     // pushed down), or pruned in readDataSchema() (in regular column pruning). These
     // two are mutual exclusive.
@@ -112,7 +131,7 @@ case class ParquetScanBuilder(
       finalSchema = readDataSchema()
     }
     ParquetScan(sparkSession, hadoopConf, fileIndex, dataSchema, finalSchema,
-      readPartitionSchema(), pushedParquetFilters, options, pushedAggregations,
-      partitionFilters, dataFilters)
+      readPartitionSchema(), pushedDataFilters, options, pushedAggregations,
+      partitionFilters, dataFilters, pushedVariantExtractions)
   }
 }

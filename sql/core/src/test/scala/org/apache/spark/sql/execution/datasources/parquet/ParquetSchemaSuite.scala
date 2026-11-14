@@ -27,9 +27,10 @@ import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.Type._
 
 import org.apache.spark.SparkException
-import org.apache.spark.sql.catalyst.ScalaReflection
-import org.apache.spark.sql.execution.QueryExecutionException
+import org.apache.spark.sql.{AnalysisException, Row}
+import org.apache.spark.sql.catalyst.expressions.Cast.toSQLType
 import org.apache.spark.sql.execution.datasources.SchemaColumnConvertNotSupportedException
+import org.apache.spark.sql.functions.desc
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.ParquetOutputTimestampType._
 import org.apache.spark.sql.test.SharedSparkSession
@@ -46,17 +47,20 @@ abstract class ParquetSchemaTest extends ParquetTest with SharedSparkSession {
       binaryAsString: Boolean,
       int96AsTimestamp: Boolean,
       writeLegacyParquetFormat: Boolean,
-      expectedParquetColumn: Option[ParquetColumn] = None): Unit = {
+      expectedParquetColumn: Option[ParquetColumn] = None,
+      nanosAsLong: Boolean = false): Unit = {
     testSchema(
       testName,
-      StructType.fromAttributes(ScalaReflection.attributesFor[T]),
+      schemaFor[T],
       messageType,
       binaryAsString,
       int96AsTimestamp,
       writeLegacyParquetFormat,
-      expectedParquetColumn = expectedParquetColumn)
+      expectedParquetColumn = expectedParquetColumn,
+      nanosAsLong = nanosAsLong)
   }
 
+  // scalastyle:off argcount
   protected def testParquetToCatalyst(
       testName: String,
       sqlSchema: StructType,
@@ -64,12 +68,19 @@ abstract class ParquetSchemaTest extends ParquetTest with SharedSparkSession {
       binaryAsString: Boolean,
       int96AsTimestamp: Boolean,
       caseSensitive: Boolean = false,
+      inferTimestampNTZ: Boolean = true,
       sparkReadSchema: Option[StructType] = None,
-      expectedParquetColumn: Option[ParquetColumn] = None): Unit = {
+      expectedParquetColumn: Option[ParquetColumn] = None,
+      nanosAsLong: Boolean = false,
+      timestampNanosTypesEnabled: Boolean = false): Unit = {
+    // scalastyle:on argcount
     val converter = new ParquetToSparkSchemaConverter(
       assumeBinaryIsString = binaryAsString,
       assumeInt96IsTimestamp = int96AsTimestamp,
-      caseSensitive = caseSensitive)
+      caseSensitive = caseSensitive,
+      inferTimestampNTZ = inferTimestampNTZ,
+      nanosAsLong = nanosAsLong,
+      timestampNanosTypesEnabled = timestampNanosTypesEnabled)
 
     test(s"sql <= parquet: $testName") {
       val actualParquetColumn = converter.convertParquetColumn(
@@ -95,7 +106,8 @@ abstract class ParquetSchemaTest extends ParquetTest with SharedSparkSession {
       parquetSchema: String,
       writeLegacyParquetFormat: Boolean,
       outputTimestampType: SQLConf.ParquetOutputTimestampType.Value =
-        SQLConf.ParquetOutputTimestampType.INT96): Unit = {
+        SQLConf.ParquetOutputTimestampType.INT96,
+      inferTimestampNTZ: Boolean = true): Unit = {
     val converter = new SparkToParquetSchemaConverter(
       writeLegacyParquetFormat = writeLegacyParquetFormat,
       outputTimestampType = outputTimestampType)
@@ -117,7 +129,9 @@ abstract class ParquetSchemaTest extends ParquetTest with SharedSparkSession {
       writeLegacyParquetFormat: Boolean,
       outputTimestampType: SQLConf.ParquetOutputTimestampType.Value =
         SQLConf.ParquetOutputTimestampType.INT96,
-      expectedParquetColumn: Option[ParquetColumn] = None): Unit = {
+      expectedParquetColumn: Option[ParquetColumn] = None,
+      nanosAsLong: Boolean = false,
+      timestampNanosTypesEnabled: Boolean = false): Unit = {
 
     testCatalystToParquet(
       testName,
@@ -132,7 +146,9 @@ abstract class ParquetSchemaTest extends ParquetTest with SharedSparkSession {
       parquetSchema,
       binaryAsString,
       int96AsTimestamp,
-      expectedParquetColumn = expectedParquetColumn)
+      expectedParquetColumn = expectedParquetColumn,
+      nanosAsLong = nanosAsLong,
+      timestampNanosTypesEnabled = timestampNanosTypesEnabled)
   }
 
   protected def compareParquetColumn(actual: ParquetColumn, expected: ParquetColumn): Unit = {
@@ -147,7 +163,14 @@ abstract class ParquetSchemaTest extends ParquetTest with SharedSparkSession {
       val expectedDesc = expected.descriptor.get
       assert(actualDesc.getMaxRepetitionLevel == expectedDesc.getMaxRepetitionLevel)
       assert(actualDesc.getMaxRepetitionLevel == expectedDesc.getMaxRepetitionLevel)
-      assert(actualDesc.getPrimitiveType === expectedDesc.getPrimitiveType)
+
+      actualDesc.getPrimitiveType.getLogicalTypeAnnotation match {
+        case timestamp: LogicalTypeAnnotation.TimestampLogicalTypeAnnotation
+          if timestamp.getUnit == LogicalTypeAnnotation.TimeUnit.NANOS =>
+          assert(actual.sparkType == expected.sparkType)
+        case _ =>
+          assert(actualDesc.getPrimitiveType === expectedDesc.getPrimitiveType)
+      }
     }
 
     assert(actual.repetitionLevel == expected.repetitionLevel, "repetition level mismatch: " +
@@ -195,6 +218,31 @@ abstract class ParquetSchemaTest extends ParquetTest with SharedSparkSession {
 }
 
 class ParquetSchemaInferenceSuite extends ParquetSchemaTest {
+  testSchemaInference[Tuple1[Long]](
+    "timestamp nanos",
+    """
+      |message root {
+      |  required int64 _1 (TIMESTAMP(NANOS,true));
+      |}
+    """.stripMargin,
+    binaryAsString = false,
+    int96AsTimestamp = true,
+    writeLegacyParquetFormat = true,
+    expectedParquetColumn = Some(
+      ParquetColumn(
+        sparkType = schemaFor[Tuple1[Long]],
+        descriptor = None,
+        repetitionLevel = 0,
+        definitionLevel = 0,
+        required = false,
+        path = Seq(),
+        children = Seq(
+          primitiveParquetColumn(LongType, PrimitiveTypeName.INT64, Repetition.REQUIRED,
+            0, 0, Seq("_1"), logicalTypeAnnotation = Some(LogicalTypeAnnotation.intType(64, false)))
+        ))),
+    nanosAsLong = true
+  )
+
   testSchemaInference[(Boolean, Int, Long, Float, Double, Array[Byte])](
     "basic types",
     """
@@ -212,8 +260,7 @@ class ParquetSchemaInferenceSuite extends ParquetSchemaTest {
     writeLegacyParquetFormat = true,
     expectedParquetColumn = Some(
       ParquetColumn(
-        sparkType = StructType.fromAttributes(
-          ScalaReflection.attributesFor[(Boolean, Int, Long, Float, Double, Array[Byte])]),
+        sparkType = schemaFor[(Boolean, Int, Long, Float, Double, Array[Byte])],
         descriptor = None,
         repetitionLevel = 0,
         definitionLevel = 0,
@@ -251,8 +298,7 @@ class ParquetSchemaInferenceSuite extends ParquetSchemaTest {
     writeLegacyParquetFormat = true,
     expectedParquetColumn = Some(
       ParquetColumn(
-        sparkType = StructType.fromAttributes(
-          ScalaReflection.attributesFor[(Byte, Short, Int, Long, java.sql.Date)]),
+        sparkType = schemaFor[(Byte, Short, Int, Long, java.sql.Date)],
         descriptor = None,
         repetitionLevel = 0,
         definitionLevel = 0,
@@ -283,8 +329,7 @@ class ParquetSchemaInferenceSuite extends ParquetSchemaTest {
     writeLegacyParquetFormat = true,
     expectedParquetColumn = Some(
       ParquetColumn(
-        sparkType = StructType.fromAttributes(
-          ScalaReflection.attributesFor[Tuple1[String]]),
+        sparkType = schemaFor[Tuple1[String]],
         descriptor = None,
         repetitionLevel = 0,
         definitionLevel = 0,
@@ -307,8 +352,7 @@ class ParquetSchemaInferenceSuite extends ParquetSchemaTest {
     writeLegacyParquetFormat = true,
     expectedParquetColumn = Some(
       ParquetColumn(
-        sparkType = StructType.fromAttributes(
-          ScalaReflection.attributesFor[Tuple1[String]]),
+        sparkType = schemaFor[Tuple1[String]],
         descriptor = None,
         repetitionLevel = 0,
         definitionLevel = 0,
@@ -931,26 +975,52 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
     val fromCaseClassString = StructType.fromString(caseClassString)
     val fromJson = StructType.fromString(jsonString)
 
-    (fromCaseClassString, fromJson).zipped.foreach { (a, b) =>
+    fromCaseClassString.lazyZip(fromJson).foreach { (a, b) =>
       assert(a.name == b.name)
       assert(a.dataType === b.dataType)
       assert(a.nullable === b.nullable)
     }
   }
 
-  test("schema merging failure error message") {
+  test("CANNOT_MERGE_SCHEMAS: Failed merging schemas") {
     import testImplicits._
 
     withTempPath { dir =>
       val path = dir.getCanonicalPath
-      spark.range(3).write.parquet(s"$path/p=1")
-      spark.range(3).select('id cast IntegerType as 'id).write.parquet(s"$path/p=2")
+      val df1 = spark.range(3)
+      df1.write.parquet(s"$path/p=1")
+      val df2 = spark.range(3).select($"id" cast IntegerType as Symbol("id"))
+      df2.write.parquet(s"$path/p=2")
+      checkError(
+        exception = intercept[SparkException] {
+          spark.read.option("mergeSchema", "true").parquet(path)
+        },
+        condition = "CANNOT_MERGE_SCHEMAS",
+        sqlState = "42KD9",
+        parameters = Map(
+          "left" -> toSQLType(df1.schema),
+          "right" -> toSQLType(df2.schema)))
+    }
+  }
 
-      val message = intercept[SparkException] {
-        spark.read.option("mergeSchema", "true").parquet(path).schema
-      }.getMessage
-
-      assert(message.contains("Failed merging schema"))
+  test("SPARK-45346: merge schema should respect case sensitivity") {
+    import testImplicits._
+    Seq(true, false).foreach { caseSensitive =>
+      withSQLConf(SQLConf.CASE_SENSITIVE.key -> caseSensitive.toString) {
+        withTempPath { path =>
+          Seq(1).toDF("col").write.mode("append").parquet(path.getCanonicalPath)
+          Seq(2).toDF("COL").write.mode("append").parquet(path.getCanonicalPath)
+          val df = spark.read.option("mergeSchema", "true").parquet(path.getCanonicalPath)
+          if (caseSensitive) {
+            assert(df.columns.toSeq.sorted == Seq("COL", "col"))
+            assert(df.collect().length == 2)
+          } else {
+            // The final column name depends on which file is listed first, and is a bit random.
+            assert(df.columns.toSeq.map(_.toLowerCase(java.util.Locale.ROOT)) == Seq("col"))
+            assert(df.collect().length == 2)
+          }
+        }
+      }
     }
   }
 
@@ -977,31 +1047,109 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
     withTempPath { dir =>
       val e = testSchemaMismatch(dir.getCanonicalPath, vectorizedReaderEnabled = false)
       val expectedMessage = "Encountered error while reading file"
-      assert(e.getCause.isInstanceOf[QueryExecutionException])
-      assert(e.getCause.getCause.isInstanceOf[ParquetDecodingException])
-      assert(e.getCause.getMessage.contains(expectedMessage))
+      assert(e.getCause.isInstanceOf[ParquetDecodingException])
+      assert(e.getMessage.contains(expectedMessage))
     }
   }
 
   test("schema mismatch failure error message for parquet vectorized reader") {
     withTempPath { dir =>
       val e = testSchemaMismatch(dir.getCanonicalPath, vectorizedReaderEnabled = true)
-      assert(e.getCause.isInstanceOf[QueryExecutionException])
-      assert(e.getCause.getCause.isInstanceOf[SchemaColumnConvertNotSupportedException])
-
-      // Check if the physical type is reporting correctly
-      val errMsg = e.getCause.getMessage
-      assert(errMsg.startsWith("Parquet column cannot be converted in file"))
-      val file = errMsg.substring("Parquet column cannot be converted in file ".length,
-        errMsg.indexOf(". "))
+      assert(e.getCause.isInstanceOf[SchemaColumnConvertNotSupportedException])
+      val file = e.getMessageParameters.get("path")
       val col = spark.read.parquet(file).schema.fields.filter(_.name == "a")
       assert(col.length == 1)
       if (col(0).dataType == StringType) {
-        assert(errMsg.contains("Column: [a], Expected: int, Found: BINARY"))
+        checkErrorMatchPVals(
+          exception = e,
+          condition = "FAILED_READ_FILE.PARQUET_COLUMN_DATA_TYPE_MISMATCH",
+          parameters = Map(
+            "path" -> s".*${dir.getCanonicalPath}.*",
+            "column" -> "\\[a\\]",
+            "expectedType" -> "int",
+            "actualType" -> "BINARY"
+          )
+        )
       } else {
-        assert(errMsg.endsWith("Column: [a], Expected: string, Found: INT32"))
+        checkErrorMatchPVals(
+          exception = e,
+          condition = "FAILED_READ_FILE.PARQUET_COLUMN_DATA_TYPE_MISMATCH",
+          parameters = Map(
+            "path" -> s".*${dir.getCanonicalPath}.*",
+            "column" -> "\\[a\\]",
+            "expectedType" -> "string",
+            "actualType" -> "INT32"
+          )
+        )
       }
     }
+  }
+
+  test("SPARK-45604: schema mismatch failure error on timestamp_ntz to array<timestamp_ntz>") {
+    import testImplicits._
+
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      val timestamp = java.time.LocalDateTime.of(1, 2, 3, 4, 5)
+      val df1 = Seq((1, timestamp)).toDF()
+      val df2 = Seq((2, Array(timestamp))).toDF()
+      df1.write.mode("overwrite").parquet(s"$path/parquet")
+      df2.write.mode("append").parquet(s"$path/parquet")
+
+      withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "true") {
+        val e = intercept[SparkException] {
+          spark.read.schema(df2.schema).parquet(s"$path/parquet").collect()
+        }
+        assert(e.getCause.isInstanceOf[SchemaColumnConvertNotSupportedException])
+      }
+    }
+  }
+
+  test("SPARK-40819: parquet file with TIMESTAMP(NANOS, true) (with nanosAsLong=true)") {
+    val tsAttribute = "birthday"
+    withSQLConf(SQLConf.LEGACY_PARQUET_NANOS_AS_LONG.key -> "true") {
+      val testDataPath = testFile("test-data/timestamp-nanos.parquet")
+      val data = spark.read.parquet(testDataPath).select(tsAttribute)
+      assert(data.schema.fields.head.dataType == LongType)
+      assert(data.orderBy(desc(tsAttribute)).take(1).head.getAs[Long](0) == 1668537129123534758L)
+    }
+  }
+
+  test("SPARK-40819: parquet file with TIMESTAMP(NANOS, true) (with default nanosAsLong=false)") {
+    val testDataPath = testFile("test-data/timestamp-nanos.parquet")
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "false") {
+      checkError(
+        exception = intercept[AnalysisException] {
+          spark.read.parquet(testDataPath).collect()
+        },
+        condition = "PARQUET_TYPE_ILLEGAL",
+        parameters = Map("parquetType" -> "INT64 (TIMESTAMP(NANOS,true))")
+      )
+    }
+  }
+
+  test("SPARK-47261: parquet file with unsupported type") {
+    val testDataPath = testFile("test-data/interval-using-fixed-len-byte-array.parquet")
+    checkError(
+      exception = intercept[AnalysisException] {
+        spark.read.parquet(testDataPath).collect()
+      },
+      condition = "PARQUET_TYPE_NOT_SUPPORTED",
+      parameters = Map("parquetType" -> "FIXED_LEN_BYTE_ARRAY (INTERVAL)")
+    )
+  }
+
+  test("SPARK-47261: parquet file with unrecognized parquet type") {
+    val testDataPath = testFile("test-data/group-field-with-enum-as-logical-annotation.parquet")
+    val expectedParameter = "required group my_list (ENUM) {\n  repeated group list {\n" +
+      "    optional binary element (STRING);\n  }\n}"
+    checkError(
+      exception = intercept[AnalysisException] {
+        spark.read.parquet(testDataPath).collect()
+      },
+      condition = "PARQUET_TYPE_NOT_RECOGNIZED",
+      parameters = Map("field" -> expectedParameter)
+    )
   }
 
   // =======================================================
@@ -2064,6 +2212,247 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
                           Seq("f1", "key_value", "value", "g2", "list", "element", "h2"))))))))
           ))))))
 
+  // ==============================================================
+  // Tests for BINARY geospatial logical types (Geometry/Geography)
+  // ==============================================================
+
+  /** Parquet to Catalyst conversion for geospatial types. */
+
+  testParquetToCatalyst(
+    "Parquet to Catalyst - BINARY with GEOMETRY logical type annotation",
+    StructType(Seq(StructField("f1", GeometryType("OGC:CRS84")))),
+    """message root {
+      |  optional binary f1 (GEOMETRY);
+      |}
+    """.stripMargin,
+    binaryAsString = false,
+    int96AsTimestamp = true)
+
+  testParquetToCatalyst(
+    "Parquet to Catalyst - BINARY with GEOMETRY logical type annotation (with CRS)",
+    StructType(Seq(StructField("f1", GeometryType("OGC:CRS84")))),
+    """message root {
+      |  optional binary f1 (GEOMETRY(OGC:CRS84));
+      |}
+    """.stripMargin,
+    binaryAsString = false,
+    int96AsTimestamp = true)
+
+  testParquetToCatalyst(
+    "Parquet to Catalyst - BINARY with GEOGRAPHY logical type annotation",
+    StructType(Seq(StructField("f1",
+      GeographyType("OGC:CRS84", EdgeInterpolationAlgorithm.SPHERICAL)))),
+    """message root {
+      |  optional binary f1 (GEOGRAPHY);
+      |}
+    """.stripMargin,
+    binaryAsString = false,
+    int96AsTimestamp = true)
+
+  testParquetToCatalyst(
+    "Parquet to Catalyst - BINARY with GEOGRAPHY logical type annotation (with CRS)",
+    StructType(Seq(StructField("f1",
+      GeographyType("OGC:CRS84", EdgeInterpolationAlgorithm.SPHERICAL)))),
+    """message root {
+      |  optional binary f1 (GEOGRAPHY(OGC:CRS84));
+      |}
+    """.stripMargin,
+    binaryAsString = false,
+    int96AsTimestamp = true)
+
+  testParquetToCatalyst(
+    "Parquet to Catalyst - BINARY with GEOGRAPHY logical type annotation (with CRS and algorithm)",
+    StructType(Seq(StructField("f1",
+      GeographyType("OGC:CRS84", EdgeInterpolationAlgorithm.SPHERICAL)))),
+    """message root {
+      |  optional binary f1 (GEOGRAPHY(OGC:CRS84, SPHERICAL));
+      |}
+    """.stripMargin,
+    binaryAsString = false,
+    int96AsTimestamp = true)
+
+  testParquetToCatalyst(
+    "Parquet to Catalyst - BINARY with GEOMETRY logical type annotation with binaryAsString",
+    StructType(Seq(StructField("f1", GeometryType("OGC:CRS84")))),
+    """message root {
+      |  optional binary f1 (GEOMETRY);
+      |}
+    """.stripMargin,
+    binaryAsString = true,
+    int96AsTimestamp = true)
+
+  testParquetToCatalyst(
+    "Parquet to Catalyst - BINARY with GEOGRAPHY logical type annotation with binaryAsString",
+    StructType(Seq(StructField("f1",
+      GeographyType("OGC:CRS84", EdgeInterpolationAlgorithm.SPHERICAL)))),
+    """message root {
+      |  optional binary f1 (GEOGRAPHY);
+      |}
+    """.stripMargin,
+    binaryAsString = true,
+    int96AsTimestamp = true)
+
+  /** Catalyst to Parquet conversion for geospatial types. */
+
+  testCatalystToParquet(
+    "Catalyst to Parquet - GeometryType",
+    StructType(Seq(StructField("f1", GeometryType("OGC:CRS84")))),
+    """message root {
+      |  optional binary f1 (GEOMETRY);
+      |}
+    """.stripMargin,
+    writeLegacyParquetFormat = false)
+
+  testCatalystToParquet(
+    "Catalyst to Parquet - GeographyType",
+    StructType(Seq(StructField("f1",
+      GeographyType("OGC:CRS84", EdgeInterpolationAlgorithm.SPHERICAL)))),
+    """message root {
+      |  optional binary f1 (GEOGRAPHY);
+      |}
+    """.stripMargin,
+    writeLegacyParquetFormat = false)
+
+  testCatalystToParquet(
+    "Catalyst to Parquet - GeometryType with non-nullable field",
+    StructType(Seq(StructField("f1", GeometryType("OGC:CRS84"), nullable = false))),
+    """message root {
+      |  required binary f1 (GEOMETRY);
+      |}
+    """.stripMargin,
+    writeLegacyParquetFormat = false)
+
+  testCatalystToParquet(
+    "Catalyst to Parquet - GeographyType with non-nullable field",
+    StructType(Seq(StructField("f1",
+      GeographyType("OGC:CRS84", EdgeInterpolationAlgorithm.SPHERICAL), nullable = false))),
+    """message root {
+      |  required binary f1 (GEOGRAPHY);
+      |}
+    """.stripMargin,
+    writeLegacyParquetFormat = false)
+
+  /** Round trip conversion for geospatial types. */
+
+  testSchema(
+    "Round-trip schema conversion - GeometryType",
+    StructType(Seq(StructField("f1", GeometryType("OGC:CRS84")))),
+    """message root {
+      |  optional binary f1 (GEOMETRY);
+      |}
+    """.stripMargin,
+    binaryAsString = false,
+    int96AsTimestamp = true,
+    writeLegacyParquetFormat = false)
+
+  testSchema(
+    "Round-trip schema conversion - GeographyType",
+    StructType(Seq(StructField("f1",
+      GeographyType("OGC:CRS84", EdgeInterpolationAlgorithm.SPHERICAL)))),
+    """message root {
+      |  optional binary f1 (GEOGRAPHY);
+      |}
+    """.stripMargin,
+    binaryAsString = false,
+    int96AsTimestamp = true,
+    writeLegacyParquetFormat = false)
+
+  /** Complex types with geospatial types. */
+
+  testCatalystToParquet(
+    "Complex types with GeometryType - array element",
+    StructType(Seq(
+      StructField("f1", ArrayType(GeometryType("OGC:CRS84"), containsNull = true))
+    )),
+    """message root {
+      |  optional group f1 (LIST) {
+      |    repeated group list {
+      |      optional binary element (GEOMETRY);
+      |    }
+      |  }
+      |}
+    """.stripMargin,
+    writeLegacyParquetFormat = false)
+
+  testCatalystToParquet(
+    "Complex types with GeographyType - array element",
+    StructType(Seq(
+      StructField("f1", ArrayType(
+        GeographyType("OGC:CRS84", EdgeInterpolationAlgorithm.SPHERICAL), containsNull = true))
+    )),
+    """message root {
+      |  optional group f1 (LIST) {
+      |    repeated group list {
+      |      optional binary element (GEOGRAPHY);
+      |    }
+      |  }
+      |}
+    """.stripMargin,
+    writeLegacyParquetFormat = false)
+
+  testCatalystToParquet(
+    "Complex types with GeometryType - nested struct",
+    StructType(Seq(
+      StructField("outer", StructType(Seq(
+        StructField("geom", GeometryType("OGC:CRS84"))
+      )))
+    )),
+    """message root {
+      |  optional group outer {
+      |    optional binary geom (GEOMETRY);
+      |  }
+      |}
+    """.stripMargin,
+    writeLegacyParquetFormat = false)
+
+  testCatalystToParquet(
+    "Complex types with GeographyType - nested struct",
+    StructType(Seq(
+      StructField("outer", StructType(Seq(
+        StructField("geog", GeographyType("OGC:CRS84", EdgeInterpolationAlgorithm.SPHERICAL))
+      )))
+    )),
+    """message root {
+      |  optional group outer {
+      |    optional binary geog (GEOGRAPHY);
+      |  }
+      |}
+    """.stripMargin,
+    writeLegacyParquetFormat = false)
+
+  testCatalystToParquet(
+    "Complex types with GeometryType - map value",
+    StructType(Seq(
+      StructField("f1", MapType(StringType, GeometryType("OGC:CRS84"), valueContainsNull = true))
+    )),
+    """message root {
+      |  optional group f1 (MAP) {
+      |    repeated group key_value {
+      |      required binary key (UTF8);
+      |      optional binary value (GEOMETRY);
+      |    }
+      |  }
+      |}
+    """.stripMargin,
+    writeLegacyParquetFormat = false)
+
+  testCatalystToParquet(
+    "Complex types with GeographyType - map value",
+    StructType(Seq(
+      StructField("f1", MapType(StringType,
+        GeographyType("OGC:CRS84", EdgeInterpolationAlgorithm.SPHERICAL), valueContainsNull = true))
+    )),
+    """message root {
+      |  optional group f1 (MAP) {
+      |    repeated group key_value {
+      |      required binary key (UTF8);
+      |      optional binary value (GEOGRAPHY);
+      |    }
+      |  }
+      |}
+    """.stripMargin,
+    writeLegacyParquetFormat = false)
+
   // =================================
   // Tests for conversion for decimals
   // =================================
@@ -2209,6 +2598,15 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
     """.stripMargin,
     writeLegacyParquetFormat = false)
 
+  testCatalystToParquet(
+    "SPARK-51610: Support the TIME data type in the parquet datasource",
+    StructType(Seq(StructField("f1", TimeType()))),
+    """message root {
+      |  optional INT64 f1;
+      |}
+    """.stripMargin,
+    writeLegacyParquetFormat = false)
+
   // The behavior of reading/writing TimestampNTZ type is independent of the configurations
   // SQLConf.PARQUET_INT96_AS_TIMESTAMP and SQLConf.PARQUET_OUTPUT_TIMESTAMP_TYPE
   Seq(true, false).foreach { int96AsTimestamp =>
@@ -2236,17 +2634,153 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
         |}
         """.stripMargin,
       binaryAsString = true,
-      int96AsTimestamp = int96AsTimestamp)
+      int96AsTimestamp = int96AsTimestamp,
+      inferTimestampNTZ = true)
   }
 
-  private def testSchemaClipping(
+  // The nanosecond timestamp types are written as INT64 with the TIMESTAMP(NANOS) annotation
+  // and, with `spark.sql.timestampNanosTypes.enabled`, read back at the canonical precision 9.
+  testSchema(
+    "SPARK-57102: TimestampNTZNanos written and read as INT64 with TIMESTAMP(NANOS,false)",
+    StructType(Seq(StructField("f1", TimestampNTZNanosType(9)))),
+    """message root {
+      |  optional INT64 f1 (TIMESTAMP(NANOS,false));
+      |}
+    """.stripMargin,
+    binaryAsString = true,
+    int96AsTimestamp = true,
+    writeLegacyParquetFormat = false,
+    timestampNanosTypesEnabled = true)
+
+  testSchema(
+    "SPARK-57102: TimestampLTZNanos written and read as INT64 with TIMESTAMP(NANOS,true)",
+    StructType(Seq(StructField("f1", TimestampLTZNanosType(9)))),
+    """message root {
+      |  optional INT64 f1 (TIMESTAMP(NANOS,true));
+      |}
+    """.stripMargin,
+    binaryAsString = true,
+    int96AsTimestamp = true,
+    writeLegacyParquetFormat = false,
+    timestampNanosTypesEnabled = true)
+
+  testCatalystToParquet(
+    "SPARK-57102: TimestampNTZNanos(7) is written as INT64 with TIMESTAMP(NANOS,false)",
+    StructType(Seq(StructField("f1", TimestampNTZNanosType(7)))),
+    """message root {
+      |  optional INT64 f1 (TIMESTAMP(NANOS,false));
+      |}
+    """.stripMargin,
+    writeLegacyParquetFormat = false)
+
+  testParquetToCatalyst(
+    "SPARK-57102: legacy nanosAsLong takes precedence over the nanos timestamp types",
+    StructType(Seq(StructField("f1", LongType))),
+    """message root {
+      |  optional INT64 f1 (TIMESTAMP(NANOS,true));
+      |}
+    """.stripMargin,
+    binaryAsString = true,
+    int96AsTimestamp = true,
+    nanosAsLong = true,
+    timestampNanosTypesEnabled = true)
+
+  testCatalystToParquet(
+    "TimestampNTZ Spark to Parquet conversion for complex types",
+    StructType(
+      Seq(
+        StructField("f1", TimestampNTZType),
+        StructField("f2", ArrayType(TimestampNTZType)),
+        StructField("f3", StructType(Seq(StructField("f4", TimestampNTZType))))
+      )
+    ),
+    """message spark_schema {
+      |  optional int64 f1 (TIMESTAMP(MICROS,false));
+      |  optional group f2 (LIST) {
+      |    repeated group list {
+      |      optional int64 element (TIMESTAMP(MICROS,false));
+      |    }
+      |  }
+      |  optional group f3 {
+      |    optional int64 f4 (TIMESTAMP(MICROS,false));
+      |  }
+      |}
+      """.stripMargin,
+    writeLegacyParquetFormat = false,
+    inferTimestampNTZ = true)
+
+  for (inferTimestampNTZ <- Seq(true, false)) {
+    val dataType = if (inferTimestampNTZ) TimestampNTZType else TimestampType
+
+    testParquetToCatalyst(
+      "TimestampNTZ Parquet to Spark conversion for complex types, " +
+        s"inferTimestampNTZ: $inferTimestampNTZ",
+      StructType(
+        Seq(
+          StructField("f1", dataType),
+          StructField("f2", ArrayType(dataType)),
+          StructField("f3", StructType(Seq(StructField("f4", dataType))))
+        )
+      ),
+      """message spark_schema {
+        |  optional int64 f1 (TIMESTAMP(MICROS,false));
+        |  optional group f2 (LIST) {
+        |    repeated group list {
+        |      optional int64 element (TIMESTAMP(MICROS,false));
+        |    }
+        |  }
+        |  optional group f3 {
+        |    optional int64 f4 (TIMESTAMP(MICROS,false));
+        |  }
+        |}
+        """.stripMargin,
+      binaryAsString = true,
+      int96AsTimestamp = false,
+      inferTimestampNTZ = inferTimestampNTZ)
+  }
+
+  test("SPARK-46056: " +
+    "schema with default existence value and binary array decimal type") {
+    import scala.jdk.CollectionConverters._
+
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      val data = Seq(Row(Decimal("13.0")))
+
+      // decimal type does not fit in int or long
+      val wideDecimal = DecimalType(32, 10)
+      val initialSchema = StructType(Seq(
+        StructField("f1", wideDecimal)
+      ))
+
+      val evolvedSchemaWithDefaultValue = StructType(Seq(
+        StructField("f1", wideDecimal),
+        StructField("f2", wideDecimal).withExistenceDefaultValue("42.0")
+      ))
+
+      val df = spark.createDataFrame(data.asJava, initialSchema)
+      df.write.mode("overwrite").parquet(s"$path/parquet")
+
+      withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "true") {
+        val res = spark.read.schema(evolvedSchemaWithDefaultValue)
+          .parquet(s"$path/parquet").collect()
+        assert(res.length == 1)
+        assert(res(0).getDecimal(0).toBigInteger.longValueExact() == 13)
+        assert(res(0).getDecimal(1).toBigInteger.longValueExact() == 42)
+      }
+    }
+  }
+
+    private def testSchemaClipping(
       testName: String,
       parquetSchema: String,
       catalystSchema: StructType,
       expectedSchema: String,
-      caseSensitive: Boolean = true): Unit = {
+      caseSensitive: Boolean = true,
+      returnNullStructIfAllFieldsMissing: Boolean = false): Unit = {
     testSchemaClipping(testName, parquetSchema, catalystSchema,
-      MessageTypeParser.parseMessageType(expectedSchema), caseSensitive)
+      MessageTypeParser.parseMessageType(expectedSchema), caseSensitive,
+      returnNullStructIfAllFieldsMissing)
   }
 
   private def testSchemaClipping(
@@ -2254,10 +2788,15 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
       parquetSchema: String,
       catalystSchema: StructType,
       expectedSchema: MessageType,
-      caseSensitive: Boolean): Unit = {
+      caseSensitive: Boolean,
+      returnNullStructIfAllFieldsMissing: Boolean): Unit = {
     test(s"Clipping - $testName") {
       val actual = ParquetReadSupport.clipParquetSchema(
-        MessageTypeParser.parseMessageType(parquetSchema), catalystSchema, caseSensitive)
+        MessageTypeParser.parseMessageType(parquetSchema),
+        catalystSchema,
+        caseSensitive,
+        useFieldId = false,
+        returnNullStructIfAllFieldsMissing)
 
       try {
         expectedSchema.checkContains(actual)
@@ -2618,7 +3157,7 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
 
     catalystSchema = new StructType(),
 
-    expectedSchema = ParquetSchemaConverter.EMPTY_MESSAGE,
+    expectedSchema = ParquetSchemaConverter.EMPTY_MESSAGE.toString,
     caseSensitive = true)
 
   testSchemaClipping(
@@ -2647,6 +3186,7 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
         |  required group f0 {
         |    optional float f02;
         |    optional double f03;
+        |    required int32 f00;
         |  }
         |}
       """.stripMargin)
@@ -2821,7 +3361,471 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
       }
       assertThrows[RuntimeException] {
         ParquetReadSupport.clipParquetSchema(
-          MessageTypeParser.parseMessageType(parquetSchema), catalystSchema, caseSensitive = false)
+         MessageTypeParser.parseMessageType(parquetSchema),
+          catalystSchema,
+          caseSensitive = false,
+          useFieldId = false,
+          returnNullStructIfAllFieldsMissing = false)
       }
     }
+
+  testSchemaClipping(
+    s"SPARK-53535: struct in struct missing in requested schema",
+    parquetSchema =
+      """message root {
+        |  required int32 f0;
+        |  required group f1 {
+        |    required group f10 {
+        |      required int32 f100;
+        |      required int32 f101;
+        |    }
+        |  }
+        |}
+      """.stripMargin,
+    catalystSchema = new StructType().add("f0", IntegerType, nullable = true),
+    expectedSchema =
+      """message root {
+        |  required int32 f0;
+        |}
+      """.stripMargin)
+
+  for (returnNullStructIfAllFieldsMissing <- Seq(true, false)) {
+    testSchemaClipping(
+      s"SPARK-53535: struct in struct, with missing field being requested, " +
+        s"returnNullStructIfAllFieldsMissing=$returnNullStructIfAllFieldsMissing",
+      parquetSchema =
+        """message root {
+          |  required group f0 {
+          |    required group f00 {
+          |      required int64 f000;
+          |      required int32 f001;
+          |    }
+          |  }
+          |}
+        """.stripMargin,
+      catalystSchema = new StructType()
+        .add("f0", new StructType()
+          .add("f01", IntegerType, nullable = true), nullable = true),
+      expectedSchema =
+        ("""message root {
+           |  required group f0 {
+           |    optional int32 f01;""" + (if (!returnNullStructIfAllFieldsMissing) {
+         """
+           |    required group f00 {
+           |      required int32 f001;
+           |    }""" } else { "" }) +
+         """
+           |  }
+           |}
+         """).stripMargin,
+      returnNullStructIfAllFieldsMissing = returnNullStructIfAllFieldsMissing)
+
+    testSchemaClipping(
+      s"SPARK-53535: missing struct with complex fields, " +
+        s"returnNullStructIfAllFieldsMissing=$returnNullStructIfAllFieldsMissing",
+      parquetSchema =
+        """message root {
+          |  optional group _1 {
+          |    optional group _1 (LIST) {
+          |      repeated group list {
+          |        optional int32 element;
+          |      }
+          |    }
+          |    optional group _2 {
+          |      optional binary _1 (UTF8);
+          |      optional int32 _2;
+          |    }
+          |    optional group _3 {
+          |      optional group _1 (LIST) {
+          |        repeated group list {
+          |          optional int32 element;
+          |        }
+          |      }
+          |      optional boolean _2;
+          |      optional int32 _3;
+          |    }
+          |    optional group _4 {
+          |      optional int64 _1;
+          |    }
+          |  }
+          |}
+        """.stripMargin,
+      catalystSchema = new StructType()
+        .add("_1", new StructType()
+          .add("_101", IntegerType)
+          .add("_102", LongType)),
+      expectedSchema =
+        ("""message root {
+           |  optional group _1 {
+           |    optional int32 _101;
+           |    optional int64 _102;""" + (if (!returnNullStructIfAllFieldsMissing) {
+         """
+           |    optional group _3 {
+           |      optional boolean _2;
+           |    }""" } else { "" }) +
+         """
+           |  }
+           |}
+         """).stripMargin,
+      returnNullStructIfAllFieldsMissing = returnNullStructIfAllFieldsMissing)
+
+    testSchemaClipping(
+      s"SPARK-53535: missing struct with only map field, " +
+        s"returnNullStructIfAllFieldsMissing=$returnNullStructIfAllFieldsMissing",
+      parquetSchema =
+        """message root {
+          |  optional group _1 {
+          |    optional group _1 (MAP) {
+          |      repeated group key_value {
+          |        required boolean key;
+          |        optional group value {
+          |          optional binary _1;
+          |          optional int32 _2;
+          |        }
+          |      }
+          |    }
+          |  }
+          |}
+        """.stripMargin,
+      catalystSchema = new StructType()
+        .add("_1", new StructType()
+          .add("_101", IntegerType)
+          .add("_102", LongType)),
+      expectedSchema =
+        ("""message root {
+           |  optional group _1 {
+           |    optional int32 _101;
+           |    optional int64 _102;""" + (if (!returnNullStructIfAllFieldsMissing) {
+         """
+           |    optional group _1 (MAP) {
+           |      repeated group key_value {
+           |        required boolean key;
+           |        optional group value {
+           |          optional int32 _2;
+           |        }
+           |      }
+           |    }""" } else { "" }) +
+         """
+           |  }
+           |}
+         """).stripMargin,
+      returnNullStructIfAllFieldsMissing = returnNullStructIfAllFieldsMissing)
+
+    testSchemaClipping(
+      s"SPARK-53535: missing struct with cheap map and more expensive array field, " +
+        s"returnNullStructIfAllFieldsMissing=$returnNullStructIfAllFieldsMissing",
+      parquetSchema =
+        """message root {
+          |  optional group _1 {
+          |    optional group _1 (MAP) {
+          |      repeated group key_value {
+          |        required boolean key;
+          |        optional group value {
+          |          optional binary _1;
+          |          optional int32 _2;
+          |        }
+          |      }
+          |    }
+          |    optional group _2 (LIST) {
+          |      repeated group list {
+          |        optional binary element;
+          |      }
+          |    }
+          |  }
+          |}
+        """.stripMargin,
+      catalystSchema = new StructType()
+        .add("_1", new StructType()
+          .add("_101", IntegerType)
+          .add("_102", LongType)),
+      expectedSchema =
+        ("""message root {
+           |  optional group _1 {
+           |    optional int32 _101;
+           |    optional int64 _102;""" + (if (!returnNullStructIfAllFieldsMissing) {
+         """
+           |    optional group _1 (MAP) {
+           |      repeated group key_value {
+           |        required boolean key;
+           |        optional group value {
+           |          optional int32 _2;
+           |        }
+           |      }
+           |    }""" } else { "" }) +
+         """
+           |  }
+           |}
+         """).stripMargin,
+      returnNullStructIfAllFieldsMissing = returnNullStructIfAllFieldsMissing)
+
+    testSchemaClipping(
+      s"SPARK-53535: missing struct with expensive map with cheap fields and primitive array, " +
+        s"returnNullStructIfAllFieldsMissing=$returnNullStructIfAllFieldsMissing",
+      parquetSchema =
+        """message root {
+          |  optional group _1 {
+          |    optional group _1 (MAP) {
+          |      repeated group key_value {
+          |        required boolean key;
+          |        optional group value {
+          |          optional binary _1;
+          |          optional int32 _2;
+          |        }
+          |      }
+          |    }
+          |    optional group _2 (LIST) {
+          |      repeated group list {
+          |        optional int32 element;
+          |      }
+          |    }
+          |  }
+          |}
+        """.stripMargin,
+      catalystSchema = new StructType()
+        .add("_1", new StructType()
+          .add("_101", IntegerType)
+          .add("_102", LongType)),
+      expectedSchema =
+        ("""message root {
+           |  optional group _1 {
+           |    optional int32 _101;
+           |    optional int64 _102;""" + (if (!returnNullStructIfAllFieldsMissing) {
+         """
+           |    optional group _2 (LIST) {
+           |      repeated group list {
+           |        optional int32 element;
+           |      }
+           |    }""" } else { "" }) +
+         """
+           |  }
+           |}
+         """).stripMargin,
+      returnNullStructIfAllFieldsMissing = returnNullStructIfAllFieldsMissing)
+
+    testSchemaClipping(
+      s"SPARK-53535: missing struct where map is not picked due to max repetition level, " +
+        s"returnNullStructIfAllFieldsMissing=$returnNullStructIfAllFieldsMissing",
+      parquetSchema =
+        """message root {
+          |  optional group _1 {
+          |    optional group _1 (MAP) {
+          |      repeated group key_value {
+          |        optional group key (LIST) {
+          |          repeated group list {
+          |            optional int32 element;
+          |          }
+          |        }
+          |        optional group value (LIST) {
+          |          repeated group list {
+          |            optional group element (LIST) {
+          |              repeated group list {
+          |                optional group element (LIST) {
+          |                  repeated group list {
+          |                    optional int32 element;
+          |                  }
+          |                }
+          |              }
+          |            }
+          |          }
+          |        }
+          |      }
+          |    }
+          |    optional group _2 (LIST) {
+          |      repeated group list {
+          |        optional group element (LIST) {
+          |          repeated group list {
+          |            optional int32 element;
+          |          }
+          |        }
+          |      }
+          |    }
+          |  }
+          |}
+        """.stripMargin,
+      catalystSchema = new StructType()
+        .add("_1", new StructType()
+          .add("_101", IntegerType)
+          .add("_102", LongType)),
+      expectedSchema =
+        ("""message root {
+           |  optional group _1 {
+           |    optional int32 _101;
+           |    optional int64 _102;""" + (if (!returnNullStructIfAllFieldsMissing) {
+         """
+           |    optional group _2 (LIST) {
+           |      repeated group list {
+           |        optional group element (LIST) {
+           |          repeated group list {
+           |            optional int32 element;
+           |          }
+           |        }
+           |      }
+           |    }""" } else { "" }) +
+         """
+           |  }
+           |}
+         """).stripMargin,
+      returnNullStructIfAllFieldsMissing = returnNullStructIfAllFieldsMissing)
+
+    testSchemaClipping(
+      s"SPARK-54220: missing struct with NullType, " +
+        s"returnNullStructIfAllFieldsMissing=$returnNullStructIfAllFieldsMissing",
+      parquetSchema =
+        """message root {
+          |  optional group _1 {
+          |    optional int32 _1;
+          |    optional boolean _2;
+          |    optional group _3 {
+          |      optional int64 _1 (UNKNOWN);
+          |    }
+          |  }
+          |}
+        """.stripMargin,
+      catalystSchema = new StructType()
+        .add("_1", new StructType()
+          .add("_101", IntegerType)
+          .add("_102", LongType)),
+      expectedSchema =
+        ("""message root {
+           |  optional group _1 {
+           |    optional int32 _101;
+           |    optional int64 _102;""" + (if (!returnNullStructIfAllFieldsMissing) {
+         """
+           |    optional group _3 {
+           |      optional int64 _1 (UNKNOWN);
+           |    }
+           |  }""" } else { "" }) +
+         """
+           |  }
+           |}
+         """).stripMargin,
+      returnNullStructIfAllFieldsMissing = returnNullStructIfAllFieldsMissing)
+  }
+
+  testSchemaClipping(
+    s"SPARK-53535: various missing structs, cheapest type selection works as expected",
+    parquetSchema =
+      """message root {
+        |  optional group pickShortestType1 {
+        |    optional int64 long;
+        |    optional int32 int;
+        |    optional double double;
+        |  }
+        |  optional group pickShortestType2 {
+        |    optional int64 long;
+        |    optional int32 int;
+        |    optional boolean boolean;
+        |  }
+        |  optional group dontPickArrayOrMap {
+        |    optional int64 long;
+        |    optional group array (LIST) {
+        |      repeated group list {
+        |        optional boolean element;
+        |      }
+        |    }
+        |    optional group map (MAP) {
+        |      repeated group key_value {
+        |        required boolean key;
+        |        required int32 value;
+        |      }
+        |    }
+        |  }
+        |  optional group pickArrayOverMap {
+        |    optional group arrayOfArray (LIST) {
+        |      repeated group list {
+        |        optional group element (LIST) {
+        |          repeated group list {
+        |            optional boolean element;
+        |          }
+        |        }
+        |      }
+        |    }
+        |    optional group arrayOfLong (LIST) {
+        |      repeated group list {
+        |        optional int64 element;
+        |      }
+        |    }
+        |    optional group map (MAP) {
+        |      repeated group key_value {
+        |        required int32 key;
+        |        required binary value (UTF8);
+        |      }
+        |    }
+        |  }
+        |  optional group pickMapOverArray {
+        |    optional group arrayOfArray (LIST) {
+        |      repeated group list {
+        |        optional group element (LIST) {
+        |          repeated group list {
+        |            optional boolean element;
+        |          }
+        |        }
+        |      }
+        |    }
+        |    optional group map (MAP) {
+        |      repeated group key_value {
+        |        required int32 key;
+        |        required binary value (UTF8);
+        |      }
+        |    }
+        |  }
+        |  optional group structNesting {
+        |    optional int64 long;
+        |    optional group struct {
+        |      optional int32 int;
+        |      optional group struct {
+        |        optional boolean boolean;
+        |      }
+        |    }
+        |  }
+        |}
+      """.stripMargin,
+    catalystSchema = new StructType()
+      .add("pickShortestType1", new StructType().add("missingColumn", IntegerType))
+      .add("pickShortestType2", new StructType().add("missingColumn", IntegerType))
+      .add("dontPickArrayOrMap", new StructType().add("missingColumn", IntegerType))
+      .add("pickArrayOverMap", new StructType().add("missingColumn", IntegerType))
+      .add("pickMapOverArray", new StructType().add("missingColumn", IntegerType))
+      .add("structNesting", new StructType().add("missingColumn", IntegerType)),
+    expectedSchema =
+      """message root {
+        |  optional group pickShortestType1 {
+        |    optional int32 missingColumn;
+        |    optional int32 int;
+        |  }
+        |  optional group pickShortestType2 {
+        |    optional int32 missingColumn;
+        |    optional boolean boolean;
+        |  }
+        |  optional group dontPickArrayOrMap {
+        |    optional int32 missingColumn;
+        |    optional int64 long;
+        |  }
+        |  optional group pickArrayOverMap {
+        |    optional int32 missingColumn;
+        |    optional group arrayOfLong (LIST) {
+        |      repeated group list {
+        |        optional int64 element;
+        |      }
+        |    }
+        |  }
+        |  optional group pickMapOverArray {
+        |    optional int32 missingColumn;
+        |    optional group map (MAP) {
+        |      repeated group key_value {
+        |        required int32 key;
+        |        required binary value (UTF8);
+        |      }
+        |    }
+        |  }
+        |  optional group structNesting {
+        |    optional int32 missingColumn;
+        |    optional group struct {
+        |      optional group struct {
+        |        optional boolean boolean;
+        |      }
+        |    }
+        |  }
+        |}
+      """.stripMargin)
 }

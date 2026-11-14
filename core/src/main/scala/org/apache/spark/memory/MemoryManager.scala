@@ -27,6 +27,7 @@ import org.apache.spark.storage.memory.MemoryStore
 import org.apache.spark.unsafe.Platform
 import org.apache.spark.unsafe.array.ByteArrayMethods
 import org.apache.spark.unsafe.memory.MemoryAllocator
+import org.apache.spark.util.Utils
 
 /**
  * An abstract memory manager that enforces how memory is shared between execution and storage.
@@ -57,9 +58,18 @@ private[spark] abstract class MemoryManager(
   onHeapStorageMemoryPool.incrementPoolSize(onHeapStorageMemory)
   onHeapExecutionMemoryPool.incrementPoolSize(onHeapExecutionMemory)
 
-  protected[this] val maxOffHeapMemory = conf.get(MEMORY_OFFHEAP_SIZE)
+  protected[this] val maxOffHeapMemory =
+    if (conf.get(MEMORY_OFFHEAP_ENABLED))  conf.get(MEMORY_OFFHEAP_SIZE) else 0
   protected[this] val offHeapStorageMemory =
     (maxOffHeapMemory * conf.get(MEMORY_STORAGE_FRACTION)).toLong
+
+  /**
+   * The maximum number of consumers listed individually in the per-consumer memory breakdown
+   * attached to an UNABLE_TO_ACQUIRE_MEMORY error. Read by [[TaskMemoryManager]]. See
+   * `spark.memory.oomErrorConsumerBreakdownLimit`.
+   */
+  private[memory] val oomErrorConsumerBreakdownLimit: Int =
+    conf.get(MEMORY_OOM_ERROR_CONSUMER_BREAKDOWN_LIMIT)
 
   offHeapExecutionMemoryPool.incrementPoolSize(maxOffHeapMemory - offHeapStorageMemory)
   offHeapStorageMemoryPool.incrementPoolSize(offHeapStorageMemory)
@@ -232,6 +242,9 @@ private[spark] abstract class MemoryManager(
         "No support for unaligned Unsafe. Set spark.memory.offHeap.enabled to false.")
       MemoryMode.OFF_HEAP
     } else {
+      if (conf.get(MEMORY_OFFHEAP_SIZE) > 0) {
+        logWarning(s"spark.memory.offHeap.size is > 0 when spark.memory.offHeap.enabled == false")
+      }
       MemoryMode.ON_HEAP
     }
   }
@@ -242,8 +255,14 @@ private[spark] abstract class MemoryManager(
    * If user didn't explicitly set "spark.buffer.pageSize", we figure out the default value
    * by looking at the number of cores available to the process, and the total amount of memory,
    * and then divide it by a factor of safety.
+   *
+   * SPARK-37593 If we are using G1GC, ZGC or ShenandoahGC, it's better to take the
+   * LONG_ARRAY_OFFSET into consideration so that the requested memory size is power of 2
+   * and can be divided by heap region size to reduce memory waste.
+   * `TaskMemoryManager.growingPageHeaderBytes` recognizes such a page size, so that the growing
+   * pages of hash join maps leave the same room.
    */
-  val pageSizeBytes: Long = {
+  private lazy val defaultPageSizeBytes = {
     val minPageSize = 1L * 1024 * 1024   // 1MB
     val maxPageSize = 64L * minPageSize  // 64MB
     val cores = if (numCores > 0) numCores else Runtime.getRuntime.availableProcessors()
@@ -254,9 +273,16 @@ private[spark] abstract class MemoryManager(
       case MemoryMode.OFF_HEAP => offHeapExecutionMemoryPool.poolSize
     }
     val size = ByteArrayMethods.nextPowerOf2(maxTungstenMemory / cores / safetyFactor)
-    val default = math.min(maxPageSize, math.max(minPageSize, size))
-    conf.get(BUFFER_PAGESIZE).getOrElse(default)
+    val chosenPageSize = math.min(maxPageSize, math.max(minPageSize, size))
+    if ((Utils.isG1GC || Utils.isZGC || Utils.isShenandoahGC) &&
+        tungstenMemoryMode == MemoryMode.ON_HEAP) {
+      chosenPageSize - Platform.LONG_ARRAY_OFFSET
+    } else {
+      chosenPageSize
+    }
   }
+
+  val pageSizeBytes: Long = conf.get(BUFFER_PAGESIZE).getOrElse(defaultPageSizeBytes)
 
   /**
    * Allocates memory for use by Unsafe/Tungsten code.

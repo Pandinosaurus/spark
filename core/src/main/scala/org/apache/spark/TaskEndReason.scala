@@ -242,7 +242,7 @@ case class TaskCommitDenied(
     jobID: Int,
     partitionID: Int,
     attemptNumber: Int) extends TaskFailedReason {
-  override def toErrorString: String = s"TaskCommitDenied (Driver denied task commit)" +
+  override def toErrorString: String = "TaskCommitDenied (Driver denied task commit)" +
     s" for job: $jobID, partition: $partitionID, attemptNumber: $attemptNumber"
   /**
    * If a task failed because its attempt to commit was denied, do not count this failure
@@ -273,6 +273,18 @@ case class ExecutorLostFailure(
   }
 
   override def countTowardsTaskFailures: Boolean = exitCausedByApp
+}
+
+/**
+ * :: DeveloperApi ::
+ * The task failed because the executor's thread pool rejected it during executor shutdown.
+ * This is not a task fault - the executor was shutting down when the task was submitted.
+ */
+@DeveloperApi
+case class ExecutorShutdownFailure(executorId: String) extends TaskFailedReason {
+  override def toErrorString: String =
+    s"ExecutorShutdownFailure (executor $executorId was shutting down)"
+  override def countTowardsTaskFailures: Boolean = false
 }
 
 /**

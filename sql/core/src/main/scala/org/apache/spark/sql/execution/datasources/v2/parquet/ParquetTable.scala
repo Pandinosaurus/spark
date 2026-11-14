@@ -16,7 +16,7 @@
  */
 package org.apache.spark.sql.execution.datasources.v2.parquet
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.fs.FileStatus
 
@@ -38,17 +38,23 @@ case class ParquetTable(
   extends FileTable(sparkSession, options, paths, userSpecifiedSchema) {
 
   override def newScanBuilder(options: CaseInsensitiveStringMap): ParquetScanBuilder =
-    new ParquetScanBuilder(sparkSession, fileIndex, schema, dataSchema, options)
+    ParquetScanBuilder(sparkSession, fileIndex, schema, dataSchema, mergedOptions(options))
 
   override def inferSchema(files: Seq[FileStatus]): Option[StructType] =
     ParquetUtils.inferSchema(sparkSession, options.asScala.toMap, files)
 
-  override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder =
+  override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = {
     new WriteBuilder {
-      override def build(): Write = ParquetWrite(paths, formatName, supportsDataType, info)
+      override def build(): Write =
+        ParquetWrite(paths, formatName, supportsDataType, mergedWriteInfo(info))
     }
+  }
 
   override def supportsDataType(dataType: DataType): Boolean = dataType match {
+    // GeoSpatial data types in Parquet are limited only to types with supported SRIDs.
+    case g: GeometryType => GeometryType.isSridSupported(g.srid)
+    case g: GeographyType => GeographyType.isSridSupported(g.srid)
+
     case _: AtomicType => true
 
     case st: StructType => st.forall { f => supportsDataType(f.dataType) }
@@ -64,4 +70,10 @@ case class ParquetTable(
   }
 
   override def formatName: String = "Parquet"
+
+  // A row is decoded from the column chunks the scan asked for, so under strict file reads reading
+  // more columns can only surface an error, never silently change which rows come back. When the
+  // read is not strict that error is swallowed and the rest of the file's rows go with it, which is
+  // why FileTable withholds the capability there.
+  override protected def supportsScanMerging: Boolean = true
 }

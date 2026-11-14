@@ -46,7 +46,7 @@ package object packageobject {
   case class PackageClass(value: Int)
 }
 
-class DatasetPrimitiveSuite extends QueryTest with SharedSparkSession {
+class DatasetPrimitiveSuite extends SharedSparkSession {
   import testImplicits._
 
   test("toDS") {
@@ -355,6 +355,9 @@ class DatasetPrimitiveSuite extends QueryTest with SharedSparkSession {
 
     checkDataset(Seq(Seq(Some(1), None), Seq(Some(2))).toDF("c").as[Set[Integer]],
       Seq(Set[Integer](1, null), Set[Integer](2)): _*)
+
+    // A decoded set keeps the element order of the source array, which must not matter.
+    checkDataset(Seq(Seq(3, 1, 2)).toDF("c").as[Set[Int]], Set(1, 2, 3))
   }
 
   test("nested sequences") {

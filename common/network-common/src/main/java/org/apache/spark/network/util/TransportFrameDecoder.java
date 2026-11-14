@@ -17,10 +17,9 @@
 
 package org.apache.spark.network.util;
 
-import java.util.LinkedList;
+import java.util.ArrayDeque;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Preconditions;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
@@ -51,7 +50,9 @@ public class TransportFrameDecoder extends ChannelInboundHandlerAdapter {
   private static final int UNKNOWN_FRAME_SIZE = -1;
   private static final long CONSOLIDATE_THRESHOLD = 20 * 1024 * 1024;
 
-  private final LinkedList<ByteBuf> buffers = new LinkedList<>();
+  // Pending input buffers not yet consumed into a frame. ArrayDeque avoids a
+  // per-channelRead list-node allocation; used strictly FIFO.
+  private final ArrayDeque<ByteBuf> buffers = new ArrayDeque<>();
   private final ByteBuf frameLenBuf = Unpooled.buffer(LENGTH_SIZE, LENGTH_SIZE);
   private final long consolidateThreshold;
 
@@ -145,9 +146,9 @@ public class TransportFrameDecoder extends ChannelInboundHandlerAdapter {
     }
 
     if (frameBuf == null) {
-      Preconditions.checkArgument(frameSize < MAX_FRAME_SIZE,
+      JavaUtils.checkArgument(frameSize < MAX_FRAME_SIZE,
           "Too large frame: %s", frameSize);
-      Preconditions.checkArgument(frameSize > 0,
+      JavaUtils.checkArgument(frameSize > 0,
           "Frame length should be positive: %s", frameSize);
       frameRemainingBytes = (int) frameSize;
 
@@ -252,7 +253,7 @@ public class TransportFrameDecoder extends ChannelInboundHandlerAdapter {
   }
 
   public void setInterceptor(Interceptor interceptor) {
-    Preconditions.checkState(this.interceptor == null, "Already have an interceptor.");
+    JavaUtils.checkState(this.interceptor == null, "Already have an interceptor.");
     this.interceptor = interceptor;
   }
 

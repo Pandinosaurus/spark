@@ -21,6 +21,7 @@ import java.io.File
 
 import org.apache.spark.benchmark.Benchmark
 import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.functions.{lit, sum}
 import org.apache.spark.util.Utils
 
 /**
@@ -30,8 +31,8 @@ import org.apache.spark.util.Utils
  *   1. without sbt:
  *      bin/spark-submit --class <this class>
  *        --jars <spark core test jar>,<spark catalyst test jar> <spark sql test jar>
- *   2. build/sbt "sql/test:runMain <this class>"
- *   3. generate result: SPARK_GENERATE_BENCHMARK_FILES=1 build/sbt "sql/test:runMain <this class>"
+ *   2. build/sbt "sql/Test/runMain <this class>"
+ *   3. generate result: SPARK_GENERATE_BENCHMARK_FILES=1 build/sbt "sql/Test/runMain <this class>"
  *      Results will be written to "benchmarks/WideSchemaBenchmark-results.txt".
  * }}}
  */
@@ -88,7 +89,50 @@ object WideSchemaBenchmark extends SqlBasedBenchmark {
     for (width <- widthsToTest) {
       val selectExpr = (1 to width).map(i => s"id as a_$i")
       benchmark.addCase(s"$width select expressions") { iter =>
-        spark.range(1).toDF.selectExpr(selectExpr: _*)
+        spark.range(1).toDF().selectExpr(selectExpr: _*)
+      }
+    }
+    benchmark.run()
+  }
+
+  def optimizeLargeSelectExpressions(): Unit = {
+    val benchmark = new Benchmark("optimize large select", 1, output = output)
+    Seq(100, 1000, 10000).foreach { width =>
+      val columns = (1 to width).map(i => s"id as c_$i")
+      val df = spark.range(1).selectExpr(columns: _*).cache()
+      df.count()  // force caching
+      benchmark.addCase(s"$width columns") { iter =>
+        df.withColumn("id", lit(1)).withColumn("name", lit("name")).queryExecution.optimizedPlan
+      }
+    }
+    benchmark.run()
+  }
+
+  def optimizeLargeUnion(): Unit = {
+    val benchmark = new Benchmark("optimize large union", 1, output = output)
+    Seq(100, 1000, 10000).foreach { width =>
+      def child(prefix: String): DataFrame =
+        spark.range(1).selectExpr((1 to width).map(i => s"id + $i as ${prefix}_$i"): _*)
+      val df = child("a").union(child("b"))
+      benchmark.addCase(s"$width columns") { iter =>
+        // `ColumnPruning` prunes the children of the `Union` for the `Aggregate`. A `select`
+        // would be pushed through the `Union` by `PushProjectionThroughUnion` instead.
+        df.groupBy("a_1").count().queryExecution.optimizedPlan
+      }
+    }
+    benchmark.run()
+  }
+
+  def optimizeLargeCube(): Unit = {
+    val benchmark = new Benchmark("optimize large cube", 1, output = output)
+    Seq(100, 1000, 10000).foreach { width =>
+      val columns = (1 to 3).map(i => s"id as g_$i") ++ (1 to width).map(i => s"id as c_$i")
+      val df = spark.range(1).selectExpr(columns: _*).cache()
+      df.count()  // force caching
+      val sums = (1 to width).map(i => sum(s"c_$i"))
+      benchmark.addCase(s"$width columns") { iter =>
+        // `ColumnPruning` prunes the `Expand` for the `Aggregate` but keeps every summed column.
+        df.cube("g_1", "g_2", "g_3").agg(sums.head, sums.tail: _*).queryExecution.optimizedPlan
       }
     }
     benchmark.run()
@@ -100,7 +144,7 @@ object WideSchemaBenchmark extends SqlBasedBenchmark {
       // normalize by width to keep constant data size
       val numRows = scaleFactor / width
       val selectExpr = (1 to width).map(i => s"id as a_$i")
-      val df = spark.range(numRows).toDF.selectExpr(selectExpr: _*).cache()
+      val df = spark.range(numRows).toDF().selectExpr(selectExpr: _*).cache()
       df.count()  // force caching
       addCases(benchmark, df, s"$width cols x $numRows rows", "a_1")
     }
@@ -195,7 +239,7 @@ object WideSchemaBenchmark extends SqlBasedBenchmark {
     for (width <- widthsToTest) {
       val numRows = scaleFactor / width
       val datum = Tuple1((1 to width).map(i => ("value_" + i -> 1)).toMap)
-      val df = spark.range(numRows).map(_ => datum).toDF.cache()
+      val df = spark.range(numRows).map(_ => datum).toDF().cache()
       df.count()  // force caching
       addCases(benchmark, df, s"$width wide x $numRows rows", "_1[\"value_1\"]")
     }
@@ -213,6 +257,18 @@ object WideSchemaBenchmark extends SqlBasedBenchmark {
 
     runBenchmarkWithDeleteTmpFiles("parsing large select expressions") {
       parsingLargeSelectExpressions()
+    }
+
+    runBenchmarkWithDeleteTmpFiles("optimize large select expressions") {
+      optimizeLargeSelectExpressions()
+    }
+
+    runBenchmarkWithDeleteTmpFiles("optimize large union") {
+      optimizeLargeUnion()
+    }
+
+    runBenchmarkWithDeleteTmpFiles("optimize large cube") {
+      optimizeLargeCube()
     }
 
     runBenchmarkWithDeleteTmpFiles("many column field read and write") {

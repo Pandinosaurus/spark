@@ -13,11 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# https://cwiki.apache.org/confluence/display/INFRA/git+-+.asf.yaml+features
+# https://github.com/apache/infrastructure-asfyaml/blob/main/README.md
 ---
 github:
   description: "Apache Spark - A unified analytics engine for large-scale data processing"
   homepage: https://spark.apache.org/
+  collaborators:
+    # Triage lets this bot remove the ai-review-requested label after posting an AI review.
+    - spark-test
+  features:
+    issues: true
   labels:
     - python
     - scala
@@ -30,4 +35,13 @@ github:
   enabled_merge_buttons:
     merge: false
     squash: true
-    rebase: true
+    squash_commit_message: PR_TITLE_AND_DESC
+    rebase: false
+  ghp_branch: master
+  ghp_path: /docs
+
+notifications:
+  pullrequests: reviews@spark.apache.org
+  issues: reviews@spark.apache.org
+  commits: commits@spark.apache.org
+  jira_options: link label

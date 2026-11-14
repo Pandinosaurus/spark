@@ -19,7 +19,8 @@ package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode}
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.plans.QueryPlan
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, HintInfo, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.trees.TreePattern._
 import org.apache.spark.sql.catalyst.trees.UnaryLike
 
@@ -37,19 +38,24 @@ trait DynamicPruning extends Predicate
  *  beneficial and so it should be executed even if it cannot reuse the results of the
  *  broadcast through ReuseExchange; otherwise, it will use the filter only if it
  *  can reuse the results of the broadcast through ReuseExchange
- * @param broadcastKeyIndex the index of the filtering key collected from the broadcast
+ * @param broadcastKeyIndices the indices of the filtering keys collected from the broadcast
+ * @param broadcastValueProjection an optional value projection from an existing broadcast
  */
 case class DynamicPruningSubquery(
     pruningKey: Expression,
     buildQuery: LogicalPlan,
     buildKeys: Seq[Expression],
-    broadcastKeyIndex: Int,
+    broadcastKeyIndices: Seq[Int],
     onlyInBroadcast: Boolean,
-    exprId: ExprId = NamedExpression.newExprId)
-  extends SubqueryExpression(buildQuery, Seq(pruningKey), exprId)
+    exprId: ExprId = NamedExpression.newExprId,
+    hint: Option[HintInfo] = None)(
+    @transient private[sql] val broadcastValueProjection: Option[BroadcastValueProjection] = None)
+  extends SubqueryExpression(buildQuery, Seq(pruningKey), exprId, Seq.empty, hint)
   with DynamicPruning
   with Unevaluable
   with UnaryLike[Expression] {
+
+  override protected def otherCopyArgs: Seq[AnyRef] = Seq(broadcastValueProjection)
 
   override def child: Expression = pruningKey
 
@@ -57,20 +63,49 @@ case class DynamicPruningSubquery(
 
   override def nullable: Boolean = false
 
-  override def withNewPlan(plan: LogicalPlan): DynamicPruningSubquery = copy(buildQuery = plan)
+  override def withNewPlan(plan: LogicalPlan): DynamicPruningSubquery =
+    copy(buildQuery = plan)(broadcastValueProjection)
+
+  override def withNewOuterAttrs(outerAttrs: Seq[Expression]): DynamicPruningSubquery = {
+    // Updating outer attrs of DynamicPruningSubquery is unsupported; assert that they match
+    // pruningKey and return a copy without any changes.
+    assert(outerAttrs.size == 1 && outerAttrs.head.semanticEquals(pruningKey))
+    copy()(broadcastValueProjection)
+  }
+
+  override def withNewHint(hint: Option[HintInfo]): SubqueryExpression =
+    copy(hint = hint)(broadcastValueProjection)
+
+  private[sql] def usableBroadcastValueProjection: Option[BroadcastValueProjection] = {
+    broadcastValueProjection.filter { projection =>
+      projection.sourcePlan.resolved &&
+        projection.sourcePlan.deterministic &&
+        projection.sourceHashKeys.nonEmpty &&
+        projection.sourceHashKeys.forall(_.resolved) &&
+        projection.sourceHashKeys.forall(_.deterministic) &&
+        projection.sourceHashKeys.forall(
+          _.references.subsetOf(projection.sourcePlan.outputSet)) &&
+        projection.valueExpression.resolved &&
+        projection.valueExpression.deterministic &&
+        projection.valueExpression.references.subsetOf(projection.sourcePlan.outputSet) &&
+        projection.valueExpression.dataType == pruningKey.dataType
+    }
+  }
 
   override lazy val resolved: Boolean = {
     pruningKey.resolved &&
       buildQuery.resolved &&
       buildKeys.nonEmpty &&
       buildKeys.forall(_.resolved) &&
-      broadcastKeyIndex >= 0 &&
-      broadcastKeyIndex < buildKeys.size &&
+      broadcastKeyIndices.forall(idx => idx >= 0 && idx < buildKeys.size) &&
       buildKeys.forall(_.references.subsetOf(buildQuery.outputSet)) &&
-      pruningKey.dataType == buildKeys(broadcastKeyIndex).dataType
+      // DynamicPruningSubquery should only have a single broadcasting key since
+      // there are no usage for multiple broadcasting keys at the moment.
+      broadcastKeyIndices.size == 1 &&
+      child.dataType == buildKeys(broadcastKeyIndices.head).dataType
   }
 
-  final override def nodePatternsInternal: Seq[TreePattern] = Seq(DYNAMIC_PRUNING_SUBQUERY)
+  final override def nodePatternsInternal(): Seq[TreePattern] = Seq(DYNAMIC_PRUNING_SUBQUERY)
 
   override def toString: String = s"dynamicpruning#${exprId.id} $conditionString"
 
@@ -78,12 +113,34 @@ case class DynamicPruningSubquery(
     copy(
       pruningKey = pruningKey.canonicalized,
       buildQuery = buildQuery.canonicalized,
-      buildKeys = buildKeys.map(_.canonicalized),
-      exprId = ExprId(0))
+      buildKeys = buildKeys.map(QueryPlan.normalizeExpressions(_, buildQuery.output)),
+      exprId = ExprId(0))(None)
   }
 
   override protected def withNewChildInternal(newChild: Expression): DynamicPruningSubquery =
-    copy(pruningKey = newChild)
+    copy(pruningKey = newChild)(broadcastValueProjection)
+}
+
+object DynamicPruningSubquery {
+  /**
+   * Builds the plan that collects the distinct build-side keys a DPP filter prunes on.
+   *
+   * The keys are aliased in a `Project` below the aggregate, which then groups on plain
+   * attributes. A partial aggregate outputs only its grouping attributes, so an `Alias` among the
+   * grouping expressions never reaches the `outputExpressions` that
+   * `PartitioningPreservingUnaryExecNode` reads its alias map from. The build side's partitioning
+   * (e.g. `KeyedPartitioning`) would then be hidden, and `EnsureRequirements` would add a shuffle.
+   * A plain grouping attribute keeps it, and `GroupPartitionsExec` coalesces duplicate keys. This
+   * is the shape `PullOutGroupingExpressions` gives complex grouping expressions.
+   */
+  private[sql] def planDistinctBuildKeys(
+      buildPlan: LogicalPlan,
+      buildKeys: Seq[Expression],
+      keyIndices: Seq[Int]): LogicalPlan = {
+    val aliases = keyIndices.map(idx => Alias(buildKeys(idx), buildKeys(idx).toString)())
+    val groupingAttrs = aliases.map(_.toAttribute)
+    Aggregate(groupingAttrs, groupingAttrs, Project(aliases, buildPlan))
+  }
 }
 
 /**

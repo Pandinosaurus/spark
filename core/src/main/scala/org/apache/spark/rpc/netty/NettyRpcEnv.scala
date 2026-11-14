@@ -31,6 +31,7 @@ import scala.util.control.NonFatal
 
 import org.apache.spark.{SecurityManager, SparkConf, SparkContext}
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.config.EXECUTOR_ID
 import org.apache.spark.internal.config.Network._
 import org.apache.spark.network.TransportContext
@@ -49,14 +50,16 @@ private[netty] class NettyRpcEnv(
     securityManager: SecurityManager,
     numUsableCores: Int) extends RpcEnv(conf) with Logging {
   val role = conf.get(EXECUTOR_ID).map { id =>
-    if (id == SparkContext.DRIVER_IDENTIFIER) "driver" else "executor"
+    if (SparkContext.isDriver(id)) "driver" else "executor"
   }
 
   private[netty] val transportConf = SparkTransportConf.fromSparkConf(
     conf.clone.set(RPC_IO_NUM_CONNECTIONS_PER_PEER, 1),
     "rpc",
     conf.get(RPC_IO_THREADS).getOrElse(numUsableCores),
-    role)
+    role,
+    sslOptions = Some(securityManager.getRpcSSLOptions())
+  )
 
   private val dispatcher: Dispatcher = new Dispatcher(this, numUsableCores)
 
@@ -214,7 +217,7 @@ private[netty] class NettyRpcEnv(
       if (!promise.tryFailure(e)) {
         e match {
           case e : RpcEnvStoppedException => logDebug(s"Ignored failure: $e")
-          case _ => logWarning(s"Ignored failure: $e")
+          case _ => logWarning(log"Ignored failure: ${MDC(ERROR, e)}")
         }
       }
     }
@@ -223,7 +226,7 @@ private[netty] class NettyRpcEnv(
       case RpcFailure(e) => onFailure(e)
       case rpcReply =>
         if (!promise.trySuccess(rpcReply)) {
-          logWarning(s"Ignored message: $reply")
+          logWarning(log"Ignored message: ${MDC(MESSAGE, reply)}")
         }
     }
 
@@ -391,7 +394,11 @@ private[netty] class NettyRpcEnv(
         }
 
         val ioThreads = clone.getInt("spark.files.io.threads", 1)
-        val downloadConf = SparkTransportConf.fromSparkConf(clone, module, ioThreads)
+        val downloadConf = SparkTransportConf.fromSparkConf(
+          clone,
+          module,
+          ioThreads,
+          sslOptions = Some(securityManager.getRpcSSLOptions()))
         val downloadContext = new TransportContext(downloadConf, new NoOpRpcHandler(), true)
         fileDownloadFactory = downloadContext.createClientFactory(createClientBootstraps())
       }
@@ -435,14 +442,30 @@ private[netty] class NettyRpcEnv(
 
   }
 
+  /**
+   * These callbacks run on the connection's event loop, so they must not log (SPARK-38446).
+   * Log4j may load classes through this thread's context class loader, e.g. to print a logged
+   * exception's stack trace. That loader can be an ExecutorClassLoader whose lock is held by a
+   * task thread waiting for a class download that this event loop serves.
+   */
   private class FileDownloadCallback(
       sink: WritableByteChannel,
       source: FileDownloadChannel,
       client: TransportClient) extends StreamCallback {
 
     override def onData(streamId: String, buf: ByteBuffer): Unit = {
-      while (buf.remaining() > 0) {
-        sink.write(buf)
+      // If the reader already closed its end (e.g. the fetch failed before reading), drop the
+      // rest of this stream. Failing here would close the shared connection and fail every
+      // other download on it.
+      if (source.isOpen()) {
+        try {
+          while (buf.remaining() > 0) {
+            sink.write(buf)
+          }
+        } catch {
+          case _: IOException if !source.isOpen() =>
+            buf.position(buf.limit())
+        }
       }
     }
 
@@ -451,7 +474,6 @@ private[netty] class NettyRpcEnv(
     }
 
     override def onFailure(streamId: String, cause: Throwable): Unit = {
-      logDebug(s"Error downloading stream $streamId.", cause)
       source.setError(cause)
       sink.close()
     }

@@ -18,17 +18,23 @@ package org.apache.spark.scheduler.cluster.k8s
 
 import java.time.Instant
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import io.fabric8.kubernetes.api.model._
 
+import org.apache.spark.{SparkConf, SSLOptions}
 import org.apache.spark.deploy.k8s.Constants._
 import org.apache.spark.deploy.k8s.SparkPod
+import org.apache.spark.internal.config.{AUTH_SECRET, NETWORK_AUTH_ENABLED}
 import org.apache.spark.resource.ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID
+import org.apache.spark.util.SparkConfWithEnv
 
 object ExecutorLifecycleTestUtils {
 
   val TEST_SPARK_APP_ID = "spark-app-id"
+  val TEST_SPARK_EXECUTOR_CONTAINER_NAME = "spark-executor"
+  val TEST_AUTH_SECRET = "authSecret"
+  val TEST_RPC_SSL_KEY_STORE_PASSWORD = "keyStorePass"
 
   def failedExecutorWithoutDeletion(
       executorId: Long, rpId: Int = DEFAULT_RESOURCE_PROFILE_ID): Pod = {
@@ -37,7 +43,7 @@ object ExecutorLifecycleTestUtils {
         .withPhase("failed")
         .withStartTime(Instant.now.toString)
         .addNewContainerStatus()
-          .withName("spark-executor")
+          .withName(TEST_SPARK_EXECUTOR_CONTAINER_NAME)
           .withImage("k8s-spark")
           .withNewState()
             .withNewTerminated()
@@ -49,6 +55,38 @@ object ExecutorLifecycleTestUtils {
         .addNewContainerStatus()
           .withName("spark-executor-sidecar")
           .withImage("k8s-spark-sidecar")
+          .withNewState()
+            .withNewTerminated()
+              .withMessage("Failed")
+              .withExitCode(2)
+              .endTerminated()
+            .endState()
+          .endContainerStatus()
+        .withMessage("Executor failed.")
+        .withReason("Executor failed because of a thrown error.")
+        .endStatus()
+      .build()
+  }
+
+  def failedExecutorWithSidecarStatusListedFirst(
+      executorId: Long, rpId: Int = DEFAULT_RESOURCE_PROFILE_ID): Pod = {
+    new PodBuilder(podWithAttachedContainerForId(executorId, rpId))
+      .editOrNewStatus()
+        .withPhase("failed")
+        .withStartTime(Instant.now.toString)
+        .addNewContainerStatus() // sidecar status listed before executor's container status
+          .withName("spark-executor-sidecar")
+          .withImage("k8s-spark-sidecar")
+          .withNewState()
+            .withNewTerminated()
+              .withMessage("Failed")
+              .withExitCode(2)
+              .endTerminated()
+            .endState()
+          .endContainerStatus()
+        .addNewContainerStatus()
+          .withName(TEST_SPARK_EXECUTOR_CONTAINER_NAME)
+          .withImage("k8s-spark")
           .withNewState()
             .withNewTerminated()
               .withMessage("Failed")
@@ -200,7 +238,7 @@ object ExecutorLifecycleTestUtils {
       .endSpec()
       .build()
     val container = new ContainerBuilder()
-      .withName("spark-executor")
+      .withName(TEST_SPARK_EXECUTOR_CONTAINER_NAME)
       .withImage("k8s-spark")
       .build()
     SparkPod(pod, container)
@@ -227,10 +265,20 @@ object ExecutorLifecycleTestUtils {
         .endMetadata()
       .withNewSpec()
         .withStorageClassName(storageClass)
-        .withAccessModes("ReadWriteOnce")
-        .withResources(new ResourceRequirementsBuilder()
+        .withAccessModes(DEFAULT_PVC_ACCESS_MODE)
+        .withResources(new VolumeResourceRequirementsBuilder()
           .withRequests(Map("storage" -> new Quantity(size)).asJava).build())
         .endSpec()
       .build()
+  }
+
+  /** Copy of `conf` with auth and RPC SSL enabled; the trust store password is env-only. */
+  def confWithAuthAndSslRpc(conf: SparkConf): SparkConf = {
+    new SparkConfWithEnv(Map(SSLOptions.ENV_RPC_SSL_TRUST_STORE_PASSWORD -> "envTrustStorePass"))
+      .setAll(conf.getAll)
+      .set(NETWORK_AUTH_ENABLED, true)
+      .set(AUTH_SECRET, TEST_AUTH_SECRET)
+      .set("spark.ssl.rpc.enabled", "true")
+      .set("spark.ssl.rpc.keyStorePassword", TEST_RPC_SSL_KEY_STORE_PASSWORD)
   }
 }

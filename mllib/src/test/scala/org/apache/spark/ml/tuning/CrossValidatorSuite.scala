@@ -19,7 +19,7 @@ package org.apache.spark.ml.tuning
 
 import java.io.File
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.{SparkFunSuite, SparkIllegalArgumentException}
 import org.apache.spark.ml.{Estimator, Model, Pipeline}
 import org.apache.spark.ml.classification.{LogisticRegression, LogisticRegressionModel, OneVsRest}
 import org.apache.spark.ml.classification.LogisticRegressionSuite.generateLogisticInput
@@ -80,6 +80,22 @@ class CrossValidatorSuite
     }
   }
 
+  test("CrossValidatorModel estimated size") {
+    val estimator = new LogisticRegression().setMaxIter(1)
+    // Initialize the estimator's logger before retaining it in the CrossValidatorModel.
+    estimator.fit(dataset)
+    val model = new CrossValidator()
+      .setEstimator(estimator)
+      .setEstimatorParamMaps(Array(ParamMap.empty))
+      .setEvaluator(new BinaryClassificationEvaluator())
+      .setNumFolds(2)
+      .fit(dataset)
+
+    val maxSize = 16 * 1024
+    assert(model.estimatedSize < maxSize,
+      s"Estimation (${model.estimatedSize}) should not include shared runtime state")
+  }
+
   test("cross validation with logistic regression with fold col") {
     val lr = new LogisticRegression
     val lrParamMaps = new ParamGridBuilder()
@@ -123,10 +139,16 @@ class CrossValidatorSuite
       .setEvaluator(eval)
       .setNumFolds(3)
       .setFoldCol("fold1")
-    val err1 = intercept[IllegalArgumentException] {
-      cv.fit(datasetWithFold)
-    }
-    assert(err1.getMessage.contains("fold1 does not exist. Available: label, features, fold"))
+
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        cv.fit(datasetWithFold)
+      },
+      condition = "FIELD_NOT_FOUND",
+      parameters = Map(
+        "fieldName" -> "`fold1`",
+        "fields" -> "`label`, `features`, `fold`")
+    )
 
     // Fold column must be integer type.
     val foldCol = udf(() => 1L)

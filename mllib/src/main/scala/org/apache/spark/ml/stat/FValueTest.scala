@@ -20,7 +20,7 @@ package org.apache.spark.ml.stat
 import org.apache.commons.math3.distribution.FDistribution
 
 import org.apache.spark.annotation.Since
-import org.apache.spark.ml.linalg.{Vector, Vectors, VectorUDT}
+import org.apache.spark.ml.linalg.{SQLDataTypes, Vector, Vectors}
 import org.apache.spark.ml.util.SchemaUtils
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Dataset, Row}
@@ -70,21 +70,21 @@ private[ml] object FValueTest {
     val spark = dataset.sparkSession
     import spark.implicits._
 
+    val resRDD = testRegression(dataset, featuresCol, labelCol)
+
     val resultDF = testRegression(dataset, featuresCol, labelCol)
       .toDF("featureIndex", "pValue", "degreesOfFreedom", "fValue")
 
     if (flatten) {
-      resultDF
+      resRDD.toDF("featureIndex", "pValue", "degreesOfFreedom", "fValue")
     } else {
-      resultDF.groupBy()
-        .agg(collect_list(struct("*")))
-        .as[Seq[(Int, Double, Long, Double)]]
-        .map { seq =>
-          val results = seq.toArray.sortBy(_._1)
-          val pValues = Vectors.dense(results.map(_._2))
-          val degreesOfFreedom = results.map(_._3)
-          val fValues = Vectors.dense(results.map(_._4))
-          (pValues, degreesOfFreedom, fValues)
+      resRDD.coalesce(1)
+        .mapPartitions { iter =>
+          val res = iter.toArray.sortBy(_._1)
+          val pValues = Vectors.dense(res.map(_._2))
+          val degreesOfFreedom = res.map(_._3)
+          val fValues = Vectors.dense(res.map(_._4))
+          Iterator.single((pValues, degreesOfFreedom, fValues))
         }.toDF("pValues", "degreesOfFreedom", "fValues")
     }
   }
@@ -99,7 +99,7 @@ private[ml] object FValueTest {
       dataset: Dataset[_],
       featuresCol: String,
       labelCol: String): RDD[(Int, Double, Long, Double)] = {
-    SchemaUtils.checkColumnType(dataset.schema, featuresCol, new VectorUDT)
+    SchemaUtils.checkColumnType(dataset.schema, featuresCol, SQLDataTypes.VectorType)
     SchemaUtils.checkNumericType(dataset.schema, labelCol)
 
     val spark = dataset.sparkSession
@@ -125,7 +125,7 @@ private[ml] object FValueTest {
         if (iter.hasNext) {
           val array = Array.ofDim[Double](numFeatures)
           while (iter.hasNext) {
-            val (label, features) = iter.next
+            val (label, features) = iter.next()
             val yDiff = label - yMean
             if (yDiff != 0) {
               features.iterator.zip(xMeans.iterator)
@@ -136,7 +136,7 @@ private[ml] object FValueTest {
         } else Iterator.empty
       }.reduceByKey(_ + _
       ).mapPartitions { iter =>
-        val fd = new FDistribution(1, degreesOfFreedom)
+        val fd = new FDistribution(1.0, degreesOfFreedom.toDouble)
         iter.map { case (col, sumForCov) =>
           // Cov(X,Y) = Sum(((Xi - Avg(X)) * ((Yi-Avg(Y))) / (N-1)
           val covariance = sumForCov / (numSamples - 1)

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -30,15 +30,21 @@ set -e
 # If there is no passwd entry for the container UID, attempt to create one
 if [ -z "$uidentry" ] ; then
     if [ -w /etc/passwd ] ; then
-	echo "$myuid:x:$myuid:$mygid:${SPARK_USER_NAME:-anonymous uid}:$SPARK_HOME:/bin/false" >> /etc/passwd
+        echo "$myuid:x:$myuid:$mygid:${SPARK_USER_NAME:-anonymous uid}:$SPARK_HOME:/bin/false" >> /etc/passwd
     else
-	echo "Container ENTRYPOINT failed to add passwd entry for anonymous UID"
+        echo "Container ENTRYPOINT failed to add passwd entry for anonymous UID"
     fi
 fi
 
+if [ -z "$JAVA_HOME" ]; then
+  JAVA_HOME=$(java -XshowSettings:properties -version 2>&1 > /dev/null | grep 'java.home' | awk '{print $3}')
+fi
+
 SPARK_CLASSPATH="$SPARK_CLASSPATH:${SPARK_HOME}/jars/*"
-env | grep SPARK_JAVA_OPT_ | sort -t_ -k4 -n | sed 's/[^=]*=\(.*\)/\1/g' > /tmp/java_opts.txt
-readarray -t SPARK_EXECUTOR_JAVA_OPTS < /tmp/java_opts.txt
+SPARK_EXECUTOR_JAVA_OPTS=()
+while IFS= read -r opt; do
+  SPARK_EXECUTOR_JAVA_OPTS+=("$opt")
+done < <(env | grep SPARK_JAVA_OPT_ | sort -t_ -k4 -n | sed 's/[^=]*=\(.*\)/\1/g')
 
 if [ -n "$SPARK_EXTRA_CLASSPATH" ]; then
   SPARK_CLASSPATH="$SPARK_CLASSPATH:$SPARK_EXTRA_CLASSPATH"
@@ -67,18 +73,26 @@ elif ! [ -z ${SPARK_HOME+x} ]; then
   SPARK_CLASSPATH="$SPARK_HOME/conf:$SPARK_CLASSPATH";
 fi
 
+# SPARK-43540: add current working directory into executor classpath
+SPARK_CLASSPATH="$SPARK_CLASSPATH:$PWD"
+
 case "$1" in
   driver)
     shift 1
     CMD=(
       "$SPARK_HOME/bin/spark-submit"
       --conf "spark.driver.bindAddress=$SPARK_DRIVER_BIND_ADDRESS"
+      --conf "spark.executorEnv.SPARK_DRIVER_POD_IP=$SPARK_DRIVER_BIND_ADDRESS"
       --deploy-mode client
       "$@"
     )
     ;;
   executor)
     shift 1
+    # Prepend spark.executor.extraLibraryPath to the existing library path
+    if [ -n "$SPARK_EXECUTOR_LIBRARY_PATH" ]; then
+      export LD_LIBRARY_PATH="$SPARK_EXECUTOR_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
     CMD=(
       ${JAVA_HOME}/bin/java
       "${SPARK_EXECUTOR_JAVA_OPTS[@]}"

@@ -25,11 +25,21 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.Literal.{FalseLiteral, TrueLiteral}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.EstimationUtils._
+import org.apache.spark.sql.catalyst.util.CharVarcharUtils
 import org.apache.spark.sql.types._
 
-case class FilterEstimation(plan: Filter) extends Logging {
+object FilterEstimation {
+  def apply(plan: Filter): FilterEstimation = {
+    new FilterEstimation(
+      plan.condition, plan.child.stats, plan.output, plan.child.isInstanceOf[LeafNode])
+  }
+}
 
-  private val childStats = plan.child.stats
+case class FilterEstimation(
+    condition: Expression,
+    childStats: Statistics,
+    output: Seq[Attribute],
+    childIsLeaf: Boolean) extends Logging {
 
   private val colStatsMap = ColumnStatsMap(childStats.attributeStats)
 
@@ -47,20 +57,50 @@ case class FilterEstimation(plan: Filter) extends Logging {
 
     // Estimate selectivity of this filter predicate, and update column stats if needed.
     // For not-supported condition, set filter selectivity to a conservative estimate 100%
-    val filterSelectivity = calculateFilterSelectivity(plan.condition).getOrElse(1.0)
+    val filterSelectivity =
+      calculateFilterSelectivity(condition).map(boundProbability).getOrElse(1.0)
 
-    val filteredRowCount: BigInt = ceil(BigDecimal(childStats.rowCount.get) * filterSelectivity)
+    val childRowCount = childStats.rowCount.get
+    val filteredRowCount: BigInt =
+      ceil(BigDecimal(childRowCount) * filterSelectivity).min(childRowCount)
     val newColStats = if (filteredRowCount == 0) {
       // The output is empty, we don't need to keep column stats.
       AttributeMap[ColumnStat](Nil)
     } else {
-      colStatsMap.outputColumnStats(rowsBeforeFilter = childStats.rowCount.get,
+      colStatsMap.outputColumnStats(rowsBeforeFilter = childRowCount,
         rowsAfterFilter = filteredRowCount)
     }
-    val filteredSizeInBytes: BigInt = getOutputSize(plan.output, filteredRowCount, newColStats)
+    val sizeByOutputAttrs = getOutputSize(output, filteredRowCount, newColStats)
+    val sizeByChildScaling = if (childRowCount > 0 && filteredRowCount > 0) {
+      ceil(
+        BigDecimal(childStats.sizeInBytes) * BigDecimal(filteredRowCount) /
+          BigDecimal(childRowCount))
+        .max(BigInt(1))
+    } else {
+      BigInt(1)
+    }
+    val filteredSizeInBytes: BigInt = sizeByOutputAttrs.min(sizeByChildScaling)
 
     Some(childStats.copy(sizeInBytes = filteredSizeInBytes, rowCount = Some(filteredRowCount),
       attributeStats = newColStats))
+  }
+
+  /**
+   * An inferred condition is implied by the original condition, so their selectivities must not
+   * be multiplied. Estimate each against the same input, with separate mutable column statistics,
+   * and keep the smaller estimate together with its size and column statistics.
+   */
+  def estimateWithInferredCondition(inferredCondition: Expression): Option[Statistics] = {
+    for {
+      originalStats <- estimate
+      inferredStats <- copy(condition = inferredCondition).estimate
+    } yield {
+      if (originalStats.rowCount.get <= inferredStats.rowCount.get) {
+        originalStats
+      } else {
+        inferredStats
+      }
+    }
   }
 
   /**
@@ -122,7 +162,10 @@ case class FilterEstimation(plan: Filter) extends Logging {
   /**
    * Returns a percentage of rows meeting a single condition in Filter node.
    * Currently we only support binary predicates where one side is a column,
-   * and the other is a literal.
+   * and the other is a literal. A side may also be the read-side CHAR padding of a column, which
+   * is what a predicate pushed below the padding Project compares. It is estimated as the column
+   * itself, as `EstimationUtils.getAliasStats` does above the padding Project. The read-side
+   * checks of standard CHAR/VARCHAR semantics are not handled yet, see the SPARK-60830 TODO there.
    *
    * @param condition a single logical expression
    * @param update a boolean flag to specify if we need to update ColumnStat of a column
@@ -131,7 +174,11 @@ case class FilterEstimation(plan: Filter) extends Logging {
    *         It returns None if the condition is not supported.
    */
   def calculateSingleCondition(condition: Expression, update: Boolean): Option[Double] = {
-    condition match {
+    val unpadded = condition.mapChildren {
+      case CharVarcharUtils.ReadSidePadding(attr: Attribute, _) => attr
+      case other => other
+    }
+    unpadded match {
       case l: Literal =>
         evaluateLiteral(l)
 
@@ -181,10 +228,10 @@ case class FilterEstimation(plan: Filter) extends Logging {
       // So for IsNull and IsNotNull predicates, we only estimate them when the child is a leaf
       // node, whose `nullCount` is accurate.
       // This is a limitation due to lack of advanced stats. We should remove it in the future.
-      case IsNull(ar: Attribute) if plan.child.isInstanceOf[LeafNode] =>
+      case IsNull(ar: Attribute) if childIsLeaf =>
         evaluateNullCheck(ar, isNull = true, update)
 
-      case IsNotNull(ar: Attribute) if plan.child.isInstanceOf[LeafNode] =>
+      case IsNotNull(ar: Attribute) if childIsLeaf =>
         evaluateNullCheck(ar, isNull = false, update)
 
       case op @ Equality(attrLeft: Attribute, attrRight: Attribute) =>
@@ -281,7 +328,7 @@ case class FilterEstimation(plan: Filter) extends Logging {
     attr.dataType match {
       case _: NumericType | DateType | TimestampType | BooleanType =>
         evaluateBinaryForNumeric(op, attr, literal, update)
-      case StringType | BinaryType =>
+      case _: StringType | BinaryType =>
         // TODO: It is difficult to support other binary comparisons for String/Binary
         // type without min/max and advanced statistics like histogram.
         logDebug("[CBO] No range comparison statistics for String/Binary type " + attr)
@@ -313,39 +360,45 @@ case class FilterEstimation(plan: Filter) extends Logging {
     }
     val colStat = colStatsMap(attr)
 
-    // decide if the value is in [min, max] of the column.
-    // We currently don't store min/max for binary/string type.
-    // Hence, we assume it is in boundary for binary/string type.
-    val statsInterval = ValueInterval(colStat.min, colStat.max, attr.dataType)
-    if (statsInterval.contains(literal)) {
-      if (update) {
-        // We update ColumnStat structure after apply this equality predicate:
-        // Set distinctCount to 1, nullCount to 0, and min/max values (if exist) to the literal
-        // value.
-        val newStats = attr.dataType match {
-          case StringType | BinaryType =>
-            colStat.copy(distinctCount = Some(1), nullCount = Some(0))
-          case _ =>
-            colStat.copy(distinctCount = Some(1), min = Some(literal.value),
-              max = Some(literal.value), nullCount = Some(0))
-        }
-        colStatsMap.update(attr, newStats)
-      }
-
-      if (colStat.histogram.isEmpty) {
-        if (!colStat.distinctCount.isEmpty) {
-          // returns 1/ndv if there is no histogram
-          Some(1.0 / colStat.distinctCount.get.toDouble)
-        } else {
-          None
-        }
-      } else {
-        Some(computeEqualityPossibilityByHistogram(literal, colStat))
-      }
-
-    } else {  // not in interval
-      Some(0.0)
+    // Decide if the value is in [min, max] of the column.
+    // We currently don't store min/max for binary/string type. For other types, if min/max are
+    // missing, treat the range as unknown (instead of "all nulls") and fall back to NDV/histogram.
+    val valueInRange = attr.dataType match {
+      case _: StringType | BinaryType =>
+        true
+      case _ if !colStat.hasMinMaxStats =>
+        true
+      case _ =>
+        ValueInterval(colStat.min, colStat.max, attr.dataType).contains(literal)
     }
+
+    if (!valueInRange) return Some(0.0)
+
+    val useHistogram = colStat.histogram.isDefined && canEstimateWithHistogram(attr.dataType)
+    val percent = if (useHistogram) {
+      if (colStat.hasMinMaxStats) {
+        Some(computeEqualityPossibilityByHistogram(literal, colStat))
+      } else {
+        None
+      }
+    } else {
+      colStat.distinctCount.filter(_ > 0).map(ndv => 1.0 / ndv.toDouble)
+    }
+
+    if (update && percent.isDefined) {
+      // We update ColumnStat structure after apply this equality predicate:
+      // Set distinctCount to 1, nullCount to 0, and min/max values (if exist) to the literal value.
+      val newStats = attr.dataType match {
+        case _: StringType | BinaryType =>
+          colStat.copy(distinctCount = Some(1), nullCount = Some(0))
+        case _ =>
+          colStat.copy(distinctCount = Some(1), min = Some(literal.value),
+            max = Some(literal.value), nullCount = Some(0))
+      }
+      colStatsMap.update(attr, newStats)
+    }
+
+    percent
   }
 
   /**
@@ -397,8 +450,11 @@ case class FilterEstimation(plan: Filter) extends Logging {
     // use [min, max] to filter the original hSet
     dataType match {
       case _: NumericType | BooleanType | DateType | TimestampType =>
-        if (ndv.toDouble == 0 || colStat.min.isEmpty || colStat.max.isEmpty)  {
+        if (ndv.toDouble == 0) {
           return Some(0.0)
+        }
+        if (colStat.min.isEmpty || colStat.max.isEmpty) {
+          return None
         }
 
         val statsInterval =
@@ -423,7 +479,7 @@ case class FilterEstimation(plan: Filter) extends Logging {
         }
 
       // We assume the whole set since there is no min/max information for String/Binary type
-      case StringType | BinaryType =>
+      case _: StringType | BinaryType =>
         if (ndv.toDouble == 0)  {
           return Some(0.0)
         }
@@ -666,7 +722,7 @@ case class FilterEstimation(plan: Filter) extends Logging {
     }
 
     attrLeft.dataType match {
-      case StringType | BinaryType =>
+      case _: StringType | BinaryType =>
         // TODO: It is difficult to support other binary comparisons for String/Binary
         // type without min/max and advanced statistics like histogram.
         logDebug("[CBO] No range comparison statistics for String/Binary type " + attrLeft)
@@ -922,6 +978,6 @@ case class ColumnStatsMap(originalMap: AttributeMap[ColumnStat]) {
       attr -> oriColStat.updateCountStats(
         rowsBeforeFilter, rowsAfterFilter, updatedMap.get(attr.exprId).map(_._2))
     }
-    AttributeMap(newColumnStats.toSeq)
+    AttributeMap(newColumnStats)
   }
 }

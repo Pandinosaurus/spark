@@ -17,17 +17,19 @@
 
 package org.apache.spark.sql.execution
 
-import org.apache.spark.sql.{DataFrame, QueryTest}
-import org.apache.spark.sql.catalyst.plans.physical.{RangePartitioning, UnknownPartitioning}
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.catalyst.expressions.{Ascending, AttributeReference, SortOrder}
+import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, RangePartitioning, UnknownPartitioning}
 import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanHelper, DisableAdaptiveExecutionSuite, EnableAdaptiveExecutionSuite}
+import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
 import org.apache.spark.sql.execution.joins.ShuffledJoin
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.types.IntegerType
 
 
 abstract class RemoveRedundantSortsSuiteBase
-    extends QueryTest
-    with SharedSparkSession
+    extends SharedSparkSession
     with AdaptiveSparkPlanHelper {
   import testImplicits._
 
@@ -51,7 +53,7 @@ abstract class RemoveRedundantSortsSuiteBase
 
   test("remove redundant sorts with limit") {
     withTempView("t") {
-      spark.range(100).select('id as "key").createOrReplaceTempView("t")
+      spark.range(100).select($"id" as "key").createOrReplaceTempView("t")
       val query =
         """
           |SELECT key FROM
@@ -64,8 +66,8 @@ abstract class RemoveRedundantSortsSuiteBase
 
   test("remove redundant sorts with broadcast hash join") {
     withTempView("t1", "t2") {
-      spark.range(1000).select('id as "key").createOrReplaceTempView("t1")
-      spark.range(1000).select('id as "key").createOrReplaceTempView("t2")
+      spark.range(1000).select($"id" as "key").createOrReplaceTempView("t1")
+      spark.range(1000).select($"id" as "key").createOrReplaceTempView("t2")
 
       val queryTemplate = """
         |SELECT /*+ BROADCAST(%s) */ t1.key FROM
@@ -100,8 +102,8 @@ abstract class RemoveRedundantSortsSuiteBase
 
   test("remove redundant sorts with sort merge join") {
     withTempView("t1", "t2") {
-      spark.range(1000).select('id as "key").createOrReplaceTempView("t1")
-      spark.range(1000).select('id as "key").createOrReplaceTempView("t2")
+      spark.range(1000).select($"id" as "key").createOrReplaceTempView("t1")
+      spark.range(1000).select($"id" as "key").createOrReplaceTempView("t2")
       val query = """
         |SELECT /*+ MERGE(t1) */ t1.key FROM
         | (SELECT key FROM t1 WHERE key > 10 ORDER BY key DESC LIMIT 10) t1
@@ -123,24 +125,74 @@ abstract class RemoveRedundantSortsSuiteBase
 
   test("cached sorted data doesn't need to be re-sorted") {
     withSQLConf(SQLConf.REMOVE_REDUNDANT_SORTS_ENABLED.key -> "true") {
-      val df = spark.range(1000).select('id as "key").sort('key.desc).cache()
-      val resorted = df.sort('key.desc)
-      val sortedAsc = df.sort('key.asc)
+      val df = spark.range(1000).select($"id" as "key").sort($"key".desc).cache()
+      df.collect()
+      val resorted = df.sort($"key".desc)
+      val sortedAsc = df.sort($"key".asc)
       checkNumSorts(df, 0)
       checkNumSorts(resorted, 0)
       checkNumSorts(sortedAsc, 1)
       val result = resorted.collect()
       withSQLConf(SQLConf.REMOVE_REDUNDANT_SORTS_ENABLED.key -> "false") {
-        val resorted = df.sort('key.desc)
+        val resorted = df.sort($"key".desc)
+        resorted.collect()
         checkNumSorts(resorted, 1)
         checkAnswer(resorted, result)
       }
     }
   }
 
+  test("SPARK-58099: remove local sort dangling below a shuffle that does not require ordering") {
+    // A local sort directly below a round-robin repartition survives logical optimization
+    // (`EliminateSorts` only recurses through Sort/Join/order-irrelevant-Aggregate parents, and
+    // `CollapseRepartition` removes only a global sort under `RepartitionByExpression` or any sort
+    // under `RebalancePartitions` -- never a sort under a round-robin `Repartition`), so it reaches
+    // the physical plan as `Shuffle(RoundRobin) <- Sort(local)` and is removed by the new branch.
+    // The source must be unsorted so the local sort is not itself elided as redundant.
+    withTempView("t") {
+      Seq(3, 1, 2, 5, 4).toDF("key").createOrReplaceTempView("t")
+      val query = "SELECT /*+ REPARTITION(3) */ * FROM (SELECT key FROM t SORT BY key)"
+      checkSorts(query, 0, 1)
+    }
+
+    // A global sort below such a shuffle must be kept: it carries its own distribution requirement
+    // and is not the dead within-partition sort this rule targets. This shape is not reachable via
+    // SQL/DataFrame, so the rule is applied directly to a physical plan.
+    val attr = AttributeReference("key", IntegerType)()
+    val scan = LocalTableScanExec(Seq(attr), Nil, None)
+    val globalSort = SortExec(SortOrder(attr, Ascending) :: Nil, global = true, scan)
+    withSQLConf(SQLConf.REMOVE_REDUNDANT_SORTS_ENABLED.key -> "true") {
+      val danglingGlobal = ShuffleExchangeExec(HashPartitioning(Seq(attr), 5), globalSort)
+      assert(RemoveRedundantSorts(danglingGlobal).find(_.isInstanceOf[SortExec]).isDefined)
+    }
+  }
+
+  test("SPARK-58099: keep local sort satisfied only by a bucketed scan output ordering") {
+    // With `RemoveRedundantSorts` running before `DisableUnnecessaryBucketedScan`, the local sort
+    // could be stripped based on the bucketed scan's output ordering and then the ordering would
+    // be silently lost once `DisableUnnecessaryBucketedScan` disables the scan. Running
+    // `RemoveRedundantSorts` after `DisableUnnecessaryBucketedScan` closes that hole.
+    withSQLConf(
+      SQLConf.REMOVE_REDUNDANT_SORTS_ENABLED.key -> "true",
+      SQLConf.LEGACY_BUCKETED_TABLE_SCAN_OUTPUT_ORDERING.key -> "true",
+      SQLConf.AUTO_BUCKETED_SCAN_ENABLED.key -> "true") {
+      withTable("t") {
+        // A single file per bucket so the bucketed scan reports an output ordering.
+        spark.range(100).selectExpr("id as i").repartition(1)
+          .write.format("parquet").bucketBy(8, "i").sortBy("i").saveAsTable("t")
+        val df = sql("SELECT * FROM t SORT BY i")
+        val plan = df.queryExecution.executedPlan
+        // The bucketed scan is disabled since there is no interesting-partition operator above it.
+        assert(collect(plan) { case s: FileSourceScanExec if s.bucketedScan => s }.isEmpty)
+        // The local sort must be kept, otherwise the within-partition ordering would be lost.
+        assert(collect(plan) { case s: SortExec => s }.nonEmpty)
+      }
+    }
+  }
+
   test("SPARK-33472: shuffled join with different left and right side partition numbers") {
     withTempView("t1", "t2") {
-      spark.range(0, 100, 1, 2).select('id as "key").createOrReplaceTempView("t1")
+      spark.range(0, 100, 1, 2).select($"id" as "key").createOrReplaceTempView("t1")
       (0 to 100).toDF("key").createOrReplaceTempView("t2")
 
       val queryTemplate = """

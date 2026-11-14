@@ -19,7 +19,7 @@ package org.apache.spark.sql.hive
 
 import java.util.Properties
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{Path, PathFilter}
@@ -37,15 +37,19 @@ import org.apache.hadoop.mapreduce.{InputFormat => newInputClass}
 
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.rdd.{EmptyRDD, HadoopRDD, NewHadoopRDD, RDD, UnionRDD}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.{InternalRow, SQLConfHelper}
 import org.apache.spark.sql.catalyst.analysis.CastSupport
+import org.apache.spark.sql.catalyst.catalog.ExternalCatalogUtils
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.{TimestampLTZNanosType, TimestampNTZNanosType}
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.{SerializableConfiguration, Utils}
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * A trait for subclasses that handle table scans.
@@ -72,7 +76,7 @@ class HadoopTableReader(
 
   // Hadoop honors "mapreduce.job.maps" as hint,
   // but will ignore when mapreduce.jobtracker.address is "local".
-  // https://hadoop.apache.org/docs/r2.7.6/hadoop-mapreduce-client/hadoop-mapreduce-client-core/
+  // https://hadoop.apache.org/docs/stable/hadoop-mapreduce-client/hadoop-mapreduce-client-core/
   // mapred-default.xml
   //
   // In order keep consistency with Hive, we will let it be 0 in local mode also.
@@ -87,7 +91,7 @@ class HadoopTableReader(
     sparkSession.sparkContext.conf, hadoopConf)
 
   private val _broadcastedHadoopConf =
-    sparkSession.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
+    SerializableConfiguration.broadcast(sparkSession.sparkContext, hadoopConf)
 
   override def conf: SQLConf = sparkSession.sessionState.conf
 
@@ -160,46 +164,7 @@ class HadoopTableReader(
   def makeRDDForPartitionedTable(
       partitionToDeserializer: Map[HivePartition, Class[_ <: Deserializer]],
       filterOpt: Option[PathFilter]): RDD[InternalRow] = {
-
-    // SPARK-5068:get FileStatus and do the filtering locally when the path is not exists
-    def verifyPartitionPath(
-        partitionToDeserializer: Map[HivePartition, Class[_ <: Deserializer]]):
-        Map[HivePartition, Class[_ <: Deserializer]] = {
-      if (!conf.verifyPartitionPath) {
-        partitionToDeserializer
-      } else {
-        val existPathSet = collection.mutable.Set[String]()
-        val pathPatternSet = collection.mutable.Set[String]()
-        partitionToDeserializer.filter {
-          case (partition, partDeserializer) =>
-            def updateExistPathSetByPathPattern(pathPatternStr: String): Unit = {
-              val pathPattern = new Path(pathPatternStr)
-              val fs = pathPattern.getFileSystem(hadoopConf)
-              val matches = fs.globStatus(pathPattern)
-              matches.foreach(fileStatus => existPathSet += fileStatus.getPath.toString)
-            }
-            // convert  /demo/data/year/month/day  to  /demo/data/*/*/*/
-            def getPathPatternByPath(parNum: Int, tempPath: Path): String = {
-              var path = tempPath
-              for (i <- (1 to parNum)) path = path.getParent
-              val tails = (1 to parNum).map(_ => "*").mkString("/", "/", "/")
-              path.toString + tails
-            }
-
-            val partPath = partition.getDataLocation
-            val partNum = Utilities.getPartitionDesc(partition).getPartSpec.size()
-            val pathPatternStr = getPathPatternByPath(partNum, partPath)
-            if (!pathPatternSet.contains(pathPatternStr)) {
-              pathPatternSet += pathPatternStr
-              updateExistPathSetByPathPattern(pathPatternStr)
-            }
-            existPathSet.contains(partPath.toString)
-        }
-      }
-    }
-
-    val hivePartitionRDDs = verifyPartitionPath(partitionToDeserializer)
-      .map { case (partition, partDeserializer) =>
+    val hivePartitionRDDs = partitionToDeserializer.map { case (partition, partDeserializer) =>
       val partDesc = Utilities.getPartitionDescFromTableDesc(tableDesc, partition, true)
       val partPath = partition.getDataLocation
       val inputPathStr = applyFilterIfNeeded(partPath, filterOpt)
@@ -209,7 +174,7 @@ class HadoopTableReader(
 
       val partColsDelimited: String = partProps.getProperty(META_TABLE_PARTITION_COLUMNS)
       // Partitioning columns are delimited by "/"
-      val partCols = partColsDelimited.trim().split("/").toSeq
+      val partCols = partColsDelimited.trim().split("/").toImmutableArraySeq
       // 'partValues[i]' contains the value for the partitioning column at 'partCols[i]'.
       val partValues = if (partSpec == null) {
         Array.fill(partCols.size)(new String)
@@ -231,7 +196,10 @@ class HadoopTableReader(
       def fillPartitionKeys(rawPartValues: Array[String], row: InternalRow): Unit = {
         partitionKeyAttrs.foreach { case (attr, ordinal) =>
           val partOrdinal = partitionKeys.indexOf(attr)
-          row(ordinal) = cast(Literal(rawPartValues(partOrdinal)), attr.dataType).eval(null)
+          val rawPartValue = rawPartValues(partOrdinal)
+          val partValue =
+            if (rawPartValue == ExternalCatalogUtils.DEFAULT_PARTITION_NAME) null else rawPartValue
+          row(ordinal) = cast(Literal(partValue), attr.dataType).eval(null)
         }
       }
 
@@ -278,7 +246,7 @@ class HadoopTableReader(
     }.toSeq
 
     // Even if we don't use any partitions, we still need an empty RDD
-    if (hivePartitionRDDs.size == 0) {
+    if (hivePartitionRDDs.isEmpty) {
       new EmptyRDD[InternalRow](sparkSession.sparkContext)
     } else {
       new UnionRDD(hivePartitionRDDs(0).context, hivePartitionRDDs)
@@ -300,6 +268,16 @@ class HadoopTableReader(
   }
 
   /**
+   * True if the new org.apache.hadoop.mapreduce.InputFormat is implemented (except
+   * HiveHBaseTableInputFormat where although the new interface is implemented by base HBase class
+   * the table inicialization in the Hive layer only happens via the old interface methods -
+   * for more details see SPARK-32380).
+   */
+  private def compatibleWithNewHadoopRDD(inputClass: Class[_ <: oldInputClass[_, _]]): Boolean =
+    classOf[newInputClass[_, _]].isAssignableFrom(inputClass) &&
+      !inputClass.getName.equalsIgnoreCase("org.apache.hadoop.hive.hbase.HiveHBaseTableInputFormat")
+
+  /**
    * The entry of creating a RDD.
    * [SPARK-26630] Using which HadoopRDD will be decided by the input format of tables.
    * The input format of NewHadoopRDD is from `org.apache.hadoop.mapreduce` package while
@@ -307,7 +285,7 @@ class HadoopTableReader(
    */
   private def createHadoopRDD(localTableDesc: TableDesc, inputPathStr: String): RDD[Writable] = {
     val inputFormatClazz = localTableDesc.getInputFileFormatClass
-    if (classOf[newInputClass[_, _]].isAssignableFrom(inputFormatClazz)) {
+    if (compatibleWithNewHadoopRDD(inputFormatClazz)) {
       createNewHadoopRDD(localTableDesc, inputPathStr)
     } else {
       createOldHadoopRDD(localTableDesc, inputPathStr)
@@ -316,7 +294,7 @@ class HadoopTableReader(
 
   private def createHadoopRDD(partitionDesc: PartitionDesc, inputPathStr: String): RDD[Writable] = {
     val inputFormatClazz = partitionDesc.getInputFileFormatClass
-    if (classOf[newInputClass[_, _]].isAssignableFrom(inputFormatClazz)) {
+    if (compatibleWithNewHadoopRDD(inputFormatClazz)) {
       createNewHadoopRDD(partitionDesc, inputPathStr)
     } else {
       createOldHadoopRDD(partitionDesc, inputPathStr)
@@ -356,7 +334,9 @@ class HadoopTableReader(
       inputFormatClass,
       classOf[Writable],
       classOf[Writable],
-      _minSplitsPerRDD)
+      _minSplitsPerRDD,
+      ignoreCorruptFiles = conf.ignoreCorruptFiles,
+      ignoreMissingFiles = conf.ignoreMissingFiles)
 
     // Only take the value (skip the key) because Hive works only with values.
     rdd.map(_._2)
@@ -390,8 +370,9 @@ class HadoopTableReader(
       inputFormatClass,
       classOf[Writable],
       classOf[Writable],
-      jobConf
-    )
+      jobConf,
+      ignoreCorruptFiles = conf.ignoreCorruptFiles,
+      ignoreMissingFiles = conf.ignoreMissingFiles)
 
     // Only take the value (skip the key) because Hive works only with values.
     rdd.map(_._2)
@@ -485,8 +466,8 @@ private[hive] object HadoopTableReader extends HiveInspectors with Logging {
      * Builds specific unwrappers ahead of time according to object inspector
      * types to avoid pattern matching and branching costs per row.
      */
-    val unwrappers: Seq[(Any, InternalRow, Int) => Unit] = fieldRefs.map {
-      _.getFieldObjectInspector match {
+    val unwrappers: Seq[(Any, InternalRow, Int) => Unit] = fieldRefs.zip(nonPartitionKeyAttrs).map {
+      case (fieldRef, (attr, _)) => fieldRef.getFieldObjectInspector match {
         case oi: BooleanObjectInspector =>
           (value: Any, row: InternalRow, ordinal: Int) => row.setBoolean(ordinal, oi.get(value))
         case oi: ByteObjectInspector =>
@@ -510,9 +491,18 @@ private[hive] object HadoopTableReader extends HiveInspectors with Logging {
         case oi: HiveDecimalObjectInspector =>
           (value: Any, row: InternalRow, ordinal: Int) =>
             row.update(ordinal, HiveShim.toCatalystDecimal(oi, value))
+        case oi: TimestampObjectInspector
+            if attr.dataType.isInstanceOf[TimestampLTZNanosType] ||
+              attr.dataType.isInstanceOf[TimestampNTZNanosType] =>
+          // Nanos timestamps need the target Catalyst type to produce TimestampNanosVal; reuse
+          // the data-type-aware unwrapper instead of duplicating the conversion here.
+          val unwrapper = unwrapperFor(oi, attr.dataType)
+          (value: Any, row: InternalRow, ordinal: Int) => row.update(ordinal, unwrapper(value))
         case oi: TimestampObjectInspector =>
           (value: Any, row: InternalRow, ordinal: Int) =>
-            row.setLong(ordinal, DateTimeUtils.fromJavaTimestamp(oi.getPrimitiveJavaObject(value)))
+            row.setLong(
+              ordinal,
+              DateTimeUtils.fromJavaTimestamp(oi.getPrimitiveJavaObject(value)))
         case oi: DateObjectInspector =>
           (value: Any, row: InternalRow, ordinal: Int) =>
             row.setInt(ordinal, DateTimeUtils.fromJavaDate(oi.getPrimitiveJavaObject(value)))
@@ -523,7 +513,7 @@ private[hive] object HadoopTableReader extends HiveInspectors with Logging {
           val unwrapper = unwrapperFor(oi)
           (value: Any, row: InternalRow, ordinal: Int) => row(ordinal) = unwrapper(value)
       }
-    }
+    }.toImmutableArraySeq
 
     val converter = ObjectInspectorConverters.getConverter(rawDeser.getObjectInspector, soi)
 
@@ -543,7 +533,10 @@ private[hive] object HadoopTableReader extends HiveInspectors with Logging {
           i += 1
         } catch {
           case ex: Throwable =>
-            logError(s"Exception thrown in field <${fieldRefs(i).getFieldName}>")
+            logError(
+              log"Exception thrown in field <${MDC(FIELD_NAME, fieldRefs(i).getFieldName)}>",
+              ex
+            )
             throw ex
         }
       }

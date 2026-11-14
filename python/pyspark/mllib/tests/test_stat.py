@@ -16,15 +16,14 @@
 #
 
 import array as pyarray
-import unittest
 
 from numpy import array
 
-from pyspark.mllib.linalg import Vectors, Matrices
+from pyspark.errors import IllegalArgumentException
+from pyspark.mllib.linalg import Matrices, Vectors
 from pyspark.mllib.random import RandomRDDs
 from pyspark.mllib.regression import LabeledPoint
 from pyspark.mllib.stat import Statistics
-from pyspark.sql.utils import IllegalArgumentException
 from pyspark.testing.mllibutils import MLlibTestCase
 
 
@@ -65,6 +64,7 @@ class ChiSqTestTests(MLlibTestCase):
 
         observed = Vectors.dense([4, 6, 5])
         pearson = Statistics.chiSqTest(observed)
+        self.assertIn("Chi squared test summary", str(pearson))
 
         # Validated against the R command `chisq.test(c(4, 6, 5), p=c(1/3, 1/3, 1/3))`
         self.assertEqual(pearson.statistic, 0.4)
@@ -195,12 +195,6 @@ class KolmogorovSmirnovTest(MLlibTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.mllib.tests.test_stat import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

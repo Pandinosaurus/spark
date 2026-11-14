@@ -99,7 +99,9 @@ final class VectorSlicer @Since("1.5.0") (@Since("1.5.0") override val uid: Stri
   override def transform(dataset: Dataset[_]): DataFrame = {
     // Validity checks
     transformSchema(dataset.schema)
-    val inputAttr = AttributeGroup.fromStructField(dataset.schema($(inputCol)))
+    val inputAttr = AttributeGroup.fromStructField(
+      SchemaUtils.getSchemaField(dataset.schema, $(inputCol))
+    )
     if ($(indices).nonEmpty) {
       val size = inputAttr.size
       if (size >= 0) {
@@ -130,7 +132,9 @@ final class VectorSlicer @Since("1.5.0") (@Since("1.5.0") override val uid: Stri
 
   /** Get the feature indices in order: indices, names */
   private def getSelectedFeatureIndices(schema: StructType): Array[Int] = {
-    val nameFeatures = MetadataUtils.getFeatureIndicesFromNames(schema($(inputCol)), $(names))
+    val nameFeatures = MetadataUtils.getFeatureIndicesFromNames(
+      SchemaUtils.getSchemaField(schema, $(inputCol)), $(names)
+    )
     val indFeatures = $(indices)
     val numDistinctFeatures = (nameFeatures ++ indFeatures).distinct.length
     lazy val errMsg = "VectorSlicer requires indices and names to be disjoint" +
@@ -146,14 +150,14 @@ final class VectorSlicer @Since("1.5.0") (@Since("1.5.0") override val uid: Stri
   override def transformSchema(schema: StructType): StructType = {
     require($(indices).length > 0 || $(names).length > 0,
       s"VectorSlicer requires that at least one feature be selected.")
-    SchemaUtils.checkColumnType(schema, $(inputCol), new VectorUDT)
+    SchemaUtils.checkColumnType(schema, $(inputCol), SQLDataTypes.VectorType)
 
     if (schema.fieldNames.contains($(outputCol))) {
       throw new IllegalArgumentException(s"Output column ${$(outputCol)} already exists.")
     }
     val numFeaturesSelected = $(indices).length + $(names).length
     val outputAttr = new AttributeGroup($(outputCol), numFeaturesSelected)
-    SchemaUtils.appendColumn(schema, outputAttr.toStructField)
+    SchemaUtils.appendColumn(schema, outputAttr.toStructField())
   }
 
   @Since("1.5.0")

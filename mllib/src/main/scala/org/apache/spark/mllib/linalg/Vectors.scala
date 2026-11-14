@@ -21,11 +21,11 @@ import java.lang.{Double => JavaDouble, Integer => JavaInteger, Iterable => Java
 import java.util
 
 import scala.annotation.varargs
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.language.implicitConversions
 
 import breeze.linalg.{DenseVector => BDV, SparseVector => BSV, Vector => BV}
-import org.json4s.DefaultFormats
+import org.json4s.{DefaultFormats, Formats}
 import org.json4s.JsonDSL._
 import org.json4s.jackson.JsonMethods.{compact, parse => parseJson, render}
 
@@ -36,6 +36,7 @@ import org.apache.spark.mllib.util.NumericParser
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeArrayData}
 import org.apache.spark.sql.types._
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * Represents a numeric vector, whose index type is Int and value type is Double.
@@ -64,11 +65,12 @@ sealed trait Vector extends Serializable {
         if (this.size != v2.size) return false
         (this, v2) match {
           case (s1: SparseVector, s2: SparseVector) =>
-            Vectors.equals(s1.indices, s1.values, s2.indices, s2.values)
+            Vectors.equals(
+              s1.indices.toImmutableArraySeq, s1.values, s2.indices.toImmutableArraySeq, s2.values)
           case (s1: SparseVector, d1: DenseVector) =>
-            Vectors.equals(s1.indices, s1.values, 0 until d1.size, d1.values)
+            Vectors.equals(s1.indices.toImmutableArraySeq, s1.values, 0 until d1.size, d1.values)
           case (d1: DenseVector, s1: SparseVector) =>
-            Vectors.equals(0 until d1.size, d1.values, s1.indices, s1.values)
+            Vectors.equals(0 until d1.size, d1.values, s1.indices.toImmutableArraySeq, s1.values)
           case (_, _) => util.Arrays.equals(this.toArray, v2.toArray)
         }
       case _ => false
@@ -273,7 +275,7 @@ class VectorUDT extends UserDefinedType[Vector] {
     // We only use "values" for dense vectors, and "size", "indices", and "values" for sparse
     // vectors. The "values" field is nullable because we might want to add binary vectors later,
     // which uses "size" and "indices", but not "values".
-    StructType(Seq(
+    StructType(Array(
       StructField("type", ByteType, nullable = false),
       StructField("size", IntegerType, nullable = true),
       StructField("indices", ArrayType(IntegerType, containsNull = false), nullable = true),
@@ -430,7 +432,7 @@ object Vectors {
    */
   @Since("1.6.0")
   def fromJson(json: String): Vector = {
-    implicit val formats = DefaultFormats
+    implicit val formats: Formats = DefaultFormats
     val jValue = parseJson(json)
     (jValue \ "type").extract[Int] match {
       case 0 => // sparse
@@ -489,46 +491,37 @@ object Vectors {
   def norm(vector: Vector, p: Double): Double = {
     require(p >= 1.0, "To compute the p-norm of the vector, we require that you specify a p>=1. " +
       s"You specified p=$p.")
-    val values = vector match {
-      case DenseVector(vs) => vs
-      case SparseVector(n, ids, vs) => vs
-      case v => throw new IllegalArgumentException("Do not support vector type " + v.getClass)
-    }
-    val size = values.length
 
     if (p == 1) {
-      var sum = 0.0
-      var i = 0
-      while (i < size) {
-        sum += math.abs(values(i))
-        i += 1
-      }
-      sum
+      BLAS.asum(vector)
     } else if (p == 2) {
-      var sum = 0.0
-      var i = 0
-      while (i < size) {
-        sum += values(i) * values(i)
-        i += 1
-      }
-      math.sqrt(sum)
-    } else if (p == Double.PositiveInfinity) {
-      var max = 0.0
-      var i = 0
-      while (i < size) {
-        val value = math.abs(values(i))
-        if (value > max) max = value
-        i += 1
-      }
-      max
+      BLAS.nrm2(vector)
     } else {
-      var sum = 0.0
-      var i = 0
-      while (i < size) {
-        sum += math.pow(math.abs(values(i)), p)
-        i += 1
+      val values = vector match {
+        case DenseVector(vs) => vs
+        case SparseVector(n, ids, vs) => vs
+        case v => throw new IllegalArgumentException("Do not support vector type " + v.getClass)
       }
-      math.pow(sum, 1.0 / p)
+      val size = values.length
+
+      if (p == Double.PositiveInfinity) {
+        var max = 0.0
+        var i = 0
+        while (i < size) {
+          val value = math.abs(values(i))
+          if (value > max) max = value
+          i += 1
+        }
+        max
+      } else {
+        var sum = 0.0
+        var i = 0
+        while (i < size) {
+          sum += math.pow(math.abs(values(i)), p)
+          i += 1
+        }
+        math.pow(sum, 1.0 / p)
+      }
     }
   }
 
@@ -757,7 +750,7 @@ class DenseVector @Since("1.0.0") (
 
   @Since("1.6.0")
   override def toJson: String = {
-    val jValue = ("type" -> 1) ~ ("values" -> values.toSeq)
+    val jValue = ("type" -> 1) ~ ("values" -> values.toImmutableArraySeq)
     compact(render(jValue))
   }
 
@@ -970,8 +963,8 @@ class SparseVector @Since("1.0.0") (
   override def toJson: String = {
     val jValue = ("type" -> 0) ~
       ("size" -> size) ~
-      ("indices" -> indices.toSeq) ~
-      ("values" -> values.toSeq)
+      ("indices" -> indices.toImmutableArraySeq) ~
+      ("values" -> values.toImmutableArraySeq)
     compact(render(jValue))
   }
 

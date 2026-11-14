@@ -16,6 +16,7 @@
  */
 package org.apache.spark.internal.config
 
+import java.io.File
 import java.util.concurrent.TimeUnit
 
 import org.apache.spark.network.util.ByteUnit
@@ -36,6 +37,11 @@ private[spark] object Python {
     .booleanConf
     .createWithDefault(true)
 
+  val PYTHON_LOG_INFO = ConfigBuilder("spark.executor.python.worker.log.details")
+    .version("3.5.0")
+    .booleanConf
+    .createWithDefault(false)
+
   val PYTHON_DAEMON_MODULE = ConfigBuilder("spark.python.daemon.module")
     .version("2.4.0")
     .stringConf
@@ -51,6 +57,29 @@ private[spark] object Python {
     .bytesConf(ByteUnit.MiB)
     .createOptional
 
+  // Defined before the config entry, whose validator captures it.
+  private[spark] val IN_PROCESS_PATH_RULE = "In-process Python site-packages paths cannot " +
+    "contain single quotes, newlines, NUL, surrogate characters (including supplementary " +
+    "Unicode characters) or the platform path separator"
+
+  val IN_PROCESS_SITE_PACKAGES = ConfigBuilder("spark.python.inProcess.sitePackages")
+    .doc("Comma-separated executor directories containing packages for in-process Python UDFs. " +
+      "These directories are processed with site.addsitedir after Spark distribution paths " +
+      "and the process PYTHONPATH. JEP must be directly importable from these directories. " +
+      s"$IN_PROCESS_PATH_RULE. Restart the executor process before changing these directories.")
+    .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+    .version("4.4.0")
+    .stringConf
+    .toSequence
+    .checkValue(_.forall(isValidInProcessPath), IN_PROCESS_PATH_RULE)
+    .createWithDefault(Nil)
+
+  private[spark] def isValidInProcessPath(path: String): Boolean = {
+    !path.exists(c => c == '\'' || c == '\r' || c == '\n' || c == '\u0000' ||
+      Character.isSurrogate(c) ||
+      c == File.pathSeparatorChar)
+  }
+
   val PYTHON_AUTH_SOCKET_TIMEOUT = ConfigBuilder("spark.python.authenticate.socketTimeout")
     .internal()
     .version("3.1.0")
@@ -64,4 +93,110 @@ private[spark] object Python {
     .version("3.2.0")
     .booleanConf
     .createWithDefault(false)
+
+  val PYTHON_UNIX_DOMAIN_SOCKET_ENABLED = ConfigBuilder("spark.python.unix.domain.socket.enabled")
+    .doc("When set to true, the Python driver uses a Unix domain socket for operations like " +
+      "creating or collecting a DataFrame from local data, using accumulators, and executing " +
+      "Python functions with PySpark such as Python UDFs. This configuration only applies " +
+      "to Spark Classic and Spark Connect server.")
+    .version("4.1.0")
+    .booleanConf
+    .createWithDefault(sys.env.get("PYSPARK_UDS_MODE").contains("true"))
+
+  val PYTHON_UNIX_DOMAIN_SOCKET_DIR = ConfigBuilder("spark.python.unix.domain.socket.dir")
+    .doc("When specified, it uses the directory to create Unix domain socket files. " +
+      "Otherwise, it uses the default location of the temporary directory set in " +
+      s"'java.io.tmpdir' property. This is used when ${PYTHON_UNIX_DOMAIN_SOCKET_ENABLED.key} " +
+      "is enabled.")
+    .internal()
+    .version("4.1.0")
+    .stringConf
+    // UDS requires the length of path lower than 104 characters. We use UUID (36 characters)
+    // and additional prefix "." (1), postfix ".sock" (5), and the path separator (1).
+    .checkValue(
+      _.length <= (104 - (36 + 1 + 5 + 1)),
+      s"The directory path should be lower than ${(104 - (36 + 1 + 5 + 1))}")
+    .createOptional
+
+  private val PYTHON_WORKER_IDLE_TIMEOUT_SECONDS_KEY = "spark.python.worker.idleTimeoutSeconds"
+  private val PYTHON_WORKER_KILL_ON_IDLE_TIMEOUT_KEY = "spark.python.worker.killOnIdleTimeout"
+
+  val PYTHON_WORKER_IDLE_TIMEOUT_SECONDS = ConfigBuilder(PYTHON_WORKER_IDLE_TIMEOUT_SECONDS_KEY)
+    .doc("The time (in seconds) Spark will wait for activity " +
+      "(e.g., data transfer or communication) from a Python worker before considering it " +
+      "potentially idle or unresponsive. When the timeout is triggered, " +
+      "Spark will log the network-related status for debugging purposes. " +
+      "However, the Python worker will remain active and continue waiting for communication " +
+      s"unless explicitly terminated via $PYTHON_WORKER_KILL_ON_IDLE_TIMEOUT_KEY." +
+      "The default is `0` that means no timeout.")
+    .version("4.0.0")
+    .timeConf(TimeUnit.SECONDS)
+    .checkValue(_ >= 0, "The idle timeout should be 0 or positive.")
+    .createWithDefault(0)
+
+  val PYTHON_WORKER_KILL_ON_IDLE_TIMEOUT = ConfigBuilder(PYTHON_WORKER_KILL_ON_IDLE_TIMEOUT_KEY)
+    .doc("Whether Spark should terminate the Python worker process when the idle timeout " +
+      s"(as defined by $PYTHON_WORKER_IDLE_TIMEOUT_SECONDS_KEY) is reached. If enabled, " +
+      "Spark will terminate the Python worker process in addition to logging the status.")
+    .version("4.1.0")
+    .booleanConf
+    .createWithDefault(false)
+
+  val PYTHON_WORKER_TRACEBACK_DUMP_INTERVAL_SECONDS =
+    ConfigBuilder("spark.python.worker.tracebackDumpIntervalSeconds")
+      .doc("The interval (in seconds) for Python workers to dump their tracebacks. " +
+        "If it's positive, the Python worker will periodically dump the traceback into " +
+        "its `stderr`. The default is `0` that means it is disabled.")
+      .version("4.1.0")
+      .timeConf(TimeUnit.SECONDS)
+      .checkValue(_ >= 0, "The interval should be 0 or positive.")
+      .createWithDefault(0)
+
+  val PYTHON_FACTORY_IDLE_WORKER_MAX_POOL_SIZE =
+    ConfigBuilder("spark.python.factory.idleWorkerMaxPoolSize")
+      .doc("Maximum number of idle Python workers to keep. " +
+        "If unset, the number is unbounded. " +
+        "If set to a positive integer N, at most N idle workers are retained; " +
+        "least-recently used workers are evicted first.")
+      .version("4.1.0")
+      .intConf
+      .checkValue(_ > 0, "If set, the idle worker max size must be > 0.")
+      .createOptional
+
+  val PYTHON_DAEMON_KILL_WORKER_ON_FLUSH_FAILURE =
+    ConfigBuilder("spark.python.daemon.killWorkerOnFlushFailure")
+      .doc("When enabled, exceptions raised during output flush operations in the Python " +
+        "worker managed under Python daemon are not caught, causing the worker to terminate " +
+        "with the exception. This allows Spark to detect the failure and launch a new worker " +
+        "and retry the task. " +
+        "When disabled, flush exceptions are caught and logged but the worker continues, " +
+        "which could cause the worker to get stuck due to protocol mismatch.")
+      .version("4.1.0")
+      .booleanConf
+      .createWithDefault(true)
+
+  val PYTHON_UDF_PIPELINED_EXECUTION =
+    ConfigBuilder("spark.python.udf.pipelined.enabled")
+      .doc("When true, enables pipelined (asynchronous) data transfer between JVM and Python " +
+        "UDF workers. In pipelined mode, input serialization runs in a separate writer thread " +
+        "while the main task thread reads output from the Python worker, allowing the two " +
+        "directions to overlap. This can improve throughput for some workloads " +
+        "(e.g., multi-column UDFs or compute-heavy UDFs like ML inference); for light, " +
+        "single-column UDFs the overhead of the extra thread may offset the gain.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
+  val PYTHON_UDF_PIPELINED_QUEUE_DEPTH =
+    ConfigBuilder("spark.python.udf.pipelined.queueDepth")
+      .doc("The maximum number of input batches the Python worker's background reader thread " +
+        "can pre-fetch ahead of UDF computation. A higher value allows more overlap between " +
+        "input reading and UDF processing, at the cost of increased memory usage. " +
+        "Only effective when spark.python.udf.pipelined.enabled is true.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(_ > 0, "Queue depth must be positive.")
+      .createWithDefault(2)
 }

@@ -21,8 +21,10 @@ import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.catalyst.analysis.MultiInstanceRelation
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeMap, AttributeReference}
 import org.apache.spark.sql.catalyst.plans.logical.{ColumnStat, LeafNode, LogicalPlan, Statistics}
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.catalyst.util.CharVarcharUtils
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{IntegerType, StringType}
+import org.apache.spark.sql.types.{CharType, IntegerType, StringType, StructField, StructType}
 
 
 trait StatsEstimationTestBase extends SparkFunSuite {
@@ -46,11 +48,16 @@ trait StatsEstimationTestBase extends SparkFunSuite {
 
   def getColSize(attribute: Attribute, colStat: ColumnStat): Long = attribute.dataType match {
     // For UTF8String: base + offset + numBytes
-    case StringType => colStat.avgLen.getOrElse(attribute.dataType.defaultSize.toLong) + 8 + 4
+    case _: StringType => colStat.avgLen.getOrElse(attribute.dataType.defaultSize.toLong) + 8 + 4
     case _ => colStat.avgLen.getOrElse(attribute.dataType.defaultSize)
   }
 
   def attr(colName: String): AttributeReference = AttributeReference(colName, IntegerType)()
+
+  /** A CHAR(n) column as a table scan outputs it, before read-side padding. */
+  def charAttr(colName: String, n: Int): AttributeReference =
+    DataTypeUtils.toAttribute(CharVarcharUtils.replaceCharVarcharWithStringInSchema(
+      StructType(Seq(StructField(colName, CharType(n))))).head)
 
   /** Convert (column name, column stat) pairs to an AttributeMap based on plan output. */
   def toAttributeMap(colStats: Seq[(String, ColumnStat)], plan: LogicalPlan)

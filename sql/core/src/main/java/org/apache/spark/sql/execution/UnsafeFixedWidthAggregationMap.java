@@ -25,7 +25,9 @@ import org.apache.spark.internal.config.package$;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.expressions.UnsafeProjection;
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow;
-import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.catalyst.plans.logical.Aggregate$;
+import org.apache.spark.sql.catalyst.util.UnsafeRowKeyOperations;
+import org.apache.spark.sql.catalyst.util.UnsafeRowUtils$;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.unsafe.KVIterator;
 import org.apache.spark.unsafe.Platform;
@@ -53,6 +55,8 @@ public final class UnsafeFixedWidthAggregationMap {
    */
   private final UnsafeProjection groupingKeyProjection;
 
+  private final UnsafeRowKeyOperations keyOperations;
+
   /**
    * A hashmap which maps from opaque bytearray keys to bytearray values.
    */
@@ -68,12 +72,7 @@ public final class UnsafeFixedWidthAggregationMap {
    *         schema, false otherwise.
    */
   public static boolean supportsAggregationBufferSchema(StructType schema) {
-    for (StructField field: schema.fields()) {
-      if (!UnsafeRow.isMutable(field.dataType())) {
-        return false;
-      }
-    }
-    return true;
+    return Aggregate$.MODULE$.isAggregateBufferMutable(schema);
   }
 
   /**
@@ -97,8 +96,13 @@ public final class UnsafeFixedWidthAggregationMap {
     this.currentAggregationBuffer = new UnsafeRow(aggregationBufferSchema.length());
     this.groupingKeyProjection = UnsafeProjection.create(groupingKeySchema);
     this.groupingKeySchema = groupingKeySchema;
+    this.keyOperations = UnsafeRowUtils$.MODULE$.isBinaryStable(groupingKeySchema) ?
+      null : new UnsafeRowKeyOperations(groupingKeySchema);
     this.map = new BytesToBytesMap(
-      taskContext.taskMemoryManager(), initialCapacity, pageSizeBytes);
+      taskContext.taskMemoryManager(),
+      initialCapacity,
+      pageSizeBytes,
+      keyOperations);
 
     // Initialize the buffer for aggregation value
     final UnsafeProjection valueProjection = UnsafeProjection.create(aggregationBufferSchema);
@@ -124,7 +128,12 @@ public final class UnsafeFixedWidthAggregationMap {
   }
 
   public UnsafeRow getAggregationBufferFromUnsafeRow(UnsafeRow key) {
-    return getAggregationBufferFromUnsafeRow(key, key.hashCode());
+    return keyOperations == null ?
+      getAggregationBufferFromUnsafeRow(key, key.hashCode()) :
+      getAggregationBufferFromLocation(key, map.lookup(
+        key.getBaseObject(),
+        key.getBaseOffset(),
+        key.getSizeInBytes()));
   }
 
   public UnsafeRow getAggregationBufferFromUnsafeRow(UnsafeRow key, int hash) {
@@ -134,6 +143,11 @@ public final class UnsafeFixedWidthAggregationMap {
       key.getBaseOffset(),
       key.getSizeInBytes(),
       hash);
+    return getAggregationBufferFromLocation(key, loc);
+  }
+
+  private UnsafeRow getAggregationBufferFromLocation(
+      UnsafeRow key, BytesToBytesMap.Location loc) {
     if (!loc.isDefined()) {
       // This is the first time that we've seen this grouping key, so we'll insert a copy of the
       // empty aggregation buffer into the map:
@@ -226,10 +240,23 @@ public final class UnsafeFixedWidthAggregationMap {
   }
 
   /**
-   * Gets the average bucket list iterations per lookup in the underlying `BytesToBytesMap`.
+   * Gets the average number of hash probes per key lookup in the underlying `BytesToBytesMap`.
    */
-  public double getAvgHashProbeBucketListIterations() {
-    return map.getAvgHashProbeBucketListIterations();
+  public double getAvgHashProbesPerKey() {
+    return map.getAvgHashProbesPerKey();
+  }
+
+  /**
+   * Returns the number of distinct keys currently stored in the underlying `BytesToBytesMap`.
+   * Used by adaptive partial aggregation to estimate the pre-shuffle reduction ratio.
+   */
+  public int getNumKeys() {
+    return map.numKeys();
+  }
+
+  /** Returns whether two grouping keys are semantically equal. */
+  public boolean keysEqual(UnsafeRow left, UnsafeRow right) {
+    return keyOperations == null ? left.equals(right) : keyOperations.areEqual(left, right);
   }
 
   /**
@@ -247,6 +274,8 @@ public final class UnsafeFixedWidthAggregationMap {
       map.getPageSizeBytes(),
       (int) SparkEnv.get().conf().get(
         package$.MODULE$.SHUFFLE_SPILL_NUM_ELEMENTS_FORCE_SPILL_THRESHOLD()),
+      (long) SparkEnv.get().conf().get(
+        package$.MODULE$.SHUFFLE_SPILL_MAX_SIZE_FORCE_SPILL_THRESHOLD()),
       map);
   }
 }

@@ -36,7 +36,7 @@ import org.apache.spark.sql.expressions.SparkUserDefinedFunction
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 import org.apache.spark.storage.StorageLevel
-import org.apache.spark.util.VersionUtils
+import org.apache.spark.util.{SizeEstimator, VersionUtils}
 
 /**
  * Common params for FPGrowth and FPGrowthModel
@@ -164,7 +164,8 @@ class FPGrowth @Since("2.2.0") (
 
     instr.logPipelineStage(this)
     instr.logDataset(dataset)
-    instr.logParams(this, params: _*)
+    import org.apache.spark.util.ArrayImplicits._
+    instr.logParams(this, params.toImmutableArraySeq: _*)
     val data = dataset.select($(itemsCol))
     val items = data.where(col($(itemsCol)).isNotNull).rdd.map(r => r.getSeq[Any](0).toArray)
     val mllibFP = new MLlibFPGrowth().setMinSupport($(minSupport))
@@ -179,7 +180,7 @@ class FPGrowth @Since("2.2.0") (
     instr.logNumExamples(inputRowCount)
     val parentModel = mllibFP.run(items)
     val rows = parentModel.freqItemsets.map(f => Row(f.items, f.freq))
-    val schema = StructType(Seq(
+    val schema = StructType(Array(
       StructField("items", dataset.schema($(itemsCol)).dataType, nullable = false),
       StructField("freq", LongType, nullable = false)))
     val frequentItems = dataset.sparkSession.createDataFrame(rows, schema)
@@ -221,6 +222,9 @@ class FPGrowthModel private[ml] (
     private val itemSupport: scala.collection.Map[Any, Double],
     private val numTrainingRecords: Long)
   extends Model[FPGrowthModel] with FPGrowthParams with MLWritable {
+
+  // For ml connect only
+  private[ml] def this() = this("", null, Map.empty, -1L)
 
   /** @group setParam */
   @Since("2.2.0")
@@ -269,35 +273,30 @@ class FPGrowthModel private[ml] (
    * from all the applicable rules as prediction. The prediction column has the same data type as
    * the input column(Array[T]) and will not contain existing items in the input column. The null
    * values in the itemsCol columns are treated as empty sets.
-   * WARNING: internally it collects association rules to the driver and uses broadcast for
-   * efficiency. This may bring pressure to driver memory for large set of association rules.
+   * Internally, transform aggregates association rules into a single-row DataFrame and joins it
+   * with the input dataset.
    */
   @Since("2.2.0")
   override def transform(dataset: Dataset[_]): DataFrame = {
     transformSchema(dataset.schema, logging = true)
-    genericTransform(dataset)
-  }
-
-  private def genericTransform(dataset: Dataset[_]): DataFrame = {
-    val rules: Array[(Seq[Any], Seq[Any])] = associationRules.select("antecedent", "consequent")
-      .rdd.map(r => (r.getSeq(0), r.getSeq(1)))
-      .collect().asInstanceOf[Array[(Seq[Any], Seq[Any])]]
-    val brRules = dataset.sparkSession.sparkContext.broadcast(rules)
-
     val dt = dataset.schema($(itemsCol)).dataType
-    // For each rule, examine the input items and summarize the consequents
-    val predictUDF = SparkUserDefinedFunction((items: Seq[Any]) => {
+    val rulesCol = Identifiable.randomUID("rules")
+    // For each rule, examine the input items and summarize the consequents.
+    val predictFunc = (items: Seq[Any], rules: Seq[Row]) => {
       if (items != null) {
         val itemset = items.toSet
-        brRules.value.filter(_._1.forall(itemset.contains))
-          .flatMap(_._2.filter(!itemset.contains(_))).distinct
+        rules.filter(_.getSeq[Any](0).forall(itemset.contains))
+          .flatMap(_.getSeq[Any](1).filter(!itemset.contains(_))).distinct
       } else {
         Seq.empty
-      }},
-      dt,
-      Nil
-    )
-    dataset.withColumn($(predictionCol), predictUDF(col($(itemsCol))))
+      }
+    }
+    val predictUDF = SparkUserDefinedFunction(predictFunc, dt, Nil)
+    dataset.join(
+      associationRules.select("antecedent", "consequent")
+        .agg(collect_set(struct("antecedent", "consequent")).as(rulesCol)))
+      .withColumn($(predictionCol), predictUDF(col($(itemsCol)), col(rulesCol)))
+      .drop(rulesCol)
   }
 
   @Since("2.2.0")
@@ -318,6 +317,20 @@ class FPGrowthModel private[ml] (
   override def toString: String = {
     s"FPGrowthModel: uid=$uid, numTrainingRecords=$numTrainingRecords"
   }
+
+  private[spark] override def estimatedSize: Long = {
+    var size = estimateMatadataSize
+    // freqItemsets: DataFrame("items": Array, "freq": Long)
+    freqItemsets match {
+      case df: org.apache.spark.sql.classic.DataFrame =>
+        size += df.toArrowBatchRdd.map(_.length.toLong).reduce(_ + _)
+      case o => throw new UnsupportedOperationException(
+        s"Unsupported dataframe type: ${o.getClass.getName}")
+    }
+    // itemSupport: scala.collection.Map[Any, Double]
+    size += SizeEstimator.estimate(itemSupport)
+    size
+  }
 }
 
 @Since("2.2.0")
@@ -335,9 +348,10 @@ object FPGrowthModel extends MLReadable[FPGrowthModel] {
 
     override protected def saveImpl(path: String): Unit = {
       val extraMetadata: JObject = Map("numTrainingRecords" -> instance.numTrainingRecords)
-      DefaultParamsWriter.saveMetadata(instance, path, sc, extraMetadata = Some(extraMetadata))
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession,
+        extraMetadata = Some(extraMetadata))
       val dataPath = new Path(path, "data").toString
-      instance.freqItemsets.write.parquet(dataPath)
+      ReadWriteUtils.saveDataFrame(dataPath, instance.freqItemsets)
     }
   }
 
@@ -348,9 +362,9 @@ object FPGrowthModel extends MLReadable[FPGrowthModel] {
 
     override def load(path: String): FPGrowthModel = {
       implicit val format = DefaultFormats
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val (major, minor) = VersionUtils.majorMinorVersion(metadata.sparkVersion)
-      val numTrainingRecords = if (major.toInt < 2 || (major.toInt == 2 && minor.toInt < 4)) {
+      val numTrainingRecords = if (major < 2 || (major == 2 && minor < 4)) {
         // 2.3 and before don't store the count
         0L
       } else {
@@ -358,7 +372,7 @@ object FPGrowthModel extends MLReadable[FPGrowthModel] {
         (metadata.metadata \ "numTrainingRecords").extract[Long]
       }
       val dataPath = new Path(path, "data").toString
-      val frequentItems = sparkSession.read.parquet(dataPath)
+      val frequentItems = ReadWriteUtils.loadDataFrame(dataPath, sparkSession)
       val itemSupport = if (numTrainingRecords == 0L) {
         Map.empty[Any, Double]
       } else {
@@ -405,7 +419,7 @@ private[fpm] object AssociationRules {
         r.freqUnion / numTrainingRecords))
 
     val dt = dataset.schema(itemsCol).dataType
-    val schema = StructType(Seq(
+    val schema = StructType(Array(
       StructField("antecedent", dt, nullable = false),
       StructField("consequent", dt, nullable = false),
       StructField("confidence", DoubleType, nullable = false),

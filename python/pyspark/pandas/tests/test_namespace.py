@@ -15,18 +15,29 @@
 # limitations under the License.
 #
 
+import inspect
+import io
 import itertools
+import json
+import os
+import tempfile
+from contextlib import redirect_stdout
 
+import numpy as np
 import pandas as pd
 
+import pyspark
 from pyspark import pandas as ps
+from pyspark.loose_version import LooseVersion
+from pyspark.pandas.exceptions import PandasNotImplementedError
+from pyspark.pandas.missing.general_functions import MissingPandasLikeGeneralFunctions
 from pyspark.pandas.namespace import _get_index_map, read_delta
+from pyspark.pandas.testing import assert_frame_equal
 from pyspark.pandas.utils import spark_column_equals
 from pyspark.testing.pandasutils import PandasOnSparkTestCase
-from pyspark.testing.sqlutils import SQLTestUtils
 
 
-class NamespaceTest(PandasOnSparkTestCase, SQLTestUtils):
+class NamespaceTestsMixin:
     def test_from_pandas(self):
         pdf = pd.DataFrame({"year": [2015, 2016], "month": [2, 3], "day": [4, 5]})
         psdf = ps.from_pandas(pdf)
@@ -201,13 +212,13 @@ class NamespaceTest(PandasOnSparkTestCase, SQLTestUtils):
         )
 
         self.assert_eq(
-            ps.date_range(start="1/1/2018", periods=5, freq="M"),
-            pd.date_range(start="1/1/2018", periods=5, freq="M"),
+            ps.date_range(start="1/1/2018", periods=5, freq="ME"),
+            pd.date_range(start="1/1/2018", periods=5, freq="ME"),
         )
 
         self.assert_eq(
-            ps.date_range(start="1/1/2018", periods=5, freq="3M"),
-            pd.date_range(start="1/1/2018", periods=5, freq="3M"),
+            ps.date_range(start="1/1/2018", periods=5, freq="3ME"),
+            pd.date_range(start="1/1/2018", periods=5, freq="3ME"),
         )
 
         self.assert_eq(
@@ -216,14 +227,29 @@ class NamespaceTest(PandasOnSparkTestCase, SQLTestUtils):
         )
 
         self.assert_eq(
-            ps.date_range(start="2017-01-01", end="2017-01-04", closed="left"),
-            pd.date_range(start="2017-01-01", end="2017-01-04", closed="left"),
+            ps.date_range(start="2017-01-01", end="2017-01-04", inclusive="left"),
+            pd.date_range(start="2017-01-01", end="2017-01-04", inclusive="left"),
         )
 
         self.assert_eq(
-            ps.date_range(start="2017-01-01", end="2017-01-04", closed="right"),
-            pd.date_range(start="2017-01-01", end="2017-01-04", closed="right"),
+            ps.date_range(start="2017-01-01", end="2017-01-04", inclusive="right"),
+            pd.date_range(start="2017-01-01", end="2017-01-04", inclusive="right"),
         )
+
+        self.assert_eq(
+            ps.date_range(start="2017-01-01", end="2017-01-04", inclusive="both"),
+            pd.date_range(start="2017-01-01", end="2017-01-04", inclusive="both"),
+        )
+
+        self.assert_eq(
+            ps.date_range(start="2017-01-01", end="2017-01-04", inclusive="neither"),
+            pd.date_range(start="2017-01-01", end="2017-01-04", inclusive="neither"),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "Inclusive has to be either 'both', 'neither', 'left' or 'right'"
+        ):
+            ps.date_range(start="2017-01-01", end="2017-01-04", inclusive="test")
 
         self.assertRaises(
             AssertionError, lambda: ps.date_range(start="1/1/2018", periods=5, tz="Asia/Tokyo")
@@ -234,6 +260,82 @@ class NamespaceTest(PandasOnSparkTestCase, SQLTestUtils):
         self.assertRaises(
             AssertionError, lambda: ps.date_range(start="1/1/2018", periods=5, freq="N")
         )
+
+    def test_to_timedelta(self):
+        self.assert_eq(
+            ps.to_timedelta("1 days 06:05:01.00003"),
+            pd.to_timedelta("1 days 06:05:01.00003"),
+        )
+        self.assert_eq(
+            ps.to_timedelta("15.5us"),
+            pd.to_timedelta("15.5us"),
+        )
+        self.assert_eq(
+            ps.to_timedelta(["1 days 06:05:01.00003", "15.5us", "nan"]),
+            pd.to_timedelta(["1 days 06:05:01.00003", "15.5us", "nan"]),
+        )
+        self.assert_eq(
+            ps.to_timedelta(np.arange(5), unit="s"),
+            pd.to_timedelta(np.arange(5), unit="s"),
+        )
+        self.assert_eq(
+            ps.to_timedelta(ps.Series([1, 2]), unit="D"),
+            pd.to_timedelta(pd.Series([1, 2]), unit="D"),
+        )
+        self.assert_eq(
+            ps.to_timedelta(pd.Series([1, 2]), unit="D"),
+            pd.to_timedelta(pd.Series([1, 2]), unit="D"),
+        )
+
+    def test_timedelta_range(self):
+        self.assert_eq(
+            ps.timedelta_range(start="1 day", end="3 days"),
+            pd.timedelta_range(start="1 day", end="3 days"),
+        )
+        self.assert_eq(
+            ps.timedelta_range(start="1 day", periods=3),
+            pd.timedelta_range(start="1 day", periods=3),
+        )
+        self.assert_eq(
+            ps.timedelta_range(end="3 days", periods=3),
+            pd.timedelta_range(end="3 days", periods=3),
+        )
+        self.assert_eq(
+            ps.timedelta_range(end="3 days", periods=3, closed="right"),
+            pd.timedelta_range(end="3 days", periods=3, closed="right"),
+        )
+        self.assert_eq(
+            ps.timedelta_range(start="1 day", end="3 days", freq="6h"),
+            pd.timedelta_range(start="1 day", end="3 days", freq="6h"),
+        )
+        self.assert_eq(
+            ps.timedelta_range(start="1 day", end="3 days", periods=4),
+            pd.timedelta_range(start="1 day", end="3 days", periods=4),
+        )
+
+        self.assertRaises(
+            AssertionError, lambda: ps.timedelta_range(start="1 day", periods=3, freq="ns")
+        )
+
+    def test_concat_multiindex_sort(self):
+        # SPARK-39314: Respect ps.concat sort parameter to follow pandas behavior
+        idx = pd.MultiIndex.from_tuples([("Y", "A"), ("Y", "B"), ("X", "C"), ("X", "D")])
+        pdf = pd.DataFrame([[1, 2, 3, 4], [5, 6, 7, 8]], columns=idx)
+        psdf = ps.from_pandas(pdf)
+
+        ignore_indexes = [True, False]
+        joins = ["inner", "outer"]
+        sorts = [True, False]
+        objs = [
+            ([psdf, psdf.reset_index()], [pdf, pdf.reset_index()]),
+            ([psdf.reset_index(), psdf], [pdf.reset_index(), pdf]),
+        ]
+        for ignore_index, join, sort in itertools.product(ignore_indexes, joins, sorts):
+            for i, (psdfs, pdfs) in enumerate(objs):
+                self.assert_eq(
+                    ps.concat(psdfs, ignore_index=ignore_index, join=join, sort=sort),
+                    pd.concat(pdfs, ignore_index=ignore_index, join=join, sort=sort),
+                )
 
     def test_concat_index_axis(self):
         pdf = pd.DataFrame({"A": [0, 2, 4], "B": [1, 3, 5], "C": [6, 7, 8]})
@@ -246,20 +348,39 @@ class NamespaceTest(PandasOnSparkTestCase, SQLTestUtils):
 
         objs = [
             ([psdf, psdf], [pdf, pdf]),
+            # no Series
             ([psdf, psdf.reset_index()], [pdf, pdf.reset_index()]),
             ([psdf.reset_index(), psdf], [pdf.reset_index(), pdf]),
             ([psdf, psdf[["C", "A"]]], [pdf, pdf[["C", "A"]]]),
             ([psdf[["C", "A"]], psdf], [pdf[["C", "A"]], pdf]),
+            # more than two Series
+            ([psdf["C"], psdf, psdf["A"]], [pdf["C"], pdf, pdf["A"]]),
+            # only Series
+            ([psdf["C"], psdf["A"]], [pdf["C"], pdf["A"]]),
+        ]
+
+        series_objs = [
+            # more than two Series
+            ([psdf, psdf["C"], psdf["A"]], [pdf, pdf["C"], pdf["A"]]),
+            # only one Series
             ([psdf, psdf["C"]], [pdf, pdf["C"]]),
             ([psdf["C"], psdf], [pdf["C"], pdf]),
-            ([psdf["C"], psdf, psdf["A"]], [pdf["C"], pdf, pdf["A"]]),
-            ([psdf, psdf["C"], psdf["A"]], [pdf, pdf["C"], pdf["A"]]),
         ]
+
+        for ignore_index, join, sort in itertools.product(ignore_indexes, joins, sorts):
+            for i, (psdfs, pdfs) in enumerate(series_objs):
+                with self.subTest(
+                    ignore_index=ignore_index, join=join, sort=sort, pair=i, index="single"
+                ):
+                    self.assert_eq(
+                        ps.concat(psdfs, ignore_index=ignore_index, join=join, sort=sort),
+                        pd.concat(pdfs, ignore_index=ignore_index, join=join, sort=sort),
+                    )
 
         for ignore_index, join, sort in itertools.product(ignore_indexes, joins, sorts):
             for i, (psdfs, pdfs) in enumerate(objs):
                 with self.subTest(
-                    ignore_index=ignore_index, join=join, sort=sort, pdfs=pdfs, pair=i
+                    ignore_index=ignore_index, join=join, sort=sort, pair=i, index="single"
                 ):
                     self.assert_eq(
                         ps.concat(psdfs, ignore_index=ignore_index, join=join, sort=sort),
@@ -283,22 +404,25 @@ class NamespaceTest(PandasOnSparkTestCase, SQLTestUtils):
         psdf3 = psdf.copy()
 
         columns = pd.MultiIndex.from_tuples([("X", "A"), ("X", "B"), ("Y", "C")])
-        # TODO: colums.names = ["XYZ", "ABC"]
+        columns.names = ["XYZ", "ABC"]
         pdf3.columns = columns
         psdf3.columns = columns
 
         objs = [
             ([psdf3, psdf3], [pdf3, pdf3]),
             ([psdf3, psdf3.reset_index()], [pdf3, pdf3.reset_index()]),
-            ([psdf3.reset_index(), psdf3], [pdf3.reset_index(), pdf3]),
             ([psdf3, psdf3[[("Y", "C"), ("X", "A")]]], [pdf3, pdf3[[("Y", "C"), ("X", "A")]]]),
+        ]
+
+        objs += [
+            ([psdf3.reset_index(), psdf3], [pdf3.reset_index(), pdf3]),
             ([psdf3[[("Y", "C"), ("X", "A")]], psdf3], [pdf3[[("Y", "C"), ("X", "A")]], pdf3]),
         ]
 
         for ignore_index, sort in itertools.product(ignore_indexes, sorts):
             for i, (psdfs, pdfs) in enumerate(objs):
                 with self.subTest(
-                    ignore_index=ignore_index, join="outer", sort=sort, pdfs=pdfs, pair=i
+                    ignore_index=ignore_index, join="outer", sort=sort, pair=i, index="multi"
                 ):
                     self.assert_eq(
                         ps.concat(psdfs, ignore_index=ignore_index, join="outer", sort=sort),
@@ -309,7 +433,7 @@ class NamespaceTest(PandasOnSparkTestCase, SQLTestUtils):
         for ignore_index in ignore_indexes:
             for i, (psdfs, pdfs) in enumerate(objs):
                 with self.subTest(
-                    ignore_index=ignore_index, join="inner", sort=True, pdfs=pdfs, pair=i
+                    ignore_index=ignore_index, join="inner", sort=True, pair=i, index="multi"
                 ):
                     self.assert_eq(
                         ps.concat(psdfs, ignore_index=ignore_index, join="inner", sort=True),
@@ -321,11 +445,7 @@ class NamespaceTest(PandasOnSparkTestCase, SQLTestUtils):
             "MultiIndex columns should have the same levels",
             lambda: ps.concat([psdf, psdf3]),
         )
-        self.assertRaisesRegex(
-            ValueError,
-            "MultiIndex columns should have the same levels",
-            lambda: ps.concat([psdf3[("Y", "C")], psdf3]),
-        )
+        self.assert_eq(ps.concat([psdf3[("Y", "C")], psdf3]), pd.concat([pdf3[("Y", "C")], pdf3]))
 
         pdf4 = pd.DataFrame({"A": [0, 2, 4], "B": [1, 3, 5], "C": [10, 20, 30]})
         psdf4 = ps.from_pandas(pdf4)
@@ -469,7 +589,13 @@ class NamespaceTest(PandasOnSparkTestCase, SQLTestUtils):
         # "coerce", "ignore" and "raise" with non-Series.
         data = ["1", "2", None, "4", "hello"]
         self.assert_eq(pd.to_numeric(data, errors="coerce"), ps.to_numeric(data, errors="coerce"))
-        self.assert_eq(pd.to_numeric(data, errors="ignore"), ps.to_numeric(data, errors="ignore"))
+        if LooseVersion(pd.__version__) < "3.0.0":
+            self.assert_eq(
+                pd.to_numeric(data, errors="ignore"), ps.to_numeric(data, errors="ignore")
+            )
+        else:
+            with self.assertRaisesRegex(ValueError, "invalid error value specified"):
+                ps.to_numeric(data, errors="ignore")
 
         self.assertRaisesRegex(
             ValueError,
@@ -497,15 +623,121 @@ class NamespaceTest(PandasOnSparkTestCase, SQLTestUtils):
             lambda: ps.to_numeric(psser, errors="ignore"),
         )
 
+        # SPARK-54666: Series with numeric dtype should be returned as-is.
+        pser = pd.Series([-1554478299, 2])
+        psser = ps.from_pandas(pser)
+        self.assert_eq(pd.to_numeric(pser), ps.to_numeric(psser))
+
+    def test_json_normalize(self):
+        # Basic test case with a simple JSON structure
+        data = [
+            {"id": 1, "name": "Alice", "address": {"city": "NYC", "zipcode": "10001"}},
+            {"id": 2, "name": "Bob", "address": {"city": "SF", "zipcode": "94105"}},
+        ]
+        assert_frame_equal(pd.json_normalize(data), ps.json_normalize(data))
+
+        # Test case with nested JSON structure
+        data = [
+            {"id": 1, "name": "Alice", "address": {"city": {"name": "NYC"}, "zipcode": "10001"}},
+            {"id": 2, "name": "Bob", "address": {"city": {"name": "SF"}, "zipcode": "94105"}},
+        ]
+        assert_frame_equal(pd.json_normalize(data), ps.json_normalize(data))
+
+        # Test case with lists included in the JSON structure
+        data = [
+            {
+                "id": 1,
+                "name": "Alice",
+                "hobbies": ["reading", "swimming"],
+                "address": {"city": "NYC", "zipcode": "10001"},
+            },
+            {
+                "id": 2,
+                "name": "Bob",
+                "hobbies": ["biking"],
+                "address": {"city": "SF", "zipcode": "94105"},
+            },
+        ]
+        assert_frame_equal(pd.json_normalize(data), ps.json_normalize(data))
+
+        # Test case with various data types
+        data = [
+            {
+                "id": 1,
+                "name": "Alice",
+                "age": 25,
+                "is_student": True,
+                "address": {"city": "NYC", "zipcode": "10001"},
+            },
+            {
+                "id": 2,
+                "name": "Bob",
+                "age": 30,
+                "is_student": False,
+                "address": {"city": "SF", "zipcode": "94105"},
+            },
+        ]
+        assert_frame_equal(pd.json_normalize(data), ps.json_normalize(data))
+
+        # Test case handling empty input data
+        data = []
+        self.assert_eq(pd.json_normalize(data), ps.json_normalize(data))
+
+    def test_show_versions(self):
+        # Default: prints human-readable output containing pyspark, pandas, and numpy versions.
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ps.show_versions()
+        output = buf.getvalue()
+        self.assertIn("INSTALLED VERSIONS", output)
+        self.assertIn("pyspark", output)
+        self.assertIn(pyspark.__version__, output)
+        self.assertIn("pandas", output)
+        self.assertIn(pd.__version__, output)
+        self.assertIn("numpy", output)
+        self.assertIn(np.__version__, output)
+        self.assertIn("python", output)
+
+        # as_json=True: writes JSON to stdout with system and dependencies sections.
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ps.show_versions(as_json=True)
+        parsed = json.loads(buf.getvalue())
+        self.assertIn("system", parsed)
+        self.assertIn("dependencies", parsed)
+        self.assertEqual(parsed["dependencies"]["pyspark"], pyspark.__version__)
+        self.assertEqual(parsed["dependencies"]["pandas"], pd.__version__)
+
+        # as_json=<path>: writes JSON to a file.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "versions.json")
+            ps.show_versions(as_json=path)
+            with open(path, "r", encoding="utf-8") as f:
+                file_parsed = json.load(f)
+        self.assertIn("system", file_parsed)
+        self.assertIn("dependencies", file_parsed)
+        self.assertEqual(file_parsed["dependencies"]["pyspark"], pyspark.__version__)
+
+    def test_missing(self):
+        missing_functions = inspect.getmembers(
+            MissingPandasLikeGeneralFunctions, inspect.isfunction
+        )
+        unsupported_functions = [
+            name for (name, type_) in missing_functions if type_.__name__ == "unsupported_function"
+        ]
+        for name in unsupported_functions:
+            with self.assertRaisesRegex(
+                PandasNotImplementedError,
+                "The method.*pd.*{}.*not implemented yet.".format(name),
+            ):
+                getattr(ps, name)()
+
+
+class NamespaceTests(NamespaceTestsMixin, PandasOnSparkTestCase):
+    pass
+
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.pandas.tests.test_namespace import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

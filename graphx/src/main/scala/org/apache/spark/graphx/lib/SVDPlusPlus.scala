@@ -38,11 +38,23 @@ object SVDPlusPlus {
       var gamma7: Double)
     extends Serializable
 
+  /** Sums two Phase 2 training messages component-wise: both vectors and the scalar. */
+  private[graphx] def combineTrainMessages(
+      g1: (Array[Double], Array[Double], Double),
+      g2: (Array[Double], Array[Double], Double)): (Array[Double], Array[Double], Double) = {
+    val out1 = g1._1.clone()
+    BLAS.nativeBLAS.daxpy(out1.length, 1.0, g2._1, 1, out1, 1)
+    val out2 = g1._2.clone()
+    BLAS.nativeBLAS.daxpy(out2.length, 1.0, g2._2, 1, out2, 1)
+    (out1, out2, g1._3 + g2._3)
+  }
+
+  // scalastyle:off line.size.limit
   /**
-   * Implement SVD++ based on "Factorization Meets the Neighborhood:
-   * a Multifaceted Collaborative Filtering Model",
-   * available at <a href="http://public.research.att.com/~volinsky/netflix/kdd08koren.pdf">
-   * here</a>.
+   * Implement SVD++ based on "Factorization Meets the Neighborhood: a Multifaceted
+   * Collaborative Filtering Model",
+   * <a href="https://web.archive.org/web/20220403174543/https://people.engr.tamu.edu/huangrh/Spring16/papers_course/matrix_factorization.pdf">
+   * available here</a>.
    *
    * The prediction rule is rui = u + bu + bi + qi*(pu + |N(u)|^^-0.5^^*sum(y)),
    * see the details on page 6.
@@ -53,6 +65,7 @@ object SVDPlusPlus {
    *
    * @return a graph with vertex attributes containing the trained model
    */
+  // scalastyle:on line.size.limit
   def run(edges: RDD[Edge[Double]], conf: Conf)
     : (Graph[(Array[Double], Array[Double], Double, Double), Double], Double) =
   {
@@ -87,7 +100,7 @@ object SVDPlusPlus {
     val gJoinT0 = g.outerJoinVertices(t0) {
       (vid: VertexId, vd: (Array[Double], Array[Double], Double, Double),
        msg: Option[(Long, Double)]) =>
-        (vd._1, vd._2, msg.get._2 / msg.get._1 - u, 1.0 / scala.math.sqrt(msg.get._1))
+        (vd._1, vd._2, msg.get._2 / msg.get._1 - u, 1.0 / scala.math.sqrt(msg.get._1.toDouble))
     }.cache()
     materialize(gJoinT0)
     g.unpersist()
@@ -150,14 +163,7 @@ object SVDPlusPlus {
       g.cache()
       val t2 = g.aggregateMessages(
         sendMsgTrainF(conf, u),
-        (g1: (Array[Double], Array[Double], Double), g2: (Array[Double], Array[Double], Double)) =>
-        {
-          val out1 = g1._1.clone()
-          BLAS.nativeBLAS.daxpy(out1.length, 1.0, g2._1, 1, out1, 1)
-          val out2 = g2._2.clone()
-          BLAS.nativeBLAS.daxpy(out2.length, 1.0, g2._2, 1, out2, 1)
-          (out1, out2, g1._3 + g2._3)
-        })
+        combineTrainMessages)
       val gJoinT2 = g.outerJoinVertices(t2) {
         (vid: VertexId,
          vd: (Array[Double], Array[Double], Double, Double),

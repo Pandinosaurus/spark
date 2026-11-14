@@ -25,9 +25,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 
-import org.junit.Test;
-import static org.junit.Assert.*;
-import static org.junit.Assume.*;
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.*;
 import static org.mockito.Mockito.*;
 
 import org.apache.spark.SparkContext;
@@ -51,20 +51,11 @@ public class SparkLauncherSuite extends BaseSuite {
     SparkSubmitOptionParser opts = new SparkSubmitOptionParser();
 
     launcher.addSparkArg(opts.HELP);
-    try {
-      launcher.addSparkArg(opts.PROXY_USER);
-      fail("Expected IllegalArgumentException.");
-    } catch (IllegalArgumentException e) {
-      // Expected.
-    }
+    assertThrows(IllegalArgumentException.class, () -> launcher.addSparkArg(opts.PROXY_USER));
 
     launcher.addSparkArg(opts.PROXY_USER, "someUser");
-    try {
-      launcher.addSparkArg(opts.HELP, "someValue");
-      fail("Expected IllegalArgumentException.");
-    } catch (IllegalArgumentException e) {
-      // Expected.
-    }
+    assertThrows(IllegalArgumentException.class,
+      () -> launcher.addSparkArg(opts.HELP, "someValue"));
 
     launcher.addSparkArg("--future-argument");
     launcher.addSparkArg("--future-argument", "someValue");
@@ -161,8 +152,10 @@ public class SparkLauncherSuite extends BaseSuite {
         // SPARK-23020: see doc for InProcessTestApp.LOCK for a description of the race. Here
         // we wait until we know that the connection between the app and the launcher has been
         // established before allowing the app to finish.
+        // Use a generous timeout because, under heavy CI load, establishing the connection
+        // between the in-process app and the launcher can take longer than a few seconds.
         final SparkAppHandle _handle = handle;
-        eventually(Duration.ofSeconds(5), Duration.ofMillis(10), () -> {
+        eventually(Duration.ofSeconds(30), Duration.ofMillis(100), () -> {
           assertNotEquals(SparkAppHandle.State.UNKNOWN, _handle.getState());
         });
 
@@ -196,16 +189,9 @@ public class SparkLauncherSuite extends BaseSuite {
       InProcessLauncher launcher = new InProcessLauncher()
         .setAppResource(SparkLauncher.NO_RESOURCE);
       switch (args.length) {
-        case 2:
-          launcher.addSparkArg(args[0], args[1]);
-          break;
-
-        case 1:
-          launcher.addSparkArg(args[0]);
-          break;
-
-        default:
-          fail("FIXME: invalid test.");
+        case 2 -> launcher.addSparkArg(args[0], args[1]);
+        case 1 -> launcher.addSparkArg(args[0]);
+        default -> fail("FIXME: invalid test.");
       }
 
       SparkAppHandle handle = launcher.startApplication();
@@ -245,11 +231,17 @@ public class SparkLauncherSuite extends BaseSuite {
       assertTrue(handle.getError().isPresent());
       assertSame(handle.getError().get(), DUMMY_EXCEPTION);
     } finally {
-      if (handle != null) {
-        handle.kill();
+      try {
+        if (handle != null) {
+          handle.kill();
+          // Wait for the handle to be fully disposed so the LauncherServer is properly
+          // cleaned up before postChecks() runs.
+          waitFor(handle);
+        }
+      } finally {
+        restoreSystemProperties(properties);
+        waitForSparkContextShutdown();
       }
-      restoreSystemProperties(properties);
-      waitForSparkContextShutdown();
     }
   }
 
@@ -275,6 +267,9 @@ public class SparkLauncherSuite extends BaseSuite {
     } finally {
       if (handle != null) {
         handle.kill();
+        // Wait for the handle to be fully disposed so the LauncherServer is properly
+        // cleaned up before postChecks() runs.
+        waitFor(handle);
       }
     }
   }
@@ -289,9 +284,8 @@ public class SparkLauncherSuite extends BaseSuite {
     // Here DAGScheduler is stopped, while SparkContext.clearActiveContext may not be called yet.
     // Wait for a reasonable amount of time to avoid creating two active SparkContext in JVM.
     // See SPARK-23019 and SparkContext.stop() for details.
-    eventually(Duration.ofSeconds(5), Duration.ofMillis(10), () -> {
-      assertTrue("SparkContext is still alive.", SparkContext$.MODULE$.getActive().isEmpty());
-    });
+    eventually(Duration.ofSeconds(30), Duration.ofMillis(100), () ->
+      assertTrue(SparkContext$.MODULE$.getActive().isEmpty(), "SparkContext is still alive."));
   }
 
   public static class SparkLauncherTestApp {

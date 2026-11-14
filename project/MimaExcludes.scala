@@ -15,8 +15,7 @@
  * limitations under the License.
  */
 
-import com.typesafe.tools.mima.core._
-import com.typesafe.tools.mima.core.ProblemFilters._
+import com.typesafe.tools.mima.core.*
 
 /**
  * Additional excludes for checking of Spark's binary compatibility.
@@ -34,23 +33,156 @@ import com.typesafe.tools.mima.core.ProblemFilters._
  */
 object MimaExcludes {
 
-  // Exclude rules for 3.3.x from 3.2.0
-  lazy val v33excludes = v32excludes ++ Seq(
-    // [SPARK-35672][CORE][YARN] Pass user classpath entries to executors using config instead of command line
-    // The followings are necessary for Scala 2.13.
-    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.executor.CoarseGrainedExecutorBackend#Arguments.*"),
-    ProblemFilters.exclude[IncompatibleResultTypeProblem]("org.apache.spark.executor.CoarseGrainedExecutorBackend#Arguments.*"),
-    ProblemFilters.exclude[MissingTypesProblem]("org.apache.spark.executor.CoarseGrainedExecutorBackend$Arguments$")
+  // Exclude rules for 5.0.x from 4.4.0 (add 5.0-specific filters below as needed).
+  lazy val v50excludes: Seq[Problem => Boolean] = v44excludes
+
+  // Exclude rules for 4.4.x from 4.3.0 (add 4.4-specific filters below as needed).
+  lazy val v44excludes: Seq[Problem => Boolean] = v43excludes ++ Seq(
+    // [SPARK-60217][SQL] Remove the unused createZstdInputStream overload that built a default
+    // Hadoop conf; callers pass the read's conf to the remaining overload.
+    ProblemFilters.exclude[DirectMissingMethodProblem](
+      "org.apache.spark.io.HadoopCodecStreams.createZstdInputStream"),
+    // [SPARK-58896] Decision tree leaf counts moved behind NodeStats. The old package-private
+    // numLeave accessors are removed from concrete models.
+    ProblemFilters.exclude[DirectMissingMethodProblem](
+      "org.apache.spark.ml.classification.DecisionTreeClassificationModel.numLeave"),
+    ProblemFilters.exclude[DirectMissingMethodProblem](
+      "org.apache.spark.ml.regression.DecisionTreeRegressionModel.numLeave"),
+    // [SPARK-59154] Remove unused prediction variance helper after inlining its implementation.
+    ProblemFilters.exclude[DirectMissingMethodProblem](
+      "org.apache.spark.ml.regression.DecisionTreeRegressionModel.predictVariance"),
+    // BIN BY DataFrame API.
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.sql.Dataset.binBy"),
+    // [SPARK-58645][SQL] Add recursive mode to variant explode table-valued functions
+    ProblemFilters.exclude[ReversedMissingMethodProblem](
+      "org.apache.spark.sql.TableValuedFunction.variant_explode"),
+    ProblemFilters.exclude[ReversedMissingMethodProblem](
+      "org.apache.spark.sql.TableValuedFunction.variant_explode_outer")
   )
 
-  // Exclude rules for 3.2.x from 3.1.1
-  lazy val v32excludes = Seq(
+  // Exclude rules for 4.3.x from 4.2.0 (add 4.3-specific filters below as needed).
+  lazy val v43excludes: Seq[Problem => Boolean] = v42excludes ++ Seq(
+    // [SPARK-60113][CORE][SQL] Add TaskContext.addTaskPreCompletionListener
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.TaskContext.addTaskPreCompletionListener"),
+    // [SPARK-54879] Add exitCode field to ApplicationAttemptInfo
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.status.api.v1.ApplicationAttemptInfo.tupled"),
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.status.api.v1.ApplicationAttemptInfo.curried"),
+    // [SPARK-58192][CORE] Support fractional spark.task.cpus. The existing TaskContext.cpus(): Int
+    // and TaskResourceRequests.cpus(Int) are retained (cpus() deprecated in favor of the new
+    // TaskContext.cpuAmount(): BigDecimal), but the internal StatusUpdate message's taskCpus field
+    // is now a BigDecimal.
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.TaskContext.cpuAmount"),
+    ProblemFilters.exclude[IncompatibleResultTypeProblem]("org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages#StatusUpdate.taskCpus"),
+    ProblemFilters.exclude[IncompatibleResultTypeProblem]("org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages#StatusUpdate.copy$default$5"),
+    ProblemFilters.exclude[IncompatibleMethTypeProblem]("org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages#StatusUpdate.copy"),
+    ProblemFilters.exclude[IncompatibleMethTypeProblem]("org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages#StatusUpdate.this"),
+    ProblemFilters.exclude[IncompatibleMethTypeProblem]("org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages#StatusUpdate.apply"),
+    // [SPARK-57910] ALS reuses the shared HasIntermediateStorageLevel param; the param and its
+    // getter are declared final in the shared trait (same name, type, default and validation).
+    ProblemFilters.exclude[FinalMethodProblem](
+      "org.apache.spark.ml.recommendation.ALS.intermediateStorageLevel"),
+    ProblemFilters.exclude[FinalMethodProblem](
+      "org.apache.spark.ml.recommendation.ALS.getIntermediateStorageLevel"),
+    // [SPARK-60384] Spark 4.2 artifacts shade Jetty types in these private wrapper classes.
+    ProblemFilters.exclude[MissingTypesProblem](
+      "org.apache.spark.ui.ProxyRedirectHandler$MutableFieldsWrapper"),
+    ProblemFilters.exclude[IncompatibleMethTypeProblem](
+      "org.apache.spark.ui.ProxyRedirectHandler#MutableFieldsWrapper.onAddField"),
+    ProblemFilters.exclude[IncompatibleMethTypeProblem](
+      "org.apache.spark.ui.ProxyRedirectHandler#MutableFieldsWrapper.this"),
+    ProblemFilters.exclude[IncompatibleResultTypeProblem](
+      "org.apache.spark.ui.ProxyRedirectHandler#ResponseWrapper.getHeaders"),
+    // [SPARK-57987] Add desc field to the SQL REST API Node case class
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.status.api.v1.sql.Node.apply"),
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.status.api.v1.sql.Node.copy"),
+    ProblemFilters.exclude[MissingTypesProblem]("org.apache.spark.status.api.v1.sql.Node$")
+  )
+
+  // Exclude rules for 4.2.x from 4.1.0
+  lazy val v42excludes = v41excludes ++ Seq(
+    // [SQL] SafeJsonSerializer.safeMapToJValue: second parameter widened from Function1 to
+    // Function2 so the key is passed to the value serializer (progress.scala). Binary-incompatible
+    // vs spark-sql-api 4.0.0; not part of the public supported API (private[streaming] package).
+    ProblemFilters.exclude[IncompatibleMethTypeProblem]("org.apache.spark.sql.streaming.SafeJsonSerializer.safeMapToJValue"),
+    // Add DEBUG format to ErrorMessageFormat enum
+    ProblemFilters.exclude[Problem]("org.apache.spark.ErrorMessageFormat*"),
+    // [SPARK-47086][BUILD][CORE][WEBUI] Upgrade Jetty to 12.1.4
+    ProblemFilters.exclude[MissingTypesProblem]("org.apache.spark.ui.ProxyRedirectHandler$ResponseWrapper"),
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.ui.ProxyRedirectHandler#ResponseWrapper.sendRedirect"),
+    ProblemFilters.exclude[IncompatibleMethTypeProblem]("org.apache.spark.ui.ProxyRedirectHandler#ResponseWrapper.this"),
+    // [SPARK-55228][SQL] Implement Dataset.zipWithIndex in Scala API
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.sql.Dataset.zipWithIndex"),
+    // [SPARK-55886][SQL] Add DataFrame.zip
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.sql.Dataset.zip"),
+    // [SPARK-55949][SQL] Add DataFrame API for CDC queries
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.sql.DataFrameReader.changes"),
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.sql.streaming.DataStreamReader.changes"),
+    // [SPARK-55793][CORE] Add multiple log directories support to SHS
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.status.api.v1.ApplicationAttemptInfo.apply"),
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.status.api.v1.ApplicationAttemptInfo.copy"),
+    ProblemFilters.exclude[MissingTypesProblem]("org.apache.spark.status.api.v1.ApplicationAttemptInfo$"),
+    // [SPARK-56330][CORE] Add TaskInterruptListener to TaskContext for interrupt notifications
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.TaskContext.addTaskInterruptListener"),
+    // [SPARK-56700][SS] Make DataStreamReader.name public
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.sql.streaming.DataStreamReader.name"),
+    // [SPARK-56395][SQL] Add NEAREST BY top-K ranking join
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.sql.Dataset.nearestByJoin"),
+    // [SPARK-57332][SQL] MySQLDialect no longer overrides the visit methods below; the public
+    // Scala overrides on its private SQL builder are replaced by the inherited protected Java
+    // methods of V2ExpressionSQLBuilder. MySQLDialect is private, so this is not a public API.
+    ProblemFilters.exclude[InaccessibleMethodProblem]("org.apache.spark.sql.connector.util.V2ExpressionSQLBuilder.visitStartsWith"),
+    ProblemFilters.exclude[InaccessibleMethodProblem]("org.apache.spark.sql.connector.util.V2ExpressionSQLBuilder.visitEndsWith"),
+    ProblemFilters.exclude[InaccessibleMethodProblem]("org.apache.spark.sql.connector.util.V2ExpressionSQLBuilder.visitContains"),
+    // [SPARK-57491][CORE] Add PostStatusUpdateListener to TaskContext for stale push detection
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.TaskContext.addPostStatusUpdateListener"),
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.TaskContext.invokePostStatusUpdateListeners")
+  )
+
+  // Exclude rules for 4.1.x from 4.0.0
+  lazy val v41excludes = defaultExcludes ++ Seq(
+    // [SPARK-51261][ML][CONNECT] Introduce model size estimation to control ml cache
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.ml.linalg.Vector.getSizeInBytes"),
+
+    // CharType and VarcharType signature change (added collation parameter)
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.sql.types.CharType.andThen"),
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.sql.types.CharType.compose"),
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.sql.types.CharType.copy"),
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.sql.types.CharType.this"),
+    ProblemFilters.exclude[MissingTypesProblem]("org.apache.spark.sql.types.CharType$"),
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.sql.types.VarcharType.andThen"),
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.sql.types.VarcharType.compose"),
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.sql.types.VarcharType.copy"),
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.sql.types.VarcharType.this"),
+    ProblemFilters.exclude[MissingTypesProblem]("org.apache.spark.sql.types.VarcharType$"),
+
+    // [SPARK-52221][SQL] Refactor SqlScriptingLocalVariableManager into more generic context manager
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.sql.scripting.SqlScriptingExecution.withLocalVariableManager"),
+
+    // [SPARK-53391][CORE] Remove unused PrimitiveKeyOpenHashMap
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.util.collection.PrimitiveKeyOpenHashMap*"),
+
+    // [SPARK-54041][SQL] Enable Direct Passthrough Partitioning in the DataFrame API
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.sql.Dataset.repartitionById"),
+
+    // [SPARK-54001][CONNECT] Replace block copying with ref-counting in ArtifactManager cloning
+    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.sql.artifact.ArtifactManager.cachedBlockIdList"),
+
+    // [SPARK-54323][PYTHON] Change the way to access logs to TVF instead of system view
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.sql.TableValuedFunction.python_worker_logs"),
+
+    // [SPARK-56719][SS] Add DataStreamWriter.name() API for sink evolution
+    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.sql.streaming.DataStreamWriter.name")
+  )
+
+  // Default exclude rules
+  lazy val defaultExcludes = Seq(
     // Spark Internals
     ProblemFilters.exclude[Problem]("org.apache.spark.rpc.*"),
     ProblemFilters.exclude[Problem]("org.spark-project.jetty.*"),
     ProblemFilters.exclude[Problem]("org.spark_project.jetty.*"),
     ProblemFilters.exclude[Problem]("org.sparkproject.jetty.*"),
     ProblemFilters.exclude[Problem]("org.apache.spark.internal.*"),
+    ProblemFilters.exclude[Problem]("org.apache.spark.kafka010.*"),
     ProblemFilters.exclude[Problem]("org.apache.spark.unused.*"),
     ProblemFilters.exclude[Problem]("org.apache.spark.unsafe.*"),
     ProblemFilters.exclude[Problem]("org.apache.spark.memory.*"),
@@ -58,65 +190,51 @@ object MimaExcludes {
     ProblemFilters.exclude[Problem]("org.apache.spark.sql.catalyst.*"),
     ProblemFilters.exclude[Problem]("org.apache.spark.sql.execution.*"),
     ProblemFilters.exclude[Problem]("org.apache.spark.sql.internal.*"),
+    ProblemFilters.exclude[Problem]("org.apache.spark.sql.errors.*"),
+    ProblemFilters.exclude[Problem]("org.apache.spark.sql.classic.*"),
+    ProblemFilters.exclude[Problem]("org.apache.spark.sql.connect.*"),
+    ProblemFilters.exclude[Problem]("org.apache.spark.sql.scripting.*"),
+    ProblemFilters.exclude[Problem]("org.apache.spark.types.variant.*"),
+    ProblemFilters.exclude[Problem]("org.apache.spark.ui.flamegraph.*"),
+    // DSv2 catalog and expression APIs are unstable yet. We should enable this back.
+    ProblemFilters.exclude[Problem]("org.apache.spark.sql.connector.catalog.*"),
+    ProblemFilters.exclude[Problem]("org.apache.spark.sql.connector.expressions.*"),
+    // Avro source implementation is internal.
+    ProblemFilters.exclude[Problem]("org.apache.spark.sql.v2.avro.*"),
+    ProblemFilters.exclude[Problem]("org.apache.spark.sql.avro.*"),
 
-    // [SPARK-34848][CORE] Add duration to TaskMetricDistributions
-    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.status.api.v1.TaskMetricDistributions.this"),
 
-    // [SPARK-34488][CORE] Support task Metrics Distributions and executor Metrics Distributions
-    // in the REST API call for a specified stage
-    ProblemFilters.exclude[MissingMethodProblem]("org.apache.spark.status.api.v1.StageData.this"),
+    // SPARK-43169: shaded and generated protobuf code
+    ProblemFilters.exclude[Problem]("org.sparkproject.spark_core.protobuf.*"),
+    ProblemFilters.exclude[Problem]("org.apache.spark.status.protobuf.StoreTypes*"),
 
-    // [SPARK-36173][CORE] Support getting CPU number in TaskContext
-    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.TaskContext.cpus"),
+    // SPARK-44104: shaded protobuf code and Apis with parameters relocated
+    ProblemFilters.exclude[Problem]("org.sparkproject.spark_protobuf.protobuf.*"),
+    ProblemFilters.exclude[Problem]("org.apache.spark.sql.protobuf.utils.SchemaConverters.*"),
 
-    // [SPARK-35896] Include more granular metrics for stateful operators in StreamingQueryProgress
-    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.sql.streaming.StateOperatorProgress.this"),
+    // SPARK-51267: Match local Spark Connect server logic between Python and Scala
+    ProblemFilters.exclude[MissingFieldProblem]("org.apache.spark.launcher.SparkLauncher.SPARK_LOCAL_REMOTE"),
+
+    // SPARK-53138: Split common/utils Java code into a new module common/utils-java
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.QueryContext"),
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.QueryContextType"),
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.api.java.function.*"),
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.network.util.ByteUnit"),
+    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.network.util.JavaUtils"),
 
     (problem: Problem) => problem match {
       case MissingClassProblem(cls) => !cls.fullName.startsWith("org.sparkproject.jpmml") &&
           !cls.fullName.startsWith("org.sparkproject.dmg.pmml")
       case _ => true
-    },
-
-    // [SPARK-33808][SQL] DataSource V2: Build logical writes in the optimizer
-    ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.sql.connector.write.V1WriteBuilder"),
-
-    // [SPARK-33955] Add latest offsets to source progress
-    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.sql.streaming.SourceProgress.this"),
-
-    // [SPARK-34862][SQL] Support nested column in ORC vectorized reader
-    ProblemFilters.exclude[DirectAbstractMethodProblem]("org.apache.spark.sql.vectorized.ColumnVector.getBoolean"),
-    ProblemFilters.exclude[DirectAbstractMethodProblem]("org.apache.spark.sql.vectorized.ColumnVector.getByte"),
-    ProblemFilters.exclude[DirectAbstractMethodProblem]("org.apache.spark.sql.vectorized.ColumnVector.getShort"),
-    ProblemFilters.exclude[DirectAbstractMethodProblem]("org.apache.spark.sql.vectorized.ColumnVector.getInt"),
-    ProblemFilters.exclude[DirectAbstractMethodProblem]("org.apache.spark.sql.vectorized.ColumnVector.getLong"),
-    ProblemFilters.exclude[DirectAbstractMethodProblem]("org.apache.spark.sql.vectorized.ColumnVector.getFloat"),
-    ProblemFilters.exclude[DirectAbstractMethodProblem]("org.apache.spark.sql.vectorized.ColumnVector.getDouble"),
-    ProblemFilters.exclude[DirectAbstractMethodProblem]("org.apache.spark.sql.vectorized.ColumnVector.getDecimal"),
-    ProblemFilters.exclude[DirectAbstractMethodProblem]("org.apache.spark.sql.vectorized.ColumnVector.getUTF8String"),
-    ProblemFilters.exclude[DirectAbstractMethodProblem]("org.apache.spark.sql.vectorized.ColumnVector.getBinary"),
-    ProblemFilters.exclude[DirectAbstractMethodProblem]("org.apache.spark.sql.vectorized.ColumnVector.getArray"),
-    ProblemFilters.exclude[DirectAbstractMethodProblem]("org.apache.spark.sql.vectorized.ColumnVector.getMap"),
-    ProblemFilters.exclude[DirectAbstractMethodProblem]("org.apache.spark.sql.vectorized.ColumnVector.getChild"),
-
-    // [SPARK-35135][CORE] Turn WritablePartitionedIterator from trait into a default implementation class
-    ProblemFilters.exclude[IncompatibleTemplateDefProblem]("org.apache.spark.util.collection.WritablePartitionedIterator"),
-
-    // [SPARK-35757][CORE] Add bitwise AND operation and functionality for intersecting bloom filters
-    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.util.sketch.BloomFilter.intersectInPlace"),
-
-    // [SPARK-35276][CORE] Calculate checksum for shuffle data and write as checksum file
-    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.shuffle.sort.io.LocalDiskShuffleMapOutputWriter.commitAllPartitions"),
-    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.shuffle.sort.io.LocalDiskSingleSpillMapOutputWriter.transferMapSpillFile"),
-    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.shuffle.api.ShuffleMapOutputWriter.commitAllPartitions"),
-    ProblemFilters.exclude[DirectMissingMethodProblem]("org.apache.spark.shuffle.api.SingleSpillShuffleMapOutputWriter.transferMapSpillFile"),
-    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.shuffle.api.SingleSpillShuffleMapOutputWriter.transferMapSpillFile"),
-    ProblemFilters.exclude[ReversedMissingMethodProblem]("org.apache.spark.shuffle.api.ShuffleMapOutputWriter.commitAllPartitions")
+    }
   )
 
-  def excludes(version: String) = version match {
-    case v if v.startsWith("3.3") => v33excludes
-    case v if v.startsWith("3.2") => v32excludes
+  def excludes(version: String): Seq[Problem => Boolean] = version match {
+    case v if v.startsWith("5.0") => v50excludes
+    case v if v.startsWith("4.4") => v44excludes
+    case v if v.startsWith("4.3") => v43excludes
+    case v if v.startsWith("4.2") => v42excludes
+    case v if v.startsWith("4.1") => v41excludes
     case _ => Seq()
   }
 }

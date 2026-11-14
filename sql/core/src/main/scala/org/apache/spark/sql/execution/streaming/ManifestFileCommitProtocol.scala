@@ -26,9 +26,11 @@ import org.apache.hadoop.fs.Path
 import org.apache.hadoop.mapreduce.{JobContext, TaskAttemptContext}
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.internal.io.FileCommitProtocol
+import org.apache.spark.internal.LogKeys.{BATCH_ID, PATH}
+import org.apache.spark.internal.io.{FileCommitProtocol, FileNameSpec}
 import org.apache.spark.internal.io.FileCommitProtocol.TaskCommitMessage
 import org.apache.spark.sql.errors.QueryExecutionErrors
+import org.apache.spark.sql.execution.streaming.sinks.{FileStreamSinkLog, SinkFileStatus}
 
 /**
  * A [[FileCommitProtocol]] that tracks the list of valid files in a manifest file, used in
@@ -74,9 +76,21 @@ class ManifestFileCommitProtocol(jobId: String, path: String)
     pendingCommitFiles.clear()
 
     if (fileLog.add(batchId, fileStatuses)) {
-      logInfo(s"Committed batch $batchId")
+      logInfo(log"Committed batch ${MDC(BATCH_ID, batchId)}")
     } else {
-      throw new IllegalStateException(s"Race while writing batch $batchId")
+      // Reaching here means `fileLog.add` found this batchId already committed to the sink
+      // metadata log at `path`. This is almost always two concurrent streaming queries writing
+      // to the same output path: they share a single `_spark_metadata` log and cannot coexist.
+      // Log the path + batchId at ERROR so a recurrence in scheduled jobs is diagnosable from the
+      // logs alone, without re-reproducing the race.
+      // Build the message once and reuse it for both the log and the exception so they stay in
+      // sync (see review on SPARK-57651).
+      val errorMsg = log"Race while writing batch ${MDC(BATCH_ID, batchId)} to the file sink " +
+        log"metadata log at ${MDC(PATH, path)}: another writer already committed this batch. " +
+        log"This usually means multiple concurrent streaming queries are writing to the same " +
+        log"output path (they share one _spark_metadata log)."
+      logError(errorMsg)
+      throw new IllegalStateException(errorMsg.message)
     }
   }
 
@@ -95,7 +109,8 @@ class ManifestFileCommitProtocol(jobId: String, path: String)
           }
         } catch {
           case e: IOException =>
-            logWarning(s"Fail to remove temporary file $path, continue removing next.", e)
+            logWarning(log"Fail to remove temporary file ${MDC(PATH, path)}, " +
+              log"continue removing next.", e)
         }
       }
       pendingCommitFiles.clear()
@@ -112,13 +127,13 @@ class ManifestFileCommitProtocol(jobId: String, path: String)
   }
 
   override def newTaskTempFile(
-      taskContext: TaskAttemptContext, dir: Option[String], ext: String): String = {
+      taskContext: TaskAttemptContext, dir: Option[String], spec: FileNameSpec): String = {
     // The file name looks like part-r-00000-2dd664f9-d2c4-4ffe-878f-c6c70c1fb0cb_00003.gz.parquet
     // Note that %05d does not truncate the split number, so if we have more than 100000 tasks,
     // the file name is fine and won't overflow.
     val split = taskContext.getTaskAttemptID.getTaskID.getId
     val uuid = UUID.randomUUID.toString
-    val filename = f"part-$split%05d-$uuid$ext"
+    val filename = f"part-$split%05d-$uuid${spec.suffix}"
 
     val file = dir.map { d =>
       new Path(new Path(path, d), filename).toString
@@ -131,7 +146,7 @@ class ManifestFileCommitProtocol(jobId: String, path: String)
   }
 
   override def newTaskTempFileAbsPath(
-      taskContext: TaskAttemptContext, absoluteDir: String, ext: String): String = {
+      taskContext: TaskAttemptContext, absoluteDir: String, spec: FileNameSpec): String = {
     throw QueryExecutionErrors.addFilesWithAbsolutePathUnsupportedError(this.toString)
   }
 

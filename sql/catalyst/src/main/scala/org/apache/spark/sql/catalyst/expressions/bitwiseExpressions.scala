@@ -19,8 +19,8 @@ package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.sql.catalyst.analysis.FunctionRegistry
 import org.apache.spark.sql.catalyst.expressions.codegen._
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.types._
-
 
 /**
  * A function that calculates bitwise and(&) of two numbers.
@@ -29,6 +29,13 @@ import org.apache.spark.sql.types._
  */
 @ExpressionDescription(
   usage = "expr1 _FUNC_ expr2 - Returns the result of bitwise AND of `expr1` and `expr2`.",
+  arguments = """
+    Arguments:
+      * expr1 - The first operand of the bitwise AND.
+        An expression that evaluates to an integral.
+      * expr2 - The second operand of the bitwise AND.
+        An expression that evaluates to an integral.
+  """,
   examples = """
     Examples:
       > SELECT 3 _FUNC_ 5;
@@ -36,9 +43,12 @@ import org.apache.spark.sql.types._
   """,
   since = "1.4.0",
   group = "bitwise_funcs")
-case class BitwiseAnd(left: Expression, right: Expression) extends BinaryArithmetic {
+case class BitwiseAnd(left: Expression, right: Expression) extends BinaryArithmetic
+  with CommutativeExpression {
 
-  protected override val failOnError: Boolean = false
+  override def evalMode: EvalMode.Value = EvalMode.LEGACY
+
+  override val evalContext: NumericEvalContext = NumericEvalContext(evalMode)
 
   override def inputType: AbstractDataType = IntegralType
 
@@ -59,6 +69,13 @@ case class BitwiseAnd(left: Expression, right: Expression) extends BinaryArithme
 
   override protected def withNewChildrenInternal(
     newLeft: Expression, newRight: Expression): BitwiseAnd = copy(left = newLeft, right = newRight)
+
+  override lazy val canonicalized: Expression = {
+    buildCanonicalizedPlan(
+      { case BitwiseAnd(l, r) => Seq(l, r) },
+      { case (l: Expression, r: Expression) => BitwiseAnd(l, r)}
+    )
+  }
 }
 
 /**
@@ -68,6 +85,13 @@ case class BitwiseAnd(left: Expression, right: Expression) extends BinaryArithme
  */
 @ExpressionDescription(
   usage = "expr1 _FUNC_ expr2 - Returns the result of bitwise OR of `expr1` and `expr2`.",
+  arguments = """
+    Arguments:
+      * expr1 - The first operand of the bitwise OR.
+        An expression that evaluates to an integral.
+      * expr2 - The second operand of the bitwise OR.
+        An expression that evaluates to an integral.
+  """,
   examples = """
     Examples:
       > SELECT 3 _FUNC_ 5;
@@ -75,9 +99,12 @@ case class BitwiseAnd(left: Expression, right: Expression) extends BinaryArithme
   """,
   since = "1.4.0",
   group = "bitwise_funcs")
-case class BitwiseOr(left: Expression, right: Expression) extends BinaryArithmetic {
+case class BitwiseOr(left: Expression, right: Expression) extends BinaryArithmetic
+  with CommutativeExpression {
 
-  protected override val failOnError: Boolean = false
+  override def evalMode: EvalMode.Value = EvalMode.LEGACY
+
+  override val evalContext: NumericEvalContext = NumericEvalContext(evalMode)
 
   override def inputType: AbstractDataType = IntegralType
 
@@ -98,6 +125,13 @@ case class BitwiseOr(left: Expression, right: Expression) extends BinaryArithmet
 
   override protected def withNewChildrenInternal(
     newLeft: Expression, newRight: Expression): BitwiseOr = copy(left = newLeft, right = newRight)
+
+  override lazy val canonicalized: Expression = {
+    buildCanonicalizedPlan(
+      { case BitwiseOr(l, r) => Seq(l, r) },
+      { case (l: Expression, r: Expression) => BitwiseOr(l, r)}
+    )
+  }
 }
 
 /**
@@ -107,6 +141,13 @@ case class BitwiseOr(left: Expression, right: Expression) extends BinaryArithmet
  */
 @ExpressionDescription(
   usage = "expr1 _FUNC_ expr2 - Returns the result of bitwise exclusive OR of `expr1` and `expr2`.",
+  arguments = """
+    Arguments:
+      * expr1 - The first operand of the bitwise exclusive OR.
+        An expression that evaluates to an integral.
+      * expr2 - The second operand of the bitwise exclusive OR.
+        An expression that evaluates to an integral.
+  """,
   examples = """
     Examples:
       > SELECT 3 _FUNC_ 5;
@@ -114,9 +155,12 @@ case class BitwiseOr(left: Expression, right: Expression) extends BinaryArithmet
   """,
   since = "1.4.0",
   group = "bitwise_funcs")
-case class BitwiseXor(left: Expression, right: Expression) extends BinaryArithmetic {
+case class BitwiseXor(left: Expression, right: Expression) extends BinaryArithmetic
+  with CommutativeExpression {
 
-  protected override val failOnError: Boolean = false
+  override def evalMode: EvalMode.Value = EvalMode.LEGACY
+
+  override val evalContext: NumericEvalContext = NumericEvalContext(evalMode)
 
   override def inputType: AbstractDataType = IntegralType
 
@@ -137,6 +181,13 @@ case class BitwiseXor(left: Expression, right: Expression) extends BinaryArithme
 
   override protected def withNewChildrenInternal(
     newLeft: Expression, newRight: Expression): BitwiseXor = copy(left = newLeft, right = newRight)
+
+  override lazy val canonicalized: Expression = {
+    buildCanonicalizedPlan(
+      { case BitwiseXor(l, r) => Seq(l, r) },
+      { case (l: Expression, r: Expression) => BitwiseXor(l, r)}
+    )
+  }
 }
 
 /**
@@ -144,6 +195,11 @@ case class BitwiseXor(left: Expression, right: Expression) extends BinaryArithme
  */
 @ExpressionDescription(
   usage = "_FUNC_ expr - Returns the result of bitwise NOT of `expr`.",
+  arguments = """
+    Arguments:
+      * expr - The expression to compute the bitwise NOT of.
+        An expression that evaluates to an integral.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_ 0;
@@ -152,8 +208,8 @@ case class BitwiseXor(left: Expression, right: Expression) extends BinaryArithme
   since = "1.4.0",
   group = "bitwise_funcs")
 case class BitwiseNot(child: Expression)
-  extends UnaryExpression with ExpectsInputTypes with NullIntolerant {
-
+  extends UnaryExpression with ExpectsInputTypes {
+  override def nullIntolerant: Boolean = true
   override def inputTypes: Seq[AbstractDataType] = Seq(IntegralType)
 
   override def dataType: DataType = child.dataType
@@ -186,6 +242,11 @@ case class BitwiseNot(child: Expression)
 @ExpressionDescription(
   usage = "_FUNC_(expr) - Returns the number of bits that are set in the argument expr as an" +
     " unsigned 64-bit integer, or NULL if the argument is NULL.",
+  arguments = """
+    Arguments:
+      * expr - The argument whose set bits are counted.
+        An expression that evaluates to an integral or boolean.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(0);
@@ -194,7 +255,8 @@ case class BitwiseNot(child: Expression)
   since = "3.0.0",
   group = "bitwise_funcs")
 case class BitwiseCount(child: Expression)
-  extends UnaryExpression with ExpectsInputTypes with NullIntolerant {
+  extends UnaryExpression with ExpectsInputTypes {
+  override def nullIntolerant: Boolean = true
 
   override def inputTypes: Seq[AbstractDataType] = Seq(TypeCollection(IntegralType, BooleanType))
 
@@ -205,7 +267,7 @@ case class BitwiseCount(child: Expression)
   override def prettyName: String = "bit_count"
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = child.dataType match {
-    case BooleanType => defineCodeGen(ctx, ev, c => s"if ($c) 1 else 0")
+    case BooleanType => defineCodeGen(ctx, ev, c => s"($c) ? 1 : 0")
     case _ => defineCodeGen(ctx, ev, c => s"java.lang.Long.bitCount($c)")
   }
 
@@ -222,11 +284,9 @@ case class BitwiseCount(child: Expression)
 }
 
 object BitwiseGetUtil {
-  def checkPosition(pos: Int, size: Int): Unit = {
-    if (pos < 0) {
-      throw new IllegalArgumentException(s"Invalid bit position: $pos is less than zero")
-    } else if (size <= pos) {
-      throw new IllegalArgumentException(s"Invalid bit position: $pos exceeds the bit upper limit")
+  def checkPosition(funcName: String, pos: Int, size: Int): Unit = {
+    if (pos < 0 || pos >= size) {
+      throw QueryExecutionErrors.bitPositionRangeError(funcName, pos, size)
     }
   }
 }
@@ -236,6 +296,13 @@ object BitwiseGetUtil {
     _FUNC_(expr, pos) - Returns the value of the bit (0 or 1) at the specified position.
       The positions are numbered from right to left, starting at zero.
       The position argument cannot be negative.
+  """,
+  arguments = """
+    Arguments:
+      * expr - The expression to read the bit from.
+        An expression that evaluates to an integral.
+      * pos - The position of the bit to return, numbered from right to left starting at zero.
+        An expression that evaluates to an integer.
   """,
   examples = """
     Examples:
@@ -247,7 +314,8 @@ object BitwiseGetUtil {
   since = "3.2.0",
   group = "bitwise_funcs")
 case class BitwiseGet(left: Expression, right: Expression)
-  extends BinaryExpression with ImplicitCastInputTypes with NullIntolerant {
+  extends BinaryExpression with ImplicitCastInputTypes {
+  override def nullIntolerant: Boolean = true
 
   override def inputTypes: Seq[AbstractDataType] = Seq(IntegralType, IntegerType)
 
@@ -262,14 +330,15 @@ case class BitwiseGet(left: Expression, right: Expression)
 
   override def nullSafeEval(target: Any, pos: Any): Any = {
     val posInt = pos.asInstanceOf[Int]
-    BitwiseGetUtil.checkPosition(posInt, bitSize)
+    BitwiseGetUtil.checkPosition(prettyName, posInt, bitSize)
     ((target.asInstanceOf[Number].longValue() >> posInt) & 1).toByte
   }
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
     nullSafeCodeGen(ctx, ev, (target, pos) => {
       s"""
-         |org.apache.spark.sql.catalyst.expressions.BitwiseGetUtil.checkPosition($pos, $bitSize);
+         |org.apache.spark.sql.catalyst.expressions.BitwiseGetUtil.checkPosition(
+         |  "$prettyName", $pos, $bitSize);
          |${ev.value} = (byte) ((((long) $target) >> $pos) & 1);
        """.stripMargin
     })

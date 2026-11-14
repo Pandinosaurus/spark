@@ -23,8 +23,8 @@ import java.util.Properties
 
 import scala.collection.mutable.HashMap
 
-import org.apache.spark.SparkFunSuite
-import org.apache.spark.resource.ResourceInformation
+import org.apache.spark.{JobArtifactSet, SparkFunSuite}
+import org.apache.spark.resource.{CpuAmount, ResourceAmountUtils}
 import org.apache.spark.resource.ResourceUtils.GPU
 
 class TaskDescriptionSuite extends SparkFunSuite {
@@ -59,11 +59,20 @@ class TaskDescriptionSuite extends SparkFunSuite {
       }
     }
 
-    val originalResources =
-      Map(GPU -> new ResourceInformation(GPU, Array("1", "2", "3")))
+    val originalResources = Map(GPU ->
+      Map("1" -> ResourceAmountUtils.toInternalResource(0.2),
+        "2" -> ResourceAmountUtils.toInternalResource(0.5),
+        "3" -> ResourceAmountUtils.toInternalResource(0.1)))
 
     // Create a dummy byte buffer for the task.
     val taskBuffer = ByteBuffer.wrap(Array[Byte](1, 2, 3, 4))
+
+    val artifacts = new JobArtifactSet(
+      None,
+      jars = Map(originalJars.toSeq: _*),
+      files = Map(originalFiles.toSeq: _*),
+      archives = Map(originalArchives.toSeq: _*)
+    )
 
     val originalTaskDescription = new TaskDescription(
       taskId = 1520589,
@@ -72,12 +81,11 @@ class TaskDescriptionSuite extends SparkFunSuite {
       name = "task for test",
       index = 19,
       partitionId = 1,
-      originalFiles,
-      originalJars,
-      originalArchives,
+      artifacts,
       originalProperties,
       cpus = 2,
       originalResources,
+      None,
       taskBuffer
     )
 
@@ -91,22 +99,99 @@ class TaskDescriptionSuite extends SparkFunSuite {
     assert(decodedTaskDescription.name === originalTaskDescription.name)
     assert(decodedTaskDescription.index === originalTaskDescription.index)
     assert(decodedTaskDescription.partitionId === originalTaskDescription.partitionId)
-    assert(decodedTaskDescription.addedFiles.equals(originalFiles))
-    assert(decodedTaskDescription.addedJars.equals(originalJars))
-    assert(decodedTaskDescription.addedArchives.equals(originalArchives))
+    assert(decodedTaskDescription.artifacts.equals(artifacts))
     assert(decodedTaskDescription.properties.equals(originalTaskDescription.properties))
     assert(decodedTaskDescription.cpus.equals(originalTaskDescription.cpus))
-    assert(equalResources(decodedTaskDescription.resources, originalTaskDescription.resources))
+    assert(decodedTaskDescription.resources === originalTaskDescription.resources)
+    assert(decodedTaskDescription.userCredentials === None)
     assert(decodedTaskDescription.serializedTask.equals(taskBuffer))
+  }
 
-    def equalResources(original: Map[String, ResourceInformation],
-        target: Map[String, ResourceInformation]): Boolean = {
-      original.size == target.size && original.forall { case (name, info) =>
-        target.get(name).exists { targetInfo =>
-          info.name.equals(targetInfo.name) &&
-            info.addresses.sameElements(targetInfo.addresses)
-        }
-      }
+  test("SPARK-58192: fractional cpus survives the encode/decode round trip exactly") {
+    Seq("0.5", "1.5", "0.000000001", "2").foreach { amount =>
+      val cpus = CpuAmount.normalize(BigDecimal(amount))
+      val taskDescription = new TaskDescription(
+        taskId = 42,
+        attemptNumber = 0,
+        executorId = "testExecutor",
+        name = "task for test",
+        index = 1,
+        partitionId = 1,
+        new JobArtifactSet(None, Map.empty, Map.empty, Map.empty),
+        new Properties(),
+        cpus,
+        Map.empty,
+        None,
+        ByteBuffer.wrap(Array[Byte](1, 2, 3, 4)))
+      val decoded = TaskDescription.decode(TaskDescription.encode(taskDescription))
+      // The decoded amount is what the executor echoes back in its status update and what the
+      // driver adds back to the executor's free cores, so it must be the identical normalized
+      // value -- same scale included -- not merely numerically close.
+      assert(decoded.cpus === cpus, s"for amount $amount")
+      assert(decoded.cpus.scale === cpus.scale, s"scale for amount $amount")
     }
   }
+
+  test("encoding and decoding TaskDescription with userCredentials preserves credentials") {
+    val taskBuffer = ByteBuffer.wrap(Array[Byte](1, 2, 3, 4))
+    val properties = new Properties()
+    properties.put("key", "value")
+
+    val credentialBytes = Array[Byte](10, 20, 30, 40, 50)
+
+    val taskDescription = new TaskDescription(
+      taskId = 42,
+      attemptNumber = 0,
+      executorId = "exec-1",
+      name = "task with credentials",
+      index = 0,
+      partitionId = 0,
+      JobArtifactSet.emptyJobArtifactSet,
+      properties,
+      cpus = 1,
+      Map.empty,
+      Some((1L, credentialBytes)),
+      taskBuffer
+    )
+
+    val serialized = TaskDescription.encode(taskDescription)
+    val decoded = TaskDescription.decode(serialized)
+
+    assert(decoded.taskId === 42)
+    assert(decoded.name === "task with credentials")
+    assert(decoded.userCredentials.isDefined)
+    assert(decoded.userCredentials.get._1 === 1L)
+    assert(decoded.userCredentials.get._2 === credentialBytes)
+    assert(decoded.serializedTask.equals(taskBuffer))
+  }
+
+  test("encoding and decoding TaskDescription without userCredentials round-trips correctly") {
+    val taskBuffer = ByteBuffer.wrap(Array[Byte](5, 6, 7, 8))
+    val properties = new Properties()
+
+    val taskDescription = new TaskDescription(
+      taskId = 99,
+      attemptNumber = 1,
+      executorId = "exec-2",
+      name = "task without credentials",
+      index = 3,
+      partitionId = 2,
+      JobArtifactSet.emptyJobArtifactSet,
+      properties,
+      cpus = 2,
+      Map.empty,
+      None,
+      taskBuffer
+    )
+
+    val serialized = TaskDescription.encode(taskDescription)
+    val decoded = TaskDescription.decode(serialized)
+
+    assert(decoded.taskId === 99)
+    assert(decoded.attemptNumber === 1)
+    assert(decoded.name === "task without credentials")
+    assert(decoded.userCredentials === None)
+    assert(decoded.serializedTask.equals(taskBuffer))
+  }
+
 }

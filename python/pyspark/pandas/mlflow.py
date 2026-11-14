@@ -18,23 +18,24 @@
 """
 MLflow-related functions to load models and apply them to pandas-on-Spark dataframes.
 """
-from typing import List, Union
 
-from pyspark.sql.types import DataType
-import pandas as pd
+from typing import Any, List, Union
+
 import numpy as np
-from typing import Any
+import pandas as pd
 
-from pyspark.pandas._typing import Label, Dtype
-from pyspark.pandas.utils import lazy_property, default_session
+from pyspark.pandas._typing import Dtype, Label
 from pyspark.pandas.frame import DataFrame
 from pyspark.pandas.series import Series, first_series
 from pyspark.pandas.typedef import as_spark_type
+from pyspark.pandas.utils import default_session, lazy_property
+from pyspark.sql.functions import struct
+from pyspark.sql.types import DataType
 
 __all__ = ["PythonModelWrapper", "load_model"]
 
 
-class PythonModelWrapper(object):
+class PythonModelWrapper:
     """
     A wrapper around MLflow's Python object model.
 
@@ -93,11 +94,8 @@ class PythonModelWrapper(object):
         if isinstance(data, pd.DataFrame):
             return self._model.predict(data)
         elif isinstance(data, DataFrame):
-            return_col = self._model_udf(*data._internal.data_spark_columns)
-            # TODO: the columns should be named according to the mlflow spec
-            # However, this is only possible with spark >= 3.0
-            # s = F.struct(*data.columns)
-            # return_col = self._model_udf(s)
+            s = struct(*data.columns)
+            return_col = self._model_udf(s)
             column_labels: List[Label] = [
                 (col,) for col in data._internal.spark_frame.select(return_col).columns
             ]
@@ -113,7 +111,7 @@ def load_model(
     model_uri: str, predict_type: Union[str, type, Dtype] = "infer"
 ) -> PythonModelWrapper:
     """
-    Loads an MLflow model into an wrapper that can be used both for pandas and pandas-on-Spark
+    Loads an MLflow model into a wrapper that can be used both for pandas and pandas-on-Spark
     DataFrame.
 
     Parameters
@@ -122,7 +120,7 @@ def load_model(
         URI pointing to the model. See MLflow documentation for more details.
     predict_type : a python basic type, a numpy basic type, a Spark type or 'infer'.
        This is the return type that is expected when calling the predict function of the model.
-       If 'infer' is specified, the wrapper will attempt to determine automatically the return type
+       If 'infer' is specified, the wrapper will attempt to automatically determine the return type
        based on the model type.
 
     Returns
@@ -143,10 +141,10 @@ def load_model(
     >>> import mlflow.sklearn
     >>> from tempfile import mkdtemp
     >>> d = mkdtemp("pandas_on_spark_mlflow")
-    >>> set_tracking_uri("file:%s"%d)
+    >>> set_tracking_uri(f"sqlite:///{d}/mlflow.db")
     >>> client = MlflowClient()
-    >>> exp = mlflow.create_experiment("my_experiment")
-    >>> mlflow.set_experiment("my_experiment")
+    >>> exp_id = mlflow.create_experiment("my_experiment")
+    >>> exp = mlflow.set_experiment("my_experiment")
 
     We aim at learning this numerical function using a simple linear regressor.
 
@@ -159,14 +157,14 @@ def load_model(
     ...     lr = LinearRegression()
     ...     lr.fit(train_x, train_y)
     ...     mlflow.sklearn.log_model(lr, "model")
-    LinearRegression(...)
+    LinearRegression...
 
     Now that our model is logged using MLflow, we load it back and apply it on a pandas-on-Spark
     dataframe:
 
     >>> from pyspark.pandas.mlflow import load_model
-    >>> run_info = client.list_run_infos(exp)[-1]
-    >>> model = load_model("runs:/{run_id}/model".format(run_id=run_info.run_uuid))
+    >>> run_info = client.search_runs(exp_id)[-1].info
+    >>> model = load_model("runs:/{run_id}/model".format(run_id=run_info.run_id))
     >>> prediction_df = ps.DataFrame({"x1": [2.0], "x2": [4.0]})
     >>> prediction_df["prediction"] = model.predict(prediction_df)
     >>> prediction_df
@@ -181,7 +179,7 @@ def load_model(
     Notes
     -----
     Currently, the model prediction can only be merged back with the existing dataframe.
-    Other columns have to be manually joined.
+    Other columns must be manually joined.
     For example, this code will not work:
 
     >>> df = ps.DataFrame({"x1": [2.0], "x2": [3.0], "z": [-1]})
@@ -205,11 +203,12 @@ def load_model(
 
 
 def _test() -> None:
-    import os
     import doctest
+    import os
     import sys
-    from pyspark.sql import SparkSession
+
     import pyspark.pandas.mlflow
+    from pyspark.sql import SparkSession
 
     os.chdir(os.environ["SPARK_HOME"])
 
@@ -218,7 +217,7 @@ def _test() -> None:
     spark = (
         SparkSession.builder.master("local[4]").appName("pyspark.pandas.mlflow tests").getOrCreate()
     )
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.pandas.mlflow,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

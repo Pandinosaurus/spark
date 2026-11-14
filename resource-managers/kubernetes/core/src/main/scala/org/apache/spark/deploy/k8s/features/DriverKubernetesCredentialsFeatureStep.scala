@@ -18,21 +18,22 @@ package org.apache.spark.deploy.k8s.features
 
 import java.io.File
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.util.Base64
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
-import com.google.common.io.{BaseEncoding, Files}
 import io.fabric8.kubernetes.api.model.{ContainerBuilder, HasMetadata, PodBuilder, Secret, SecretBuilder}
 
 import org.apache.spark.deploy.k8s.{KubernetesConf, SparkPod}
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
-import org.apache.spark.deploy.k8s.KubernetesUtils.buildPodWithServiceAccount
+import org.apache.spark.deploy.k8s.KubernetesUtils.{buildPodWithServiceAccount, podServiceAccount}
+import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys.{CONFIG, CONFIGS, PREFIX, SERVICE_ACCOUNT_NAME, VALUE}
 
 private[spark] class DriverKubernetesCredentialsFeatureStep(kubernetesConf: KubernetesConf)
-  extends KubernetesFeatureConfigStep {
-  // TODO clean up this class, and credentials in general. See also SparkKubernetesClientFactory.
-  // We should use a struct to hold all creds-related fields. A lot of the code is very repetitive.
+  extends KubernetesFeatureConfigStep with Logging {
 
   private val maybeMountedOAuthTokenFile = kubernetesConf.getOption(
     s"$KUBERNETES_AUTH_DRIVER_MOUNTED_CONF_PREFIX.$OAUTH_TOKEN_FILE_CONF_SUFFIX")
@@ -47,7 +48,7 @@ private[spark] class DriverKubernetesCredentialsFeatureStep(kubernetesConf: Kube
   private val oauthTokenBase64 = kubernetesConf
     .getOption(s"$KUBERNETES_AUTH_DRIVER_CONF_PREFIX.$OAUTH_TOKEN_CONF_SUFFIX")
     .map { token =>
-      BaseEncoding.base64().encode(token.getBytes(StandardCharsets.UTF_8))
+      Base64.getEncoder().encodeToString(token.getBytes(StandardCharsets.UTF_8))
     }
 
   private val caCertDataBase64 = safeFileConfToBase64(
@@ -60,11 +61,16 @@ private[spark] class DriverKubernetesCredentialsFeatureStep(kubernetesConf: Kube
     s"$KUBERNETES_AUTH_DRIVER_CONF_PREFIX.$CLIENT_CERT_FILE_CONF_SUFFIX",
     "Driver client cert file")
 
-  // TODO decide whether or not to apply this step entirely in the caller, i.e. the builder.
-  private val shouldMountSecret = oauthTokenBase64.isDefined ||
-    caCertDataBase64.isDefined ||
-    clientKeyDataBase64.isDefined ||
-    clientCertDataBase64.isDefined
+  private val submittedCredentialConfs = Seq(
+    OAUTH_TOKEN_CONF_SUFFIX -> oauthTokenBase64,
+    CA_CERT_FILE_CONF_SUFFIX -> caCertDataBase64,
+    CLIENT_KEY_FILE_CONF_SUFFIX -> clientKeyDataBase64,
+    CLIENT_CERT_FILE_CONF_SUFFIX -> clientCertDataBase64)
+    .collect { case (suffix, credential) if credential.isDefined =>
+      s"$KUBERNETES_AUTH_DRIVER_CONF_PREFIX.$suffix"
+    }
+
+  private val shouldMountSecret = submittedCredentialConfs.nonEmpty
 
   private val driverCredentialsSecretName =
     s"${kubernetesConf.resourceNamePrefix}-kubernetes-credentials"
@@ -73,6 +79,23 @@ private[spark] class DriverKubernetesCredentialsFeatureStep(kubernetesConf: Kube
     if (!shouldMountSecret) {
       pod.copy(pod = buildPodWithServiceAccount(driverServiceAccount, pod).getOrElse(pod.pod))
     } else {
+      // The credentials secret takes precedence over the driver service account: this branch never
+      // applies the account, so warn that the pod keeps whatever its spec names, or the namespace
+      // default. Stay quiet when the spec already names the same account.
+      val specServiceAccount = podServiceAccount(pod)
+      driverServiceAccount.filterNot(specServiceAccount.contains).foreach { account =>
+        val keptAccount = specServiceAccount
+          .map(name => log"the pod keeps ${MDC(SERVICE_ACCOUNT_NAME, name)}, named by its spec")
+          .getOrElse(log"the pod falls back to the namespace's default account")
+        logWarning(log"Not applying " +
+          log"${MDC(CONFIG, KUBERNETES_DRIVER_SERVICE_ACCOUNT_NAME.key)}=${MDC(VALUE, account)} " +
+          log"to the driver pod, because the driver credentials given by " +
+          log"${MDC(CONFIGS, submittedCredentialConfs.mkString(", "))} take precedence: " +
+          keptAccount + log". To have Spark apply that configuration anyway, put the credentials " +
+          log"inside the driver pod and point the " +
+          log"${MDC(PREFIX, KUBERNETES_AUTH_DRIVER_MOUNTED_CONF_PREFIX)}.* configurations at " +
+          log"them instead, which does not mount a secret.")
+      }
       val driverPodWithMountedKubernetesCredentials =
         new PodBuilder(pod.pod)
           .editOrNewSpec()
@@ -153,7 +176,7 @@ private[spark] class DriverKubernetesCredentialsFeatureStep(kubernetesConf: Kube
       .map { file =>
         require(file.isFile, String.format("%s provided at %s does not exist or is not a file.",
           fileType, file.getAbsolutePath))
-        BaseEncoding.base64().encode(Files.toByteArray(file))
+        Base64.getEncoder().encodeToString(Files.readAllBytes(file.toPath))
       }
   }
 

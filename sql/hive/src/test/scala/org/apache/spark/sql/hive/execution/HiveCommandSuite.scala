@@ -18,8 +18,9 @@
 package org.apache.spark.sql.hive.execution
 
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
-import com.google.common.io.Files
 import org.apache.hadoop.fs.{FileContext, FsConstants, Path}
 
 import org.apache.spark.sql.{AnalysisException, QueryTest, Row}
@@ -28,10 +29,11 @@ import org.apache.spark.sql.catalyst.catalog.{CatalogStorageFormat, CatalogTable
 import org.apache.spark.sql.execution.command.LoadDataCommand
 import org.apache.spark.sql.hive.test.TestHiveSingleton
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.test.SQLTestUtils
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.tags.SlowHiveTest
 
-class HiveCommandSuite extends QueryTest with SQLTestUtils with TestHiveSingleton {
+@SlowHiveTest
+class HiveCommandSuite extends QueryTest with TestHiveSingleton {
 
   protected override def beforeAll(): Unit = {
     super.beforeAll()
@@ -145,7 +147,7 @@ class HiveCommandSuite extends QueryTest with SQLTestUtils with TestHiveSingleto
         fn(testData)
       } else {
         val tmp = File.createTempFile(testData.getName(), ".tmp")
-        Files.copy(testData, tmp)
+        Files.copy(testData.toPath, tmp.toPath, StandardCopyOption.REPLACE_EXISTING)
         try {
           fn(tmp)
         } finally {

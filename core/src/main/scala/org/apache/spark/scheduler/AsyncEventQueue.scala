@@ -17,13 +17,15 @@
 
 package org.apache.spark.scheduler
 
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.{LinkedBlockingQueue, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
 import com.codahale.metrics.{Gauge, Timer}
+import com.google.common.util.concurrent.Uninterruptibles
 
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.config._
 import org.apache.spark.util.Utils
 
@@ -140,12 +142,26 @@ private class AsyncEventQueue(
     }
     if (stopped.compareAndSet(false, true)) {
       eventCount.incrementAndGet()
-      eventQueue.put(POISON_PILL)
+      // Shutdown may run on an interrupted thread, such as a streaming execution thread.
+      // Once stopped is set, the poison pill must still be enqueued or the dispatch thread can
+      // remain blocked forever.
+      Uninterruptibles.putUninterruptibly(eventQueue, POISON_PILL)
     }
-    // this thread might be trying to stop itself as part of error handling -- we can't join
+    // This thread might be trying to stop itself as part of error handling -- we can't join
     // in that case.
     if (Thread.currentThread() != dispatchThread) {
-      dispatchThread.join()
+      // If users don't want to wait for the dispatch to end until all events are drained,
+      // they can control the waiting time by themselves.
+      // By default, the `waitingTimeMs` is set to 0,
+      // which means it will wait until all events are drained.
+      val exitTimeoutMs = conf.get(LISTENER_BUS_EXIT_TIMEOUT)
+      // Finish waiting despite interruption while preserving the configured timeout.
+      // Uninterruptibles restores the caller's interrupt status before returning.
+      if (exitTimeoutMs == 0) {
+        Uninterruptibles.joinUninterruptibly(dispatchThread)
+      } else {
+        Uninterruptibles.joinUninterruptibly(dispatchThread, exitTimeoutMs, TimeUnit.MILLISECONDS)
+      }
     }
   }
 
@@ -164,9 +180,9 @@ private class AsyncEventQueue(
     droppedEventsCounter.incrementAndGet()
     if (logDroppedEvent.compareAndSet(false, true)) {
       // Only log the following message once to avoid duplicated annoying logs.
-      logError(s"Dropping event from queue $name. " +
-        "This likely means one of the listeners is too slow and cannot keep up with " +
-        "the rate at which tasks are being started by the scheduler.")
+      logError(log"Dropping event from queue ${MDC(EVENT_QUEUE, name)}. " +
+        log"This likely means one of the listeners is too slow and cannot keep up with " +
+        log"the rate at which tasks are being started by the scheduler.")
     }
     logTrace(s"Dropping event $event")
 
@@ -181,8 +197,9 @@ private class AsyncEventQueue(
       if (lastReportTimestamp.compareAndSet(lastReportTime, curTime)) {
         val previous = new java.util.Date(lastReportTime)
         lastDroppedEventsCounter = droppedEventsCount
-        logWarning(s"Dropped $droppedCountIncreased events from $name since " +
-          s"${if (lastReportTime == 0) "the application started" else s"$previous"}.")
+        logWarning(log"Dropped ${MDC(NUM_EVENTS, droppedCountIncreased)} events from " +
+          log"${MDC(EVENT_NAME, name)} since " +
+          (if (lastReportTime == 0) log"the application started" else log"${MDC(TIME, previous)}"))
       }
     }
   }

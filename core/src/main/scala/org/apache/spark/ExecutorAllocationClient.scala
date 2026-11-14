@@ -18,10 +18,11 @@
 package org.apache.spark
 
 import org.apache.spark.scheduler.ExecutorDecommissionInfo
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * A client that communicates with the cluster manager to request or kill executors.
- * This is currently supported only in YARN mode.
+ * This is currently supported only in Kubernetes and YARN mode.
  */
 private[spark] trait ExecutorAllocationClient {
 
@@ -98,11 +99,24 @@ private[spark] trait ExecutorAllocationClient {
       executorsAndDecomInfo: Array[(String, ExecutorDecommissionInfo)],
       adjustTargetNumExecutors: Boolean,
       triggeredByExecutor: Boolean): Seq[String] = {
-    killExecutors(executorsAndDecomInfo.map(_._1),
+    killExecutors(executorsAndDecomInfo.map(_._1).toImmutableArraySeq,
       adjustTargetNumExecutors,
       countFailures = false)
   }
 
+  /**
+   * Decommission only executors which are still idle when the request is accepted.
+   * Implementations must check for assigned tasks and stop further task assignment atomically.
+   * The default declines all requests. Clients that support graceful dynamic-allocation
+   * scale-down must override this method and provide the atomicity guarantee.
+   *
+   * @param executorsAndDecomInfo identifiers of executors and decommission information
+   * @param adjustTargetNumExecutors whether to reduce the target number of executors
+   * @return the ids of the executors accepted for decommissioning
+   */
+  def decommissionExecutorsIfIdle(
+      executorsAndDecomInfo: Array[(String, ExecutorDecommissionInfo)],
+      adjustTargetNumExecutors: Boolean): Seq[String] = Seq.empty
 
   /**
    * Request that the cluster manager decommission the specified executor.

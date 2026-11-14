@@ -17,22 +17,30 @@
 
 package org.apache.spark.sql.execution.datasources.orc
 
+import scala.jdk.CollectionConverters._
+
 import org.apache.hadoop.io._
+import org.apache.orc.TypeDescription
 import org.apache.orc.mapred.{OrcList, OrcMap, OrcStruct, OrcTimestamp}
 
+import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.SpecializedGetters
 import org.apache.spark.sql.catalyst.util._
-import org.apache.spark.sql.errors.QueryExecutionErrors
+import org.apache.spark.sql.execution.datasources.orc.types.ops.OrcTypeOps
 import org.apache.spark.sql.types._
 
 /**
  * A serializer to serialize Spark rows to ORC structs.
  */
 class OrcSerializer(dataSchema: StructType) {
-
-  private val result = createOrcValue(dataSchema).asInstanceOf[OrcStruct]
-  private val converters = dataSchema.map(_.dataType).map(newConverter(_)).toArray
+  private val resultTypeDescription = OrcUtils.orcTypeDescription(dataSchema)
+  private val result = OrcStruct.createValue(resultTypeDescription).asInstanceOf[OrcStruct]
+  private val converters =
+    dataSchema.map(_.dataType).zip(resultTypeDescription.getChildren.asScala).map {
+      case (dt, orcType) =>
+        newConverter(dt, orcType)
+    }.toArray
 
   def serialize(row: InternalRow): OrcStruct = {
     var i = 0
@@ -54,6 +62,7 @@ class OrcSerializer(dataSchema: StructType) {
    */
   private def newConverter(
       dataType: DataType,
+      orcType: TypeDescription,
       reuseObj: Boolean = true): Converter = dataType match {
     case NullType => (getter, ordinal) => null
 
@@ -98,7 +107,7 @@ class OrcSerializer(dataSchema: StructType) {
       }
 
 
-    case LongType | _: DayTimeIntervalType =>
+    case LongType | _: DayTimeIntervalType | _: TimestampNTZType =>
       if (reuseObj) {
         val result = new LongWritable()
         (getter, ordinal) =>
@@ -130,7 +139,7 @@ class OrcSerializer(dataSchema: StructType) {
 
 
     // Don't reuse the result object for string and binary as it would cause extra data copy.
-    case StringType => (getter, ordinal) =>
+    case _: StringType => (getter, ordinal) =>
       new Text(getter.getUTF8String(ordinal).getBytes)
 
     case BinaryType => (getter, ordinal) =>
@@ -147,14 +156,18 @@ class OrcSerializer(dataSchema: StructType) {
       result.setNanos(ts.getNanos)
       result
 
-    case TimestampNTZType => (getter, ordinal) => OrcUtils.toOrcNTZ(getter.getLong(ordinal))
+    // Framework types (TimeType, nanosecond timestamps) provide their own ORC value writer.
+    case OrcTypeOps(ops) => ops.makeSerializer(reuseObj)
 
     case DecimalType.Fixed(precision, scale) =>
       OrcShimUtils.getHiveDecimalWritable(precision, scale)
 
     case st: StructType => (getter, ordinal) =>
-      val result = createOrcValue(st).asInstanceOf[OrcStruct]
-      val fieldConverters = st.map(_.dataType).map(newConverter(_))
+      val result = OrcStruct.createValue(orcType).asInstanceOf[OrcStruct]
+      val fieldConverters = st.map(_.dataType).zip(orcType.getChildren.asScala).map {
+        case (dt, orcType) =>
+          newConverter(dt, orcType)
+      }.toArray
       val numFields = st.length
       val struct = getter.getStruct(ordinal, numFields)
       var i = 0
@@ -169,27 +182,32 @@ class OrcSerializer(dataSchema: StructType) {
       result
 
     case ArrayType(elementType, _) => (getter, ordinal) =>
-      val result = createOrcValue(dataType).asInstanceOf[OrcList[WritableComparable[_]]]
-      // Need to put all converted values to a list, can't reuse object.
-      val elementConverter = newConverter(elementType, reuseObj = false)
       val array = getter.getArray(ordinal)
-      var i = 0
-      while (i < array.numElements()) {
-        if (array.isNullAt(i)) {
-          result.add(null)
-        } else {
-          result.add(elementConverter(array, i))
+      val numElements = array.numElements()
+      val result = new OrcList[WritableComparable[_]](orcType, numElements)
+      if (numElements > 0) {
+        // Need to put all converted values to a list, can't reuse object.
+        val elementConverter =
+          newConverter(elementType, orcType.getChildren.get(0), reuseObj = false)
+        var i = 0
+        while (i < numElements) {
+          if (array.isNullAt(i)) {
+            result.add(null)
+          } else {
+            result.add(elementConverter(array, i))
+          }
+          i += 1
         }
-        i += 1
       }
       result
 
     case MapType(keyType, valueType, _) => (getter, ordinal) =>
-      val result = createOrcValue(dataType)
+      val result = OrcStruct.createValue(orcType)
         .asInstanceOf[OrcMap[WritableComparable[_], WritableComparable[_]]]
       // Need to put all converted values to a list, can't reuse object.
-      val keyConverter = newConverter(keyType, reuseObj = false)
-      val valueConverter = newConverter(valueType, reuseObj = false)
+      val orcChildSchema = orcType.getChildren
+      val keyConverter = newConverter(keyType, orcChildSchema.get(0), reuseObj = false)
+      val valueConverter = newConverter(valueType, orcChildSchema.get(1), reuseObj = false)
       val map = getter.getMap(ordinal)
       val keyArray = map.keyArray()
       val valueArray = map.valueArray()
@@ -205,16 +223,8 @@ class OrcSerializer(dataSchema: StructType) {
       }
       result
 
-    case udt: UserDefinedType[_] => newConverter(udt.sqlType)
+    case udt: UserDefinedType[_] => newConverter(udt.sqlType, orcType)
 
-    case _ =>
-      throw QueryExecutionErrors.dataTypeUnsupportedYetError(dataType)
-  }
-
-  /**
-   * Return a Orc value object for the given Spark schema.
-   */
-  private def createOrcValue(dataType: DataType) = {
-    OrcStruct.createValue(OrcUtils.orcTypeDescription(dataType))
+    case _ => throw SparkException.internalError(s"Unsupported data type $dataType.")
   }
 }

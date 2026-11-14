@@ -17,54 +17,26 @@
 
 package org.apache.spark.sql.execution.stat
 
-import scala.collection.mutable.{Map => MutableMap}
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, DataOutputStream}
+
+import scala.collection.mutable
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.{Column, DataFrame, Dataset, Row}
-import org.apache.spark.sql.catalyst.plans.logical.LocalRelation
+import org.apache.spark.sql.{functions, Column}
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.{Expression, UnsafeProjection, UnsafeRow}
+import org.apache.spark.sql.catalyst.expressions.aggregate.{ImperativeAggregate, TypedImperativeAggregate}
+import org.apache.spark.sql.catalyst.trees.UnaryLike
+import org.apache.spark.sql.catalyst.util.GenericArrayData
+import org.apache.spark.sql.classic.ClassicConversions._
+import org.apache.spark.sql.classic.DataFrame
+import org.apache.spark.sql.classic.ExpressionUtils.expression
 import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.Platform
+import org.apache.spark.unsafe.hash.Murmur3_x86_32
+import org.apache.spark.util.Utils
 
 object FrequentItems extends Logging {
-
-  /** A helper class wrapping `MutableMap[Any, Long]` for simplicity. */
-  private class FreqItemCounter(size: Int) extends Serializable {
-    val baseMap: MutableMap[Any, Long] = MutableMap.empty[Any, Long]
-    /**
-     * Add a new example to the counts if it exists, otherwise deduct the count
-     * from existing items.
-     */
-    def add(key: Any, count: Long): this.type = {
-      if (baseMap.contains(key))  {
-        baseMap(key) += count
-      } else {
-        if (baseMap.size < size) {
-          baseMap += key -> count
-        } else {
-          val minCount = if (baseMap.values.isEmpty) 0 else baseMap.values.min
-          val remainder = count - minCount
-          if (remainder >= 0) {
-            baseMap += key -> count // something will get kicked out, so we can add this
-            baseMap.retain((k, v) => v > minCount)
-            baseMap.transform((k, v) => v - minCount)
-          } else {
-            baseMap.transform((k, v) => v - count)
-          }
-        }
-      }
-      this
-    }
-
-    /**
-     * Merge two maps of counts.
-     * @param other The map containing the counts for that partition
-     */
-    def merge(other: FreqItemCounter): this.type = {
-      other.baseMap.foreach { case (k, v) =>
-        add(k, v)
-      }
-      this
-    }
-  }
 
   /**
    * Finding frequent items for columns, possibly with false positives. Using the
@@ -85,42 +57,179 @@ object FrequentItems extends Logging {
       cols: Seq[String],
       support: Double): DataFrame = {
     require(support >= 1e-4 && support <= 1.0, s"Support must be in [1e-4, 1], but got $support.")
-    val numCols = cols.length
+
     // number of max items to keep counts for
     val sizeOfMap = (1 / support).toInt
-    val countMaps = Seq.tabulate(numCols)(i => new FreqItemCounter(sizeOfMap))
 
-    val freqItems = df.select(cols.map(Column(_)) : _*).rdd.treeAggregate(countMaps)(
-      seqOp = (counts, row) => {
-        var i = 0
-        while (i < numCols) {
-          val thisMap = counts(i)
-          val key = row.get(i)
-          thisMap.add(key, 1L)
-          i += 1
+    val frequentItemCols = cols.map { col =>
+      Column(new CollectFrequentItems(expression(functions.col(col)), sizeOfMap))
+        .as(s"${col}_freqItems")
+    }
+
+    df.select(frequentItemCols: _*)
+  }
+}
+
+case class CollectFrequentItems(
+    child: Expression,
+    size: Int,
+    mutableAggBufferOffset: Int = 0,
+    inputAggBufferOffset: Int = 0) extends TypedImperativeAggregate[mutable.Map[Any, Long]]
+  with UnaryLike[Expression] {
+  require(size > 0)
+
+  def this(child: Expression, size: Int) = this(child, size, 0, 0)
+
+  // Returns empty array for empty inputs
+  override def nullable: Boolean = false
+
+  override def dataType: DataType = ArrayType(child.dataType, containsNull = child.nullable)
+
+  override def prettyName: String = "collect_frequent_items"
+
+  override def createAggregationBuffer(): mutable.Map[Any, Long] =
+    mutable.Map.empty[Any, Long]
+
+  /**
+   * Returns the map key for `value`. A binary value (BinaryType, or a UDT whose sqlType is
+   * BinaryType) is wrapped in a [[BinaryKey]] so that the map compares it by content; any other
+   * value is its own key.
+   */
+  private def toKey(value: Any): Any = value match {
+    case bytes: Array[Byte] => new BinaryKey(bytes)
+    case _ => value
+  }
+
+  /** Returns the value that a map key stands for: the inverse of `toKey`. */
+  private def fromKey(key: Any): Any = key match {
+    case binaryKey: BinaryKey => binaryKey.bytes
+    case _ => key
+  }
+
+  private def add(map: mutable.Map[Any, Long], key: Any, count: Long): mutable.Map[Any, Long] = {
+    map.get(key) match {
+      case Some(existing) =>
+        map(key) = existing + count
+      case None =>
+        if (map.size < size) {
+          map += key -> count
+        } else {
+          // Non-empty here: this branch runs only when map.size >= size, and size > 0.
+          val minCount = map.values.min
+          val remainder = count - minCount
+          if (remainder >= 0) {
+            map += key -> count // something will get kicked out, so we can add this
+            map.filterInPlace((k, v) => v > minCount)
+            map.mapValuesInPlace((k, v) => v - minCount)
+          } else {
+            map.mapValuesInPlace((k, v) => v - count)
+          }
         }
-        counts
-      },
-      combOp = (baseCounts, counts) => {
-        var i = 0
-        while (i < numCols) {
-          baseCounts(i).merge(counts(i))
-          i += 1
-        }
-        baseCounts
+    }
+    map
+  }
+
+  override def update(
+      buffer: mutable.Map[Any, Long],
+      input: InternalRow): mutable.Map[Any, Long] = {
+    val key = child.eval(input)
+    if (key != null) {
+      this.add(buffer, toKey(InternalRow.copyValue(key)), 1L)
+    } else {
+      this.add(buffer, key, 1L)
+    }
+  }
+
+  override def merge(
+      buffer: mutable.Map[Any, Long],
+      input: mutable.Map[Any, Long]): mutable.Map[Any, Long] = {
+    val otherIter = input.iterator
+    while (otherIter.hasNext) {
+      val (key, count) = otherIter.next()
+      add(buffer, key, count)
+    }
+    buffer
+  }
+
+  override def eval(buffer: mutable.Map[Any, Long]): Any =
+    new GenericArrayData(buffer.keys.iterator.map(fromKey).toArray[Any])
+
+  private lazy val projection =
+    UnsafeProjection.create(Array[DataType](child.dataType, LongType))
+
+  override def serialize(map: mutable.Map[Any, Long]): Array[Byte] = {
+    val buffer = new Array[Byte](4 << 10) // 4K
+    val bos = new ByteArrayOutputStream()
+    val out = new DataOutputStream(bos)
+    Utils.tryWithSafeFinally {
+      // Write pairs in counts map to byte buffer.
+      map.foreach { case (key, count) =>
+        val row = InternalRow.apply(fromKey(key), count)
+        val unsafeRow = projection.apply(row)
+        out.writeInt(unsafeRow.getSizeInBytes)
+        unsafeRow.writeToStream(out, buffer)
       }
-    )
-    val justItems = freqItems.map(m => m.baseMap.keys.toArray)
-    val resultRow = Row(justItems : _*)
+      out.writeInt(-1)
+      out.flush()
 
-    val outputCols = cols.map { name =>
-      val originalField = df.resolve(name)
+      bos.toByteArray
+    } {
+      out.close()
+      bos.close()
+    }
+  }
 
-      // append frequent Items to the column name for easy debugging
-      StructField(name + "_freqItems", ArrayType(originalField.dataType, originalField.nullable))
-    }.toArray
+  override def deserialize(bytes: Array[Byte]): mutable.Map[Any, Long] = {
+    val bis = new ByteArrayInputStream(bytes)
+    val ins = new DataInputStream(bis)
+    Utils.tryWithSafeFinally {
+      val map = mutable.Map.empty[Any, Long]
+      // Read unsafeRow size and content in bytes.
+      var sizeOfNextRow = ins.readInt()
+      while (sizeOfNextRow >= 0) {
+        val bs = new Array[Byte](sizeOfNextRow)
+        ins.readFully(bs)
+        val row = new UnsafeRow(2)
+        row.pointTo(bs, sizeOfNextRow)
+        // Insert the pairs into counts map.
+        val key = toKey(row.get(0, child.dataType))
+        val count = row.get(1, LongType).asInstanceOf[Long]
+        // A buffer serialized before binary keys compared by content can hold equal keys.
+        map.update(key, map.getOrElse(key, 0L) + count)
+        sizeOfNextRow = ins.readInt()
+      }
 
-    val schema = StructType(outputCols).toAttributes
-    Dataset.ofRows(df.sparkSession, LocalRelation.fromExternalRows(schema, Seq(resultRow)))
+      map
+    } {
+      ins.close()
+      bis.close()
+    }
+  }
+
+  override def withNewMutableAggBufferOffset(newMutableAggBufferOffset: Int): ImperativeAggregate =
+    copy(mutableAggBufferOffset = newMutableAggBufferOffset)
+
+  override def withNewInputAggBufferOffset(newInputAggBufferOffset: Int): ImperativeAggregate =
+    copy(inputAggBufferOffset = newInputAggBufferOffset)
+
+  override protected def withNewChildInternal(newChild: Expression): Expression =
+    copy(child = newChild)
+}
+
+/**
+ * A [[CollectFrequentItems]] map key for a BinaryType value. Java byte arrays use referential
+ * equality and identity hash codes, so this compares and hashes the bytes by content instead. It
+ * wraps the array without copying it.
+ */
+private final class BinaryKey(val bytes: Array[Byte]) {
+  // Computed once: adding a key hashes it twice, to look it up and then to update or insert it.
+  private[this] val hash =
+    Murmur3_x86_32.hashUnsafeBytes2(bytes, Platform.BYTE_ARRAY_OFFSET, bytes.length, 42)
+
+  override def hashCode(): Int = hash
+
+  override def equals(other: Any): Boolean = other match {
+    case that: BinaryKey => java.util.Arrays.equals(bytes, that.bytes)
+    case _ => false
   }
 }

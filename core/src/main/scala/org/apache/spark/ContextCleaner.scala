@@ -21,10 +21,11 @@ import java.lang.ref.{ReferenceQueue, WeakReference}
 import java.util.Collections
 import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue, ScheduledExecutorService, TimeUnit}
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys.{ACCUMULATOR_ID, BROADCAST_ID, LISTENER, RDD_ID, SHUFFLE_ID}
 import org.apache.spark.internal.config._
 import org.apache.spark.rdd.{RDD, ReliableRDDCheckpointData}
 import org.apache.spark.scheduler.SparkListener
@@ -128,8 +129,10 @@ private[spark] class ContextCleaner(
     cleaningThread.setDaemon(true)
     cleaningThread.setName("Spark Context Cleaner")
     cleaningThread.start()
-    periodicGCService.scheduleAtFixedRate(() => System.gc(),
-      periodicGCInterval, periodicGCInterval, TimeUnit.SECONDS)
+    if (periodicGCInterval > 0) {
+      periodicGCService.scheduleAtFixedRate(() => System.gc(),
+        periodicGCInterval, periodicGCInterval, TimeUnit.SECONDS)
+    }
   }
 
   /**
@@ -226,25 +229,81 @@ private[spark] class ContextCleaner(
       listeners.asScala.foreach(_.rddCleaned(rddId))
       logDebug("Cleaned RDD " + rddId)
     } catch {
-      case e: Exception => logError("Error cleaning RDD " + rddId, e)
+      case e: Exception => logError(log"Error cleaning RDD ${MDC(RDD_ID, rddId)}", e)
     }
   }
 
   /** Perform shuffle cleanup. */
   def doCleanupShuffle(shuffleId: Int, blocking: Boolean): Unit = {
     try {
+      // A shuffle lives in exactly one tracker, split by dependency type: a regular shuffle in the
+      // MapOutputTracker, a pipelined shuffle in the driver-only StreamingShuffleOutputTracker (see
+      // DAGScheduler.createShuffleMapStage). Clean up whichever holds it -- the two branches are
+      // independent, each keyed on its own tracker's membership, so neither depends on the other.
       if (mapOutputTrackerMaster.containsShuffle(shuffleId)) {
         logDebug("Cleaning shuffle " + shuffleId)
-        mapOutputTrackerMaster.unregisterShuffle(shuffleId)
+        // Shuffle must be removed before it's unregistered from the output tracker
+        // to find blocks served by the shuffle service on deallocated executors
         shuffleDriverComponents.removeShuffle(shuffleId, blocking)
+        mapOutputTrackerMaster.unregisterShuffle(shuffleId)
         listeners.asScala.foreach(_.shuffleCleaned(shuffleId))
         logDebug("Cleaned shuffle " + shuffleId)
+      } else if (streamingShuffleOutputTrackerMaster.exists(_.containsShuffle(shuffleId))) {
+        // A pipelined shuffle's output state is driver-only (the worker tracker caches nothing), so
+        // it is unregistered directly from the StreamingShuffleOutputTracker rather than the
+        // MapOutputTracker. Still call shuffleDriverComponents.removeShuffle to balance the
+        // registerShuffle that the ShuffleDependency constructor issues for EVERY shuffle (incl. a
+        // pipelined one): a custom components impl may track per-shuffle driver state that would
+        // otherwise leak. For the default impl this is just a RemoveShuffle RPC that finds no
+        // blocks (a pipelined shuffle has none), matching the regular branch's ordering.
+        logDebug("Cleaning pipelined shuffle " + shuffleId)
+        shuffleDriverComponents.removeShuffle(shuffleId, blocking)
+        streamingShuffleOutputTrackerMaster.foreach(_.unregisterShuffle(shuffleId))
+        listeners.asScala.foreach(_.shuffleCleaned(shuffleId))
+        logDebug("Cleaned pipelined shuffle " + shuffleId)
+      } else if (heldByTracklessPipelinedManager(shuffleId)) {
+        // The shuffle is in NEITHER tracker AND a pipelined manager that keeps no output tracker
+        // (PipelinedChannelShuffleManager.usesStreamingShuffleOutputTracker = false) reports that
+        // it holds this shuffle. An in-process pipelined shuffle registers with no tracker at all,
+        // so the two branches above miss it, yet its process-wide rendezvous queues
+        // (ChannelShuffleRendezvous) still need freeing. The removeShuffle call below issues a
+        // RemoveShuffle that routes to the manager's unregisterShuffle (via
+        // SparkEnv.unregisterShuffleFromAllManagers) -> ChannelShuffleRendezvous.removeShuffle,
+        // freeing the queues.
+        // This arm is gated on the manager actually HOLDING this shuffle id, not merely on the
+        // manager being tracker-less: an already-cleaned REGULAR shuffle also reaches this else
+        // (RDD.cleanShuffleDependencies unregisters it from the MapOutputTracker eagerly, then its
+        // later GC re-cleans it), even in a feature-ON session that runs regular shuffles too, and
+        // firing an extra cluster-wide RemoveShuffle RPC + shuffleCleaned callback for it would be
+        // a behavior change. Scoping to holdsShuffle keeps the new call on the pipelined path only.
+        logDebug("Cleaning tracker-less pipelined shuffle " + shuffleId)
+        shuffleDriverComponents.removeShuffle(shuffleId, blocking)
+        listeners.asScala.foreach(_.shuffleCleaned(shuffleId))
+        logDebug("Cleaned tracker-less pipelined shuffle " + shuffleId)
       } else {
         logDebug("Asked to cleanup non-existent shuffle (maybe it was already removed)")
       }
     } catch {
-      case e: Exception => logError("Error cleaning shuffle " + shuffleId, e)
+      case e: Exception => logError(log"Error cleaning shuffle ${MDC(SHUFFLE_ID, shuffleId)}", e)
     }
+  }
+
+  /**
+   * Whether a pipelined shuffle manager that keeps NO output tracker is configured AND the
+   * in-process rendezvous currently holds state for `shuffleId` -- the only case where a shuffle
+   * in neither tracker legitimately holds cleanup state (rendezvous queues / abandoned marks) that
+   * doCleanupShuffle's else arm must free. False for the default (no pipelined manager, or the RPC
+   * streaming manager, which registers in the streaming tracker), and false for a REGULAR shuffle
+   * in a feature-on session (never present in the rendezvous) -- so an already-cleaned shuffle
+   * reaching that else stays a no-op rather than firing a duplicate cluster-wide RemoveShuffle RPC.
+   *
+   * The manager answers `holdsShuffle` from the state that would leak rather than from a
+   * registration record -- see `PipelinedShuffleManager.holdsShuffle` -- so a shuffle unregistered
+   * before its job ran, whose state the run then recreated, is still freed here.
+   */
+  private def heldByTracklessPipelinedManager(shuffleId: Int): Boolean = {
+    val mgr = sc.env.pipelinedShuffleManager
+    mgr != null && !mgr.usesStreamingShuffleOutputTracker && mgr.holdsShuffle(shuffleId)
   }
 
   /** Perform broadcast cleanup. */
@@ -255,7 +314,8 @@ private[spark] class ContextCleaner(
       listeners.asScala.foreach(_.broadcastCleaned(broadcastId))
       logDebug(s"Cleaned broadcast $broadcastId")
     } catch {
-      case e: Exception => logError("Error cleaning broadcast " + broadcastId, e)
+      case e: Exception =>
+        logError(log"Error cleaning broadcast ${MDC(BROADCAST_ID, broadcastId)}", e)
     }
   }
 
@@ -267,7 +327,8 @@ private[spark] class ContextCleaner(
       listeners.asScala.foreach(_.accumCleaned(accId))
       logDebug("Cleaned accumulator " + accId)
     } catch {
-      case e: Exception => logError("Error cleaning accumulator " + accId, e)
+      case e: Exception =>
+        logError(log"Error cleaning accumulator ${MDC(ACCUMULATOR_ID, accId)}", e)
     }
   }
 
@@ -283,7 +344,8 @@ private[spark] class ContextCleaner(
       logDebug("Cleaned rdd checkpoint data " + rddId)
     }
     catch {
-      case e: Exception => logError("Error cleaning rdd checkpoint data " + rddId, e)
+      case e: Exception =>
+        logError(log"Error cleaning rdd checkpoint data ${MDC(RDD_ID, rddId)}", e)
     }
   }
 
@@ -293,12 +355,15 @@ private[spark] class ContextCleaner(
       sc.listenerBus.removeListener(listener)
       logDebug(s"Cleaned Spark listener $listener")
     } catch {
-      case e: Exception => logError(s"Error cleaning Spark listener $listener", e)
+      case e: Exception =>
+        logError(log"Error cleaning Spark listener ${MDC(LISTENER, listener)}", e)
     }
   }
 
   private def broadcastManager = sc.env.broadcastManager
   private def mapOutputTrackerMaster = sc.env.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster]
+  private def streamingShuffleOutputTrackerMaster: Option[StreamingShuffleOutputTrackerMaster] =
+    sc.env.streamingShuffleOutputTracker.map(_.asInstanceOf[StreamingShuffleOutputTrackerMaster])
 }
 
 private object ContextCleaner {

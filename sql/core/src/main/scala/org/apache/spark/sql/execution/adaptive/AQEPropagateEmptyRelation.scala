@@ -19,8 +19,12 @@ package org.apache.spark.sql.execution.adaptive
 
 import org.apache.spark.sql.catalyst.optimizer.PropagateEmptyRelationBase
 import org.apache.spark.sql.catalyst.planning.ExtractSingleColumnNullAwareAntiJoin
+import org.apache.spark.sql.catalyst.plans.logical.EmptyRelation
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.trees.TreePattern.{LOCAL_RELATION, LOGICAL_QUERY_STAGE, TRUE_OR_FALSE_LITERAL}
+import org.apache.spark.sql.execution.{BaseLimitExec, SortExec, SparkPlan}
+import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
+import org.apache.spark.sql.execution.exchange.{REPARTITION_BY_COL, REPARTITION_BY_NUM, ShuffleExchangeLike}
 import org.apache.spark.sql.execution.joins.HashedRelationWithAllNullKeys
 
 /**
@@ -32,14 +36,57 @@ import org.apache.spark.sql.execution.joins.HashedRelationWithAllNullKeys
  */
 object AQEPropagateEmptyRelation extends PropagateEmptyRelationBase {
   override protected def isEmpty(plan: LogicalPlan): Boolean =
-    super.isEmpty(plan) || getRowCount(plan).contains(0)
+    super.isEmpty(plan) || (!isRootRepartition(plan) && getEstimatedRowCount(plan).contains(0))
 
   override protected def nonEmpty(plan: LogicalPlan): Boolean =
-    super.nonEmpty(plan) || getRowCount(plan).exists(_ > 0)
+    super.nonEmpty(plan) || getEstimatedRowCount(plan).exists(_ > 0)
 
-  private def getRowCount(plan: LogicalPlan): Option[BigInt] = plan match {
-    case LogicalQueryStage(_, stage: QueryStageExec) if stage.isMaterialized =>
+  override protected def empty(plan: LogicalPlan): LogicalPlan = EmptyRelation(plan)
+
+  private def isRootRepartition(plan: LogicalPlan): Boolean = plan match {
+    case l: LogicalQueryStage if l.containsTag(ROOT_REPARTITION) => true
+    case _ => false
+  }
+
+  // The returned value follows:
+  //   - 0 means the plan must produce 0 row
+  //   - positive value means an estimated row count which can be over-estimated
+  //   - none means the plan has not materialized or the plan can not be estimated
+  private def getEstimatedRowCount(plan: LogicalPlan): Option[BigInt] = plan match {
+    case LogicalQueryStage(_, physicalPlan) =>
+      getEstimatedRowCount(physicalPlan)
+
+    case _: EmptyRelation => Some(0)
+
+    case _ => None
+  }
+
+  private def getEstimatedRowCount(plan: SparkPlan): Option[BigInt] = plan match {
+    case stage: QueryStageExec if stage.isMaterialized =>
       stage.getRuntimeStatistics.rowCount
+
+    case sort: SortExec =>
+      getEstimatedRowCount(sort.child)
+
+    // A global limit can also drop rows through an offset, so only propagate
+    // proven emptiness; a zero limit is unconditionally empty.
+    case limit: BaseLimitExec =>
+      if (limit.limit == 0) {
+        Some(BigInt(0))
+      } else {
+        getEstimatedRowCount(limit.child).filter(_ == 0)
+      }
+
+    // Match the global-aggregate invariant in LogicalQueryStage.computeStats without adopting
+    // its logical-statistics fallback or its unrestricted physical-plan traversal.
+    case aggregate: BaseAggregateExec if aggregate.groupingExpressions.isEmpty =>
+      getEstimatedRowCount(aggregate.child).map { rowCount =>
+        if (rowCount == 0) BigInt(1) else rowCount
+      }
+
+    case aggregate: BaseAggregateExec =>
+      getEstimatedRowCount(aggregate.child)
+
     case _ => None
   }
 
@@ -54,7 +101,21 @@ object AQEPropagateEmptyRelation extends PropagateEmptyRelationBase {
       empty(j)
   }
 
-  def apply(plan: LogicalPlan): LogicalPlan = plan.transformUpWithPruning(
+  override protected def userSpecifiedRepartition(p: LogicalPlan): Boolean = p match {
+    case LogicalQueryStage(_, ShuffleQueryStageExec(_, shuffle: ShuffleExchangeLike, _))
+      if shuffle.shuffleOrigin == REPARTITION_BY_COL ||
+        shuffle.shuffleOrigin == REPARTITION_BY_NUM => true
+    case _ => false
+  }
+
+  // A broadcast query stage can't be executed without the join operator.
+  // TODO: we can return the original query plan before broadcast.
+  override protected def canExecuteWithoutJoin(plan: LogicalPlan): Boolean = plan match {
+    case LogicalQueryStage(_, _: BroadcastQueryStageExec) => false
+    case _ => true
+  }
+
+  override protected def applyInternal(p: LogicalPlan): LogicalPlan = p.transformUpWithPruning(
     // LOCAL_RELATION and TRUE_OR_FALSE_LITERAL pattern are matched at
     // `PropagateEmptyRelationBase.commonApplyFunc`
     // LOGICAL_QUERY_STAGE pattern is matched at `PropagateEmptyRelationBase.commonApplyFunc`

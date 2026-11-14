@@ -18,11 +18,11 @@ import time
 import unittest
 
 from pyspark import StorageLevel
-from pyspark.streaming.kinesis import KinesisUtils, InitialPositionInStream
+from pyspark.streaming.kinesis import InitialPositionInStream, KinesisUtils, MetricsLevel
 from pyspark.testing.streamingutils import (
-    should_test_kinesis,
-    kinesis_requirement_message,
     PySparkStreamingTestCase,
+    kinesis_requirement_message,
+    should_test_kinesis,
 )
 
 
@@ -38,6 +38,7 @@ class KinesisStreamTests(PySparkStreamingTestCase):
             "us-west-2",
             InitialPositionInStream.LATEST,
             2,
+            MetricsLevel.DETAILED,
             StorageLevel.MEMORY_AND_DISK_2,
         )
         KinesisUtils.createStream(
@@ -48,6 +49,7 @@ class KinesisStreamTests(PySparkStreamingTestCase):
             "us-west-2",
             InitialPositionInStream.LATEST,
             2,
+            MetricsLevel.DETAILED,
             StorageLevel.MEMORY_AND_DISK_2,
             "awsAccessKey",
             "awsSecretKey",
@@ -69,6 +71,7 @@ class KinesisStreamTests(PySparkStreamingTestCase):
                 kinesisTestUtils.regionName(),
                 InitialPositionInStream.LATEST,
                 10,
+                MetricsLevel.DETAILED,
                 StorageLevel.MEMORY_ONLY,
                 aWSCredentials.getAWSAccessKeyId(),
                 aWSCredentials.getAWSSecretKey(),
@@ -92,7 +95,7 @@ class KinesisStreamTests(PySparkStreamingTestCase):
                     break
                 time.sleep(10)
             self.assertEqual(expectedOutput, set(outputBuffer))
-        except:
+        except BaseException:
             import traceback
 
             traceback.print_exc()
@@ -104,12 +107,6 @@ class KinesisStreamTests(PySparkStreamingTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.streaming.tests.test_kinesis import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

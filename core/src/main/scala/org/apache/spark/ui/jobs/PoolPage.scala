@@ -17,9 +17,9 @@
 
 package org.apache.spark.ui.jobs
 
-import javax.servlet.http.HttpServletRequest
-
 import scala.xml.Node
+
+import jakarta.servlet.http.HttpServletRequest
 
 import org.apache.spark.status.PoolData
 import org.apache.spark.ui.{UIUtils, WebUIPage}
@@ -44,21 +44,23 @@ private[ui] class PoolPage(parent: StagesTab) extends WebUIPage("pool") {
     val activeStages = uiPool.stageIds.toSeq.map(parent.store.lastStageAttempt(_))
     val activeStagesTable =
       new StageTableBase(parent.store, request, activeStages, "", "activeStage", parent.basePath,
-        "stages/pool", parent.isFairScheduler, parent.killEnabled, false)
+        "stages/pool", parent.isFairScheduler, parent.killEnabled, false,
+        parent.actionsViaGetEnabled, parent.csrfToken)
 
     val poolTable = new PoolTable(Map(pool -> uiPool), parent)
     var content = <h4>Summary </h4> ++ poolTable.toNodeSeq(request)
     if (activeStages.nonEmpty) {
       content ++=
-        <span class="collapse-aggregated-poolActiveStages collapse-table"
-            onClick="collapseTable('collapse-aggregated-poolActiveStages',
-            'aggregated-poolActiveStages')">
+        <span class="collapse-table" data-bs-toggle="collapse"
+            data-bs-target="#aggregated-poolActiveStages"
+            aria-expanded="true" aria-controls="aggregated-poolActiveStages"
+            data-collapse-name="collapse-aggregated-poolActiveStages">
           <h4>
             <span class="collapse-table-arrow arrow-open"></span>
             <a>Active Stages ({activeStages.size})</a>
           </h4>
         </span> ++
-        <div class="aggregated-poolActiveStages collapsible-table">
+        <div class="collapsible-table collapse show" id="aggregated-poolActiveStages">
           {activeStagesTable.toNodeSeq}
         </div>
     }

@@ -21,17 +21,20 @@ import java.nio.ByteBuffer
 
 import com.google.common.primitives.{Doubles, Ints, Longs}
 
+import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.{FunctionRegistry, TypeCheckResult}
-import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.{TypeCheckFailure, TypeCheckSuccess}
+import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.{DataTypeMismatch, TypeCheckSuccess}
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.expressions.Cast._
 import org.apache.spark.sql.catalyst.expressions.aggregate.ApproximatePercentile.PercentileDigest
 import org.apache.spark.sql.catalyst.trees.TernaryLike
+import org.apache.spark.sql.catalyst.types.PhysicalNumericType
 import org.apache.spark.sql.catalyst.util.{ArrayData, GenericArrayData}
 import org.apache.spark.sql.catalyst.util.QuantileSummaries
 import org.apache.spark.sql.catalyst.util.QuantileSummaries.{defaultCompressThreshold, Stats}
-import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.types._
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * The ApproximatePercentile function returns the approximate percentile(s) of a column at the given
@@ -52,8 +55,8 @@ import org.apache.spark.sql.types._
 // scalastyle:off line.size.limit
 @ExpressionDescription(
   usage = """
-    _FUNC_(col, percentage [, accuracy]) - Returns the approximate `percentile` of the numeric or
-      ansi interval column `col` which is the smallest value in the ordered `col` values (sorted
+    _FUNC_(col, percentage [, accuracy]) - Returns the approximate `percentile` of the numeric,
+      ansi interval or TIME column `col` which is the smallest value in the ordered `col` values (sorted
       from least to greatest) such that no more than `percentage` of `col` values is less than
       the value or equal to that value. The value of percentage must be between 0.0 and 1.0.
       The `accuracy` parameter (default: 10000) is a positive numeric literal which controls
@@ -62,6 +65,16 @@ import org.apache.spark.sql.types._
       When `percentage` is an array, each value of the percentage array must be between 0.0 and 1.0.
       In this case, returns the approximate percentile array of column `col` at the given
       percentage array.
+  """,
+  arguments = """
+    Arguments:
+      * col - The numeric, ANSI interval or TIME column whose percentile is
+          computed.
+      * percentage - A value (or array of values) between 0.0 and 1.0 specifying
+          the percentile(s) to compute.
+      * accuracy - Optional. A positive numeric literal (default: 10000) that
+          controls approximation accuracy at the cost of memory. Higher values
+          yield better accuracy; `1.0/accuracy` is the relative error.
   """,
   examples = """
     Examples:
@@ -95,13 +108,14 @@ case class ApproximatePercentile(
   }
 
   // Mark as lazy so that accuracyExpression is not evaluated during tree transformation.
-  private lazy val accuracy: Long = accuracyExpression.eval().asInstanceOf[Number].longValue
+  private lazy val accuracyNum = accuracyExpression.eval().asInstanceOf[Number]
+  private lazy val accuracy: Long = accuracyNum.longValue
 
   override def inputTypes: Seq[AbstractDataType] = {
-    // Support NumericType, DateType, TimestampType and TimestampNTZType since their internal types
-    // are all numeric, and can be easily cast to double for processing.
+    // Support NumericType, DateType, TimestampType, TimestampNTZType and TimeType since their
+    // internal types are all numeric, and can be easily cast to double for processing.
     Seq(TypeCollection(NumericType, DateType, TimestampType, TimestampNTZType,
-      YearMonthIntervalType, DayTimeIntervalType),
+      YearMonthIntervalType, DayTimeIntervalType, AnyTimeType),
       TypeCollection(DoubleType, ArrayType(DoubleType, containsNull = false)), IntegralType)
   }
 
@@ -118,17 +132,50 @@ case class ApproximatePercentile(
     val defaultCheck = super.checkInputDataTypes()
     if (defaultCheck.isFailure) {
       defaultCheck
-    } else if (!percentageExpression.foldable || !accuracyExpression.foldable) {
-      TypeCheckFailure(s"The accuracy or percentage provided must be a constant literal")
+    } else if (!percentageExpression.foldable) {
+      DataTypeMismatch(
+        errorSubClass = "NON_FOLDABLE_INPUT",
+        messageParameters = Map(
+          "inputName" -> toSQLId("percentage"),
+          "inputType" -> toSQLType(percentageExpression.dataType),
+          "inputExpr" -> toSQLExpr(percentageExpression)
+        )
+      )
+    } else if (!accuracyExpression.foldable) {
+      DataTypeMismatch(
+        errorSubClass = "NON_FOLDABLE_INPUT",
+        messageParameters = Map(
+          "inputName" -> toSQLId("accuracy"),
+          "inputType" -> toSQLType(accuracyExpression.dataType),
+          "inputExpr" -> toSQLExpr(accuracyExpression)
+        )
+      )
+    } else if (accuracyNum == null) {
+      DataTypeMismatch(
+        errorSubClass = "UNEXPECTED_NULL",
+        messageParameters = Map("exprName" -> "accuracy"))
     } else if (accuracy <= 0 || accuracy > Int.MaxValue) {
-      TypeCheckFailure(s"The accuracy provided must be a literal between (0, ${Int.MaxValue}]" +
-        s" (current value = $accuracy)")
+      DataTypeMismatch(
+        errorSubClass = "VALUE_OUT_OF_RANGE",
+        messageParameters = Map(
+          "exprName" -> "accuracy",
+          "valueRange" -> s"(0, ${Int.MaxValue}]",
+          "currentValue" -> toSQLValue(accuracy, LongType)
+        )
+      )
     } else if (percentages == null) {
-      TypeCheckFailure("Percentage value must not be null")
+      DataTypeMismatch(
+        errorSubClass = "UNEXPECTED_NULL",
+        messageParameters = Map("exprName" -> "percentage"))
     } else if (percentages.exists(percentage => percentage < 0.0D || percentage > 1.0D)) {
-      TypeCheckFailure(
-        s"All percentage values must be between 0.0 and 1.0 " +
-          s"(current = ${percentages.mkString(", ")})")
+      DataTypeMismatch(
+        errorSubClass = "VALUE_OUT_OF_RANGE",
+        messageParameters = Map(
+          "exprName" -> "percentage",
+          "valueRange" -> "[0.0, 1.0]",
+          "currentValue" -> percentages.map(toSQLValue(_, DoubleType)).mkString(",")
+        )
+      )
     } else {
       TypeCheckSuccess
     }
@@ -146,11 +193,13 @@ case class ApproximatePercentile(
       // Convert the value to a double value
       val doubleValue = child.dataType match {
         case DateType | _: YearMonthIntervalType => value.asInstanceOf[Int].toDouble
-        case TimestampType | TimestampNTZType | _: DayTimeIntervalType =>
+        case TimestampType | TimestampNTZType | _: DayTimeIntervalType | _: TimeType =>
           value.asInstanceOf[Long].toDouble
-        case n: NumericType => n.numeric.toDouble(value.asInstanceOf[n.InternalType])
+        case n: NumericType =>
+          PhysicalNumericType.numeric(n)
+            .toDouble(value.asInstanceOf[PhysicalNumericType#InternalType])
         case other: DataType =>
-          throw QueryExecutionErrors.dataTypeUnexpectedError(other)
+          throw SparkException.internalError(s"Unexpected data type $other")
       }
       buffer.add(doubleValue)
     }
@@ -166,7 +215,8 @@ case class ApproximatePercentile(
     val doubleResult = buffer.getPercentiles(percentages)
     val result = child.dataType match {
       case DateType | _: YearMonthIntervalType => doubleResult.map(_.toInt)
-      case TimestampType | TimestampNTZType | _: DayTimeIntervalType => doubleResult.map(_.toLong)
+      case TimestampType | TimestampNTZType | _: DayTimeIntervalType | _: TimeType =>
+        doubleResult.map(_.toLong)
       case ByteType => doubleResult.map(_.toByte)
       case ShortType => doubleResult.map(_.toShort)
       case IntegerType => doubleResult.map(_.toInt)
@@ -175,7 +225,7 @@ case class ApproximatePercentile(
       case DoubleType => doubleResult
       case _: DecimalType => doubleResult.map(Decimal(_))
       case other: DataType =>
-        throw QueryExecutionErrors.dataTypeUnexpectedError(other)
+        throw SparkException.internalError(s"Unexpected data type $other")
     }
     if (result.length == 0) {
       null
@@ -272,9 +322,9 @@ object ApproximatePercentile {
     def getPercentiles(percentages: Array[Double]): Seq[Double] = {
       if (!isCompressed) compress()
       if (summaries.count == 0 || percentages.length == 0) {
-        Array.emptyDoubleArray
+        Array.emptyDoubleArray.toImmutableArraySeq
       } else {
-        summaries.query(percentages).get
+        summaries.query(percentages.toImmutableArraySeq).get
       }
     }
 

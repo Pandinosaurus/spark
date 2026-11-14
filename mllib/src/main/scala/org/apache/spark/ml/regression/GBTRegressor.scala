@@ -21,19 +21,21 @@ import org.json4s.{DefaultFormats, JObject}
 import org.json4s.JsonDSL._
 
 import org.apache.spark.annotation.Since
-import org.apache.spark.internal.Logging
-import org.apache.spark.ml.linalg.{BLAS, Vector}
+import org.apache.spark.internal.{Logging, LogKeys}
+import org.apache.spark.ml.linalg.Vector
 import org.apache.spark.ml.param.ParamMap
 import org.apache.spark.ml.tree._
 import org.apache.spark.ml.tree.impl.GradientBoostedTrees
 import org.apache.spark.ml.util._
+import org.apache.spark.ml.util.DatasetUtils.extractInstances
 import org.apache.spark.ml.util.DefaultParamsReader.Metadata
 import org.apache.spark.ml.util.Instrumentation.instrumented
 import org.apache.spark.mllib.tree.configuration.{Algo => OldAlgo}
 import org.apache.spark.mllib.tree.model.{GradientBoostedTreesModel => OldGBTModel}
-import org.apache.spark.sql.{Column, DataFrame, Dataset}
+import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.storage.StorageLevel
 
 /**
  * <a href="http://en.wikipedia.org/wiki/Gradient_boosting">Gradient-Boosted Trees (GBTs)</a>
@@ -104,6 +106,10 @@ class GBTRegressor @Since("1.4.0") (@Since("1.4.0") override val uid: String)
   @Since("1.4.0")
   def setCheckpointInterval(value: Int): this.type = set(checkpointInterval, value)
 
+  /** @group expertSetParam */
+  @Since("4.4.0")
+  def setIntermediateStorageLevel(value: String): this.type = set(intermediateStorageLevel, value)
+
   /**
    * The impurity setting is ignored for GBT models.
    * Individual trees are built using impurity "Variance."
@@ -165,12 +171,11 @@ class GBTRegressor @Since("1.4.0") (@Since("1.4.0") override val uid: String)
 
   override protected def train(dataset: Dataset[_]): GBTRegressionModel = instrumented { instr =>
     val withValidation = isDefined(validationIndicatorCol) && $(validationIndicatorCol).nonEmpty
-
     val (trainDataset, validationDataset) = if (withValidation) {
-      (extractInstances(dataset.filter(not(col($(validationIndicatorCol))))),
-        extractInstances(dataset.filter(col($(validationIndicatorCol)))))
+      (extractInstances(this, dataset.filter(not(col($(validationIndicatorCol))))),
+        extractInstances(this, dataset.filter(col($(validationIndicatorCol)))))
     } else {
-      (extractInstances(dataset), null)
+      (extractInstances(this, dataset), null)
     }
 
     instr.logPipelineStage(this)
@@ -178,16 +183,17 @@ class GBTRegressor @Since("1.4.0") (@Since("1.4.0") override val uid: String)
     instr.logParams(this, labelCol, featuresCol, predictionCol, leafCol, weightCol, impurity,
       lossType, maxDepth, maxBins, maxIter, maxMemoryInMB, minInfoGain, minInstancesPerNode,
       minWeightFractionPerNode, seed, stepSize, subsamplingRate, cacheNodeIds, checkpointInterval,
-      featureSubsetStrategy, validationIndicatorCol, validationTol)
+      featureSubsetStrategy, validationIndicatorCol, validationTol, intermediateStorageLevel)
 
     val categoricalFeatures = MetadataUtils.getCategoricalFeatures(dataset.schema($(featuresCol)))
     val boostingStrategy = super.getOldBoostingStrategy(categoricalFeatures, OldAlgo.Regression)
+    val storageLevel = StorageLevel.fromString($(intermediateStorageLevel))
     val (baseLearners, learnerWeights) = if (withValidation) {
       GradientBoostedTrees.runWithValidation(trainDataset, validationDataset, boostingStrategy,
-        $(seed), $(featureSubsetStrategy), Some(instr))
+        $(seed), $(featureSubsetStrategy), Some(instr), storageLevel)
     } else {
       GradientBoostedTrees.run(trainDataset, boostingStrategy,
-        $(seed), $(featureSubsetStrategy), Some(instr))
+        $(seed), $(featureSubsetStrategy), Some(instr), storageLevel)
     }
     baseLearners.foreach(copyValues(_))
 
@@ -242,6 +248,11 @@ class GBTRegressionModel private[ml](
   def this(uid: String, _trees: Array[DecisionTreeRegressionModel], _treeWeights: Array[Double]) =
     this(uid, _trees, _treeWeights, -1)
 
+  // For ml connect only
+  private[ml] def this() = this("", Array(new DecisionTreeRegressionModel), Array(Double.NaN), -1)
+
+  private[spark] override def estimatedSize: Long = estimateMatadataSize + getEstimatedSize()
+
   @Since("1.4.0")
   override def trees: Array[DecisionTreeRegressionModel] = _trees
 
@@ -266,40 +277,41 @@ class GBTRegressionModel private[ml](
   override def transform(dataset: Dataset[_]): DataFrame = {
     val outputSchema = transformSchema(dataset.schema, logging = true)
 
-    var predictionColNames = Seq.empty[String]
-    var predictionColumns = Seq.empty[Column]
+    if ($(predictionCol).nonEmpty || $(leafCol).nonEmpty) {
+      var predColNames = Seq.empty[String]
+      var predCols = Seq.empty[Column]
+      val bcTreeData = dataset.sparkSession.sparkContext.broadcast(
+        (_trees.map(_.rootNode), _treeWeights.clone()))
 
-    val bcastModel = dataset.sparkSession.sparkContext.broadcast(this)
+      if ($(predictionCol).nonEmpty) {
+        val predUDF = udf { features: Vector =>
+          val (rootNodes, treeWeights) = bcTreeData.value
+          TreeEnsembleModel.predictRaw(features, rootNodes, treeWeights)
+        }
+        predColNames :+= $(predictionCol)
+        predCols :+= predUDF(col($(featuresCol)))
+          .as($(predictionCol), outputSchema($(predictionCol)).metadata)
+      }
 
-    if ($(predictionCol).nonEmpty) {
-      val predictUDF = udf { features: Vector => bcastModel.value.predict(features) }
-      predictionColNames :+= $(predictionCol)
-      predictionColumns :+= predictUDF(col($(featuresCol)))
-        .as($(featuresCol), outputSchema($(featuresCol)).metadata)
-    }
+      if ($(leafCol).nonEmpty) {
+        val leafUDF = udf { features: Vector =>
+          TreeEnsembleModel.predictLeaf(features, bcTreeData.value._1)
+        }
+        predColNames :+= $(leafCol)
+        predCols :+= leafUDF(col($(featuresCol)))
+          .as($(leafCol), outputSchema($(leafCol)).metadata)
+      }
 
-    if ($(leafCol).nonEmpty) {
-      val leafUDF = udf { features: Vector => bcastModel.value.predictLeaf(features) }
-      predictionColNames :+= $(leafCol)
-      predictionColumns :+= leafUDF(col($(featuresCol)))
-        .as($(leafCol), outputSchema($(leafCol)).metadata)
-    }
-
-    if (predictionColNames.nonEmpty) {
-      dataset.withColumns(predictionColNames, predictionColumns)
+      dataset.withColumns(predColNames, predCols)
     } else {
-      this.logWarning(s"$uid: GBTRegressionModel.transform() does nothing" +
-        " because no output columns were set.")
+      this.logWarning(log"${MDC(LogKeys.UUID, uid)}: GBTRegressionModel.transform() " +
+        log"does nothing because no output columns were set.")
       dataset.toDF()
     }
   }
 
-  override def predict(features: Vector): Double = {
-    // TODO: When we add a generic Boosting class, handle transform there?  SPARK-7129
-    // Classifies by thresholding sum of weighted tree predictions
-    val treePredictions = _trees.map(_.rootNode.predictImpl(features).prediction)
-    BLAS.nativeBLAS.ddot(getNumTrees, treePredictions, 1, _treeWeights, 1)
-  }
+  override def predict(features: Vector): Double =
+    TreeEnsembleModel.predictRaw(features, _trees, _treeWeights)
 
   @Since("1.4.0")
   override def copy(extra: ParamMap): GBTRegressionModel = {
@@ -339,7 +351,7 @@ class GBTRegressionModel private[ml](
    */
   @Since("2.4.0")
   def evaluateEachIteration(dataset: Dataset[_], loss: String): Array[Double] = {
-    val data = extractInstances(dataset)
+    val data = extractInstances(this, dataset)
     GradientBoostedTrees.evaluateEachIteration(data, trees, treeWeights,
       convertToOldLossType(loss), OldAlgo.Regression)
   }

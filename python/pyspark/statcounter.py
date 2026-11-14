@@ -19,18 +19,24 @@
 
 import copy
 import math
-from typing import Dict, Iterable, Optional
-
-try:
-    from numpy import maximum, minimum, sqrt
-except ImportError:
-    maximum = max  # type: ignore[assignment]
-    minimum = min  # type: ignore[assignment]
-    sqrt = math.sqrt  # type: ignore[assignment]
+from typing import Callable, Dict, Iterable, Optional
 
 
-class StatCounter(object):
+class StatCounter:
     def __init__(self, values: Optional[Iterable[float]] = None):
+        maximum: Callable[[float, float], float]
+        minimum: Callable[[float, float], float]
+        sqrt: Callable[[float], float]
+        try:
+            from numpy import maximum, minimum, sqrt
+        except ImportError:
+            maximum = max
+            minimum = min
+            sqrt = math.sqrt
+
+        self.maximum = maximum
+        self.minimum = minimum
+        self.sqrt = sqrt
         if values is None:
             values = list()
         self.n = 0  # Running count of our values
@@ -48,8 +54,8 @@ class StatCounter(object):
         self.n += 1
         self.mu += delta / self.n
         self.m2 += delta * (value - self.mu)
-        self.maxValue = maximum(self.maxValue, value)
-        self.minValue = minimum(self.minValue, value)
+        self.maxValue = self.maximum(self.maxValue, value)
+        self.minValue = self.minimum(self.minValue, value)
 
         return self
 
@@ -77,8 +83,8 @@ class StatCounter(object):
                 else:
                     self.mu = (self.mu * self.n + other.mu * other.n) / (self.n + other.n)
 
-                self.maxValue = maximum(self.maxValue, other.maxValue)
-                self.minValue = minimum(self.minValue, other.minValue)
+                self.maxValue = self.maximum(self.maxValue, other.maxValue)
+                self.minValue = self.minimum(self.minValue, other.minValue)
 
                 self.m2 += other.m2 + (delta * delta * self.n * other.n) / (self.n + other.n)
                 self.n += other.n
@@ -122,14 +128,14 @@ class StatCounter(object):
 
     # Return the standard deviation of the values.
     def stdev(self) -> float:
-        return sqrt(self.variance())
+        return self.sqrt(self.variance())
 
     #
     # Return the sample standard deviation of the values, which corrects for bias in estimating the
     # variance by dividing by N-1 instead of N.
     #
     def sampleStdev(self) -> float:
-        return sqrt(self.sampleVariance())
+        return self.sqrt(self.sampleVariance())
 
     def asDict(self, sample: bool = False) -> Dict[str, float]:
         """Returns the :class:`StatCounter` members as a ``dict``.

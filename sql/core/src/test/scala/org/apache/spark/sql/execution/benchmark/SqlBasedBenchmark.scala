@@ -17,7 +17,10 @@
 
 package org.apache.spark.sql.execution.benchmark
 
+import scala.concurrent.duration._
+
 import org.apache.spark.benchmark.{Benchmark, BenchmarkBase}
+import org.apache.spark.internal.config.MAX_RESULT_SIZE
 import org.apache.spark.internal.config.UI.UI_ENABLED
 import org.apache.spark.sql.{Dataset, SparkSession}
 import org.apache.spark.sql.SaveMode.Overwrite
@@ -41,20 +44,46 @@ trait SqlBasedBenchmark extends BenchmarkBase with SQLHelper {
       .config(SQLConf.SHUFFLE_PARTITIONS.key, 1)
       .config(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key, 1)
       .config(UI_ENABLED.key, false)
+      .config(MAX_RESULT_SIZE.key, "3g")
       .getOrCreate()
   }
 
-  /** Runs function `f` with whole stage codegen on and off. */
-  final def codegenBenchmark(name: String, cardinality: Long)(f: => Unit): Unit = {
-    val benchmark = new Benchmark(name, cardinality, output = output)
+  /**
+   * Runs function `f` with whole stage codegen on and off.
+   *
+   * @param minNumIters minimum timed iterations per case when the corresponding
+   *        `wholestageOffNumIters` or `wholestageOnNumIters` is zero.
+   * @param warmupTime JIT warm-up duration per case before timed iterations.
+   * @param minTime minimum total timed duration per case when the corresponding
+   *        `wholestageOffNumIters` or `wholestageOnNumIters` is zero.
+   * @param wholestageOffNumIters if non-zero, run exactly this many timed iterations
+   *        for the wholestage-off case; otherwise use `minNumIters` and `minTime`.
+   * @param wholestageOnNumIters if non-zero, run exactly this many timed iterations
+   *        for the wholestage-on case; otherwise use `minNumIters` and `minTime`.
+   */
+  final def codegenBenchmark(
+      name: String,
+      cardinality: Long,
+      minNumIters: Int = 2,
+      warmupTime: FiniteDuration = 2.seconds,
+      minTime: FiniteDuration = 2.seconds,
+      wholestageOffNumIters: Int = 2,
+      wholestageOnNumIters: Int = 5)(f: => Unit): Unit = {
+    val benchmark = new Benchmark(
+      name,
+      cardinality,
+      minNumIters = minNumIters,
+      warmupTime = warmupTime,
+      minTime = minTime,
+      output = output)
 
-    benchmark.addCase(s"$name wholestage off", numIters = 2) { _ =>
+    benchmark.addCase(s"$name wholestage off", numIters = wholestageOffNumIters) { _ =>
       withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false") {
         f
       }
     }
 
-    benchmark.addCase(s"$name wholestage on", numIters = 5) { _ =>
+    benchmark.addCase(s"$name wholestage on", numIters = wholestageOnNumIters) { _ =>
       withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
         f
       }

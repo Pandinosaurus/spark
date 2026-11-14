@@ -21,26 +21,48 @@ import java.util.Locale
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.io.SequenceFile.CompressionType
-import org.apache.hadoop.io.compress._
+import org.apache.hadoop.io.compress.{SplittableCompressionCodec, ZStandardCodec}
 
+import org.apache.spark.io.HadoopCodecStreams
+import org.apache.spark.sql.errors.QueryExecutionErrors
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.Utils
 
 object CompressionCodecs {
-  private val shortCompressionCodecNames = Map(
-    "none" -> null,
-    "uncompressed" -> null,
-    "bzip2" -> classOf[BZip2Codec].getName,
-    "deflate" -> classOf[DeflateCodec].getName,
-    "gzip" -> classOf[GzipCodec].getName,
-    "lz4" -> classOf[Lz4Codec].getName,
-    "snappy" -> classOf[SnappyCodec].getName)
+  private val shortCompressionCodecNames = HadoopCompressionCodec.values().map { codec =>
+    codec.lowerCaseName() -> Option(codec.getCompressionCodec).map(_.getClass.getName).orNull
+  }.toMap
+
+  // Read-side short names extend the write-side set with Zstandard, which file-format writers do
+  // not support yet (see the TODO in `HadoopCompressionCodec`) but readers do, via Spark's
+  // built-in Zstandard codec when Hadoop lacks native support (see `HadoopCodecStreams`). `zst`,
+  // the most common Zstandard file suffix, is accepted as well.
+  private val readShortCompressionCodecNames = shortCompressionCodecNames ++ Map(
+    "zstd" -> classOf[ZStandardCodec].getName,
+    "zstandard" -> classOf[ZStandardCodec].getName,
+    "zst" -> classOf[ZStandardCodec].getName)
 
   /**
    * Return the full version of the given codec class.
    * If it is already a class name, just return it.
    */
   def getCodecClassName(name: String): String = {
-    val codecName = shortCompressionCodecNames.getOrElse(name.toLowerCase(Locale.ROOT), name)
+    getCodecClassName(name, shortCompressionCodecNames)
+  }
+
+  /**
+   * Read-side counterpart of [[getCodecClassName]]. Accepts the same short names plus `zstd` /
+   * `zstandard`, since the file readers can decompress Zstandard even though the writers cannot
+   * produce it. Used to parse the `decompression` option.
+   */
+  def getReadCodecClassName(name: String): String = {
+    getCodecClassName(name, readShortCompressionCodecNames)
+  }
+
+  private def getCodecClassName(
+      name: String,
+      shortNames: Map[String, String]): String = {
+    val codecName = shortNames.getOrElse(name.toLowerCase(Locale.ROOT), name)
     try {
       // Validate the codec name
       if (codecName != null) {
@@ -48,9 +70,9 @@ object CompressionCodecs {
       }
       codecName
     } catch {
-      case e: ClassNotFoundException =>
-        throw new IllegalArgumentException(s"Codec [$codecName] " +
-          s"is not available. Known codecs are ${shortCompressionCodecNames.keys.mkString(", ")}.")
+      case _: ClassNotFoundException =>
+        throw QueryExecutionErrors.codecNotAvailableError(
+          codecName, shortNames.keys.mkString(", "))
     }
   }
 
@@ -70,5 +92,43 @@ object CompressionCodecs {
       conf.set("mapreduce.output.fileoutputformat.compress", "false")
       conf.set("mapreduce.map.output.compress", "false")
     }
+  }
+
+  /**
+   * Records the codec requested via the `decompression` data source option into the Hadoop
+   * `Configuration`, so the file readers decompress with it instead of inferring the codec from
+   * the file name extension (see [[HadoopCodecStreams.getDecompressionCodec]]). Called on the
+   * driver while planning the read, so an unsupported setup fails before any task runs.
+   *
+   * @param decompressionCodec the parsed `decompression` option: `None` when absent (unset
+   *                           the conf so the codec is inferred from the extension),
+   *                           `Some(null)` for `none`/`uncompressed` (read the file as-is), or
+   *                           `Some(className)` to force that codec.
+   */
+  def setReadCodecConfiguration(
+      conf: Configuration,
+      decompressionCodec: Option[String]): Unit = decompressionCodec match {
+    case Some(codec) =>
+      // Hadoop's `LineRecordReader` infers the codec from the file name extension and cannot be
+      // told otherwise, so fail rather than silently ignore the option.
+      if (!SQLConf.get.hadoopLineRecordReaderEnabled) {
+        throw QueryExecutionErrors.decompressionCodecWithLegacyLineReaderError()
+      }
+      // An empty string encodes "no compression" (read as-is); a class name selects that codec.
+      conf.set(HadoopCodecStreams.DECOMPRESSION_CODEC_CONF, Option(codec).getOrElse(""))
+    case None =>
+      // Unset rather than leave untouched, so a value inherited from the session or Hadoop
+      // configuration cannot override the codec of a read that did not ask for it.
+      conf.unset(HadoopCodecStreams.DECOMPRESSION_CODEC_CONF)
+  }
+
+  /**
+   * Whether files decompressed with the given parsed `decompression` value can be split into
+   * multiple partitions: `null` (`none`/`uncompressed`) reads the raw file and stays splittable,
+   * and a codec class is splittable only if it is a `SplittableCompressionCodec` (e.g. bzip2).
+   */
+  def isSplittableReadCodec(codec: String): Boolean = {
+    codec == null ||
+      classOf[SplittableCompressionCodec].isAssignableFrom(Utils.classForName(codec))
   }
 }

@@ -17,16 +17,19 @@
 
 package org.apache.spark.ml.feature
 
+import java.io.{DataInputStream, DataOutputStream}
+
 import scala.util.Random
 
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.annotation.Since
-import org.apache.spark.ml.linalg.{Vector, Vectors, VectorUDT}
+import org.apache.spark.ml.linalg.{SQLDataTypes, Vector, Vectors}
 import org.apache.spark.ml.param.ParamMap
 import org.apache.spark.ml.param.shared.HasSeed
 import org.apache.spark.ml.util._
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.util.SizeEstimator
 
 /**
  * Model produced by [[MinHashLSH]], where multiple hash functions are stored. Each hash function
@@ -48,6 +51,16 @@ class MinHashLSHModel private[ml](
     private[ml] val randCoefficients: Array[(Int, Int)])
   extends LSHModel[MinHashLSHModel] {
 
+  // For ml connect only
+  private[ml] def this() = this("", Array.empty)
+
+  private[spark] override def estimatedSize: Long = {
+    var size = estimateMatadataSize
+    // randCoefficients: Array[(Int, Int)]
+    size += SizeEstimator.estimate(randCoefficients)
+    size
+  }
+
   /** @group setParam */
   @Since("2.4.0")
   override def setInputCol(value: String): this.type = super.set(inputCol, value)
@@ -58,14 +71,12 @@ class MinHashLSHModel private[ml](
 
   @Since("2.1.0")
   override protected[ml] def hashFunction(elems: Vector): Array[Vector] = {
-    require(elems.nonZeroIterator.nonEmpty, "Must have at least 1 non zero entry.")
-    val hashValues = randCoefficients.map { case (a, b) =>
-      elems.nonZeroIterator.map { case (i, _) =>
-        ((1L + i) * a + b) % MinHashLSH.HASH_PRIME
-      }.min.toDouble
-    }
-    // TODO: Output vectors of dimension numHashFunctions in SPARK-18450
-    hashValues.map(Vectors.dense(_))
+    MinHashLSHModel.hashFunction(elems, randCoefficients)
+  }
+
+  override protected[ml] def createTransformFunc: Vector => Array[Vector] = {
+    val localRandCoefficients = randCoefficients
+    elems => MinHashLSHModel.hashFunction(elems, localRandCoefficients)
   }
 
   @Since("2.1.0")
@@ -79,8 +90,8 @@ class MinHashLSHModel private[ml](
       return 1.0
     }
 
-    var xIndex = xIter.next
-    var yIndex = yIter.next
+    var xIndex = xIter.next()
+    var yIndex = yIter.next()
     var xSize = 1
     var ySize = 1
     var intersectionSize = 0
@@ -88,12 +99,12 @@ class MinHashLSHModel private[ml](
     while (xIndex != -1 && yIndex != -1) {
       if (xIndex == yIndex) {
         intersectionSize += 1
-        xIndex = if (xIter.hasNext) { xSize += 1; xIter.next } else -1
-        yIndex = if (yIter.hasNext) { ySize += 1; yIter.next } else -1
+        xIndex = if (xIter.hasNext) { xSize += 1; xIter.next() } else -1
+        yIndex = if (yIter.hasNext) { ySize += 1; yIter.next() } else -1
       } else if (xIndex > yIndex) {
-        yIndex = if (yIter.hasNext) { ySize += 1; yIter.next } else -1
+        yIndex = if (yIter.hasNext) { ySize += 1; yIter.next() } else -1
       } else {
-        xIndex = if (xIter.hasNext) { xSize += 1; xIter.next } else -1
+        xIndex = if (xIter.hasNext) { xSize += 1; xIter.next() } else -1
       }
     }
 
@@ -188,7 +199,7 @@ class MinHashLSH(override val uid: String) extends LSH[MinHashLSHModel] with Has
 
   @Since("2.1.0")
   override def transformSchema(schema: StructType): StructType = {
-    SchemaUtils.checkColumnType(schema, $(inputCol), new VectorUDT)
+    SchemaUtils.checkColumnType(schema, $(inputCol), SQLDataTypes.VectorType)
     validateAndTransformSchema(schema)
   }
 
@@ -208,6 +219,32 @@ object MinHashLSH extends DefaultParamsReadable[MinHashLSH] {
 @Since("2.1.0")
 object MinHashLSHModel extends MLReadable[MinHashLSHModel] {
 
+  private def hashFunction(
+      elems: Vector,
+      randCoefficients: Array[(Int, Int)]): Array[Vector] = {
+    require(elems.nonZeroIterator.nonEmpty, "Must have at least 1 non zero entry.")
+    val hashValues = randCoefficients.map { case (a, b) =>
+      elems.nonZeroIterator.map { case (i, _) =>
+        ((1L + i) * a + b) % MinHashLSH.HASH_PRIME
+      }.min.toDouble
+    }
+    // TODO: Output vectors of dimension numHashFunctions in SPARK-18450
+    hashValues.map(Vectors.dense(_))
+  }
+
+  private[ml] case class Data(randCoefficients: Array[Int])
+
+  private[ml] def serializeData(data: Data, dos: DataOutputStream): Unit = {
+    import ReadWriteUtils._
+    serializeIntArray(data.randCoefficients, dos)
+  }
+
+  private[ml] def deserializeData(dis: DataInputStream): Data = {
+    import ReadWriteUtils._
+    val randCoefficients = deserializeIntArray(dis)
+    Data(randCoefficients)
+  }
+
   @Since("2.1.0")
   override def read: MLReader[MinHashLSHModel] = new MinHashLSHModelReader
 
@@ -217,13 +254,11 @@ object MinHashLSHModel extends MLReadable[MinHashLSHModel] {
   private[MinHashLSHModel] class MinHashLSHModelWriter(instance: MinHashLSHModel)
     extends MLWriter {
 
-    private case class Data(randCoefficients: Array[Int])
-
     override protected def saveImpl(path: String): Unit = {
-      DefaultParamsWriter.saveMetadata(instance, path, sc)
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
       val data = Data(instance.randCoefficients.flatMap(tuple => Array(tuple._1, tuple._2)))
       val dataPath = new Path(path, "data").toString
-      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
+      ReadWriteUtils.saveObject[Data](dataPath, data, sparkSession, serializeData)
     }
   }
 
@@ -233,13 +268,14 @@ object MinHashLSHModel extends MLReadable[MinHashLSHModel] {
     private val className = classOf[MinHashLSHModel].getName
 
     override def load(path: String): MinHashLSHModel = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
 
       val dataPath = new Path(path, "data").toString
-      val data = sparkSession.read.parquet(dataPath).select("randCoefficients").head()
-      val randCoefficients = data.getSeq[Int](0).grouped(2)
-        .map(tuple => (tuple(0), tuple(1))).toArray
-      val model = new MinHashLSHModel(metadata.uid, randCoefficients)
+      val data = ReadWriteUtils.loadObject[Data](dataPath, sparkSession, deserializeData)
+      val model = new MinHashLSHModel(
+        metadata.uid,
+        data.randCoefficients.grouped(2).map(tuple => (tuple(0), tuple(1))).toArray
+      )
 
       metadata.getAndSetParams(model)
       model

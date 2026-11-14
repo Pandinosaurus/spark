@@ -14,16 +14,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from typing import overload, Callable, Optional, TypeVar, Union
+from typing import Callable, Optional, TypeVar, Union, overload
 
 from pyspark.serializers import NoOpSerializer
 from pyspark.storagelevel import StorageLevel
 from pyspark.streaming import DStream
 from pyspark.streaming.context import StreamingContext
-from pyspark.util import _print_missing_jar  # type: ignore[attr-defined]
+from pyspark.util import _print_missing_jar
+
+__all__ = ["KinesisUtils", "InitialPositionInStream", "MetricsLevel", "utf8_decoder"]
 
 
-__all__ = ["KinesisUtils", "InitialPositionInStream", "utf8_decoder"]
+class InitialPositionInStream:
+    LATEST, TRIM_HORIZON = (0, 1)
+
+
+class MetricsLevel:
+    DETAILED, SUMMARY, NONE = (0, 1, 2)
+
 
 T = TypeVar("T")
 
@@ -35,7 +43,7 @@ def utf8_decoder(s: Optional[bytes]) -> Optional[str]:
     return s.decode("utf-8")
 
 
-class KinesisUtils(object):
+class KinesisUtils:
     @staticmethod
     @overload
     def createStream(
@@ -46,6 +54,7 @@ class KinesisUtils(object):
         regionName: str,
         initialPositionInStream: str,
         checkpointInterval: int,
+        metricsLevel: int = MetricsLevel.DETAILED,
         storageLevel: StorageLevel = ...,
         awsAccessKeyId: Optional[str] = ...,
         awsSecretKey: Optional[str] = ...,
@@ -53,8 +62,7 @@ class KinesisUtils(object):
         stsAssumeRoleArn: Optional[str] = ...,
         stsSessionName: Optional[str] = ...,
         stsExternalId: Optional[str] = ...,
-    ) -> "DStream[Optional[str]]":
-        ...
+    ) -> "DStream[Optional[str]]": ...
 
     @staticmethod
     @overload
@@ -66,6 +74,7 @@ class KinesisUtils(object):
         regionName: str,
         initialPositionInStream: str,
         checkpointInterval: int,
+        metricsLevel: int = MetricsLevel.DETAILED,
         storageLevel: StorageLevel = ...,
         awsAccessKeyId: Optional[str] = ...,
         awsSecretKey: Optional[str] = ...,
@@ -73,8 +82,7 @@ class KinesisUtils(object):
         stsAssumeRoleArn: Optional[str] = ...,
         stsSessionName: Optional[str] = ...,
         stsExternalId: Optional[str] = ...,
-    ) -> "DStream[T]":
-        ...
+    ) -> "DStream[T]": ...
 
     @staticmethod
     def createStream(
@@ -85,6 +93,7 @@ class KinesisUtils(object):
         regionName: str,
         initialPositionInStream: str,
         checkpointInterval: int,
+        metricsLevel: int = MetricsLevel.DETAILED,
         storageLevel: StorageLevel = StorageLevel.MEMORY_AND_DISK_2,
         awsAccessKeyId: Optional[str] = None,
         awsSecretKey: Optional[str] = None,
@@ -123,6 +132,9 @@ class KinesisUtils(object):
             Checkpoint interval(in seconds) for Kinesis checkpointing. See the Kinesis
             Spark Streaming documentation for more details on the different
             types of checkpoints.
+        metricsLevel : int
+            Level of CloudWatch PutMetrics.
+            Can be set to either DETAILED, SUMMARY, or NONE. (default is DETAILED)
         storageLevel : :class:`pyspark.StorageLevel`, optional
             Storage level to use for storing the received objects (default is
             StorageLevel.MEMORY_AND_DISK_2)
@@ -153,13 +165,14 @@ class KinesisUtils(object):
         The given AWS credentials will get saved in DStream checkpoints if checkpointing
         is enabled. Make sure that your checkpoint directory is secure.
         """
-        jlevel = ssc._sc._getJavaStorageLevel(storageLevel)  # type: ignore[attr-defined]
-        jduration = ssc._jduration(checkpointInterval)  # type: ignore[attr-defined]
+        jlevel = ssc._sc._getJavaStorageLevel(storageLevel)
+        jduration = ssc._jduration(checkpointInterval)
+
+        jvm = ssc._jvm
+        assert jvm is not None
 
         try:
-            helper = (
-                ssc._jvm.org.apache.spark.streaming.kinesis.KinesisUtilsPythonHelper()  # type: ignore[attr-defined]
-            )
+            helper = jvm.org.apache.spark.streaming.kinesis.KinesisUtilsPythonHelper()
         except TypeError as e:
             if str(e) == "'JavaPackage' object is not callable":
                 _print_missing_jar(
@@ -170,13 +183,14 @@ class KinesisUtils(object):
                 )
             raise
         jstream = helper.createStream(
-            ssc._jssc,  # type: ignore[attr-defined]
+            ssc._jssc,
             kinesisAppName,
             streamName,
             endpointUrl,
             regionName,
             initialPositionInStream,
             jduration,
+            metricsLevel,
             jlevel,
             awsAccessKeyId,
             awsSecretKey,
@@ -186,7 +200,3 @@ class KinesisUtils(object):
         )
         stream: DStream = DStream(jstream, ssc, NoOpSerializer())
         return stream.map(lambda v: decoder(v))
-
-
-class InitialPositionInStream(object):
-    LATEST, TRIM_HORIZON = (0, 1)

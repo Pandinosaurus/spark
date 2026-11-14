@@ -25,14 +25,13 @@ import org.scalatest.matchers.should.Matchers._
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.plans.PlanTestBase
 import org.apache.spark.sql.catalyst.util._
 import org.apache.spark.sql.types.{IntegerType, LongType, _}
 import org.apache.spark.unsafe.array.ByteArrayMethods
-import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
+import org.apache.spark.unsafe.types.{CalendarInterval, TimestampNanosVal, UTF8String}
+import org.apache.spark.util.ArrayImplicits._
 
-class UnsafeRowConverterSuite extends SparkFunSuite with Matchers with PlanTestBase
-    with ExpressionEvalHelper {
+class UnsafeRowConverterSuite extends SparkFunSuite with Matchers with ExpressionEvalHelper {
 
   private def roundedSize(size: Int) = ByteArrayMethods.roundNumberOfBytesToNearestWord(size)
 
@@ -40,7 +39,7 @@ class UnsafeRowConverterSuite extends SparkFunSuite with Matchers with PlanTestB
     val factory = UnsafeProjection
     val fieldTypes: Array[DataType] = Array(LongType, LongType, IntegerType)
     val converter = factory.create(fieldTypes)
-    val row = new SpecificInternalRow(fieldTypes)
+    val row = new SpecificInternalRow(fieldTypes.toImmutableArraySeq)
     row.setLong(0, 0)
     row.setLong(1, 1)
     row.setInt(2, 2)
@@ -74,12 +73,68 @@ class UnsafeRowConverterSuite extends SparkFunSuite with Matchers with PlanTestB
     assert(unsafeRow2.getInt(2) === 2)
   }
 
+  testBothCodegenAndInterpreted(
+      "null interval keys are byte-identical regardless of prior rows") {
+    // CalendarInterval occupies a 16-byte variable-length payload. The projection reuses its output
+    // buffer across rows, so a null value must zero that payload; otherwise it inherits the prior
+    // non-null value's bytes and two null rows compare unequal -- which splits a nullable interval
+    // GROUP BY / join key into several null groups.
+    val fieldTypes: Array[DataType] = Array(CalendarIntervalType)
+    val converter = UnsafeProjection.create(fieldTypes)
+    val row = new SpecificInternalRow(fieldTypes.toImmutableArraySeq)
+
+    // Dirty the reused buffer with one non-null value, then project a null.
+    row.update(0, new CalendarInterval(3, 1, 1000L))
+    converter.apply(row)
+    row.setNullAt(0)
+    val nullAfterA = converter.apply(row).copy()
+
+    // Dirty the buffer with a *different* non-null value, then project a null again.
+    row.update(0, new CalendarInterval(7, 9, 987654321L))
+    converter.apply(row)
+    row.setNullAt(0)
+    val nullAfterB = converter.apply(row).copy()
+
+    assert(nullAfterA.isNullAt(0) && nullAfterB.isNullAt(0))
+    assert(nullAfterA == nullAfterB,
+      "two null interval projections must be byte-identical but differed (stale payload)")
+  }
+
+  testBothCodegenAndInterpreted(
+      "null nanosecond timestamp keys are byte-identical regardless of prior rows") {
+    // The nanosecond timestamp types occupy a 16-byte variable-length payload. The projection
+    // reuses its output buffer across rows, so a null value must zero that payload; otherwise it
+    // inherits the previous non-null value's bytes and two null rows compare unequal -- which
+    // splits a nullable nanosecond GROUP BY / join key into several null groups.
+    Seq(TimestampNTZNanosType(9), TimestampLTZNanosType(9)).foreach { dt =>
+      val fieldTypes: Array[DataType] = Array(dt)
+      val converter = UnsafeProjection.create(fieldTypes)
+      val row = new SpecificInternalRow(fieldTypes.toImmutableArraySeq)
+
+      // Dirty the reused buffer with one non-null value, then project a null.
+      row.update(0, TimestampNanosVal.fromParts(1234567L, 111.toShort))
+      converter.apply(row)
+      row.setNullAt(0)
+      val nullAfterA = converter.apply(row).copy()
+
+      // Dirty the buffer with a *different* non-null value, then project a null again.
+      row.update(0, TimestampNanosVal.fromParts(987654321L, 222.toShort))
+      converter.apply(row)
+      row.setNullAt(0)
+      val nullAfterB = converter.apply(row).copy()
+
+      assert(nullAfterA.isNullAt(0) && nullAfterB.isNullAt(0))
+      assert(nullAfterA == nullAfterB,
+        s"two null $dt projections must be byte-identical but differed (stale payload)")
+    }
+  }
+
   testBothCodegenAndInterpreted("basic conversion with primitive, string and binary types") {
     val factory = UnsafeProjection
     val fieldTypes: Array[DataType] = Array(LongType, StringType, BinaryType)
     val converter = factory.create(fieldTypes)
 
-    val row = new SpecificInternalRow(fieldTypes)
+    val row = new SpecificInternalRow(fieldTypes.toImmutableArraySeq)
     row.setLong(0, 0)
     row.update(1, UTF8String.fromString("Hello"))
     row.update(2, "World".getBytes(StandardCharsets.UTF_8))
@@ -100,7 +155,7 @@ class UnsafeRowConverterSuite extends SparkFunSuite with Matchers with PlanTestB
     val fieldTypes: Array[DataType] = Array(LongType, StringType, DateType, TimestampType)
     val converter = factory.create(fieldTypes)
 
-    val row = new SpecificInternalRow(fieldTypes)
+    val row = new SpecificInternalRow(fieldTypes.toImmutableArraySeq)
     row.setLong(0, 0)
     row.update(1, UTF8String.fromString("Hello"))
     row.update(2, DateTimeUtils.fromJavaDate(Date.valueOf("1970-01-01")))
@@ -115,14 +170,14 @@ class UnsafeRowConverterSuite extends SparkFunSuite with Matchers with PlanTestB
     // Date is represented as Int in unsafeRow
     assert(DateTimeUtils.toJavaDate(unsafeRow.getInt(2)) === Date.valueOf("1970-01-01"))
     // Timestamp is represented as Long in unsafeRow
-    DateTimeUtils.toJavaTimestamp(unsafeRow.getLong(3)) should be
-    (Timestamp.valueOf("2015-05-08 08:10:25"))
+    DateTimeUtils.toJavaTimestamp(unsafeRow.getLong(3)) should be(
+      Timestamp.valueOf("2015-05-08 08:10:25"))
 
     unsafeRow.setInt(2, DateTimeUtils.fromJavaDate(Date.valueOf("2015-06-22")))
     assert(DateTimeUtils.toJavaDate(unsafeRow.getInt(2)) === Date.valueOf("2015-06-22"))
     unsafeRow.setLong(3, DateTimeUtils.fromJavaTimestamp(Timestamp.valueOf("2015-06-22 08:10:25")))
-    DateTimeUtils.toJavaTimestamp(unsafeRow.getLong(3)) should be
-    (Timestamp.valueOf("2015-06-22 08:10:25"))
+    DateTimeUtils.toJavaTimestamp(unsafeRow.getLong(3)) should be(
+      Timestamp.valueOf("2015-06-22 08:10:25"))
   }
 
   testBothCodegenAndInterpreted(
@@ -131,7 +186,7 @@ class UnsafeRowConverterSuite extends SparkFunSuite with Matchers with PlanTestB
     val fieldTypes: Array[DataType] = Array(LongType, StringType, CalendarIntervalType)
     val converter = factory.create(fieldTypes)
 
-    val row = new SpecificInternalRow(fieldTypes)
+    val row = new SpecificInternalRow(fieldTypes.toImmutableArraySeq)
     row.setLong(0, 0)
     row.update(1, UTF8String.fromString("Hello"))
     val interval1 = new CalendarInterval(3, 1, 1000L)
@@ -175,7 +230,7 @@ class UnsafeRowConverterSuite extends SparkFunSuite with Matchers with PlanTestB
     val converter = factory.create(fieldTypes)
 
     val rowWithAllNullColumns: InternalRow = {
-      val r = new SpecificInternalRow(fieldTypes)
+      val r = new SpecificInternalRow(fieldTypes.toImmutableArraySeq)
       for (i <- fieldTypes.indices) {
         r.setNullAt(i)
       }
@@ -204,7 +259,7 @@ class UnsafeRowConverterSuite extends SparkFunSuite with Matchers with PlanTestB
     // columns, then the serialized row representation should be identical to what we would get by
     // creating an entirely null row via the converter
     val rowWithNoNullColumns: InternalRow = {
-      val r = new SpecificInternalRow(fieldTypes)
+      val r = new SpecificInternalRow(fieldTypes.toImmutableArraySeq)
       r.setNullAt(0)
       r.setBoolean(1, false)
       r.setByte(2, 20)
@@ -277,6 +332,49 @@ class UnsafeRowConverterSuite extends SparkFunSuite with Matchers with PlanTestB
     // assert(setToNullAfterCreation.get(11) === rowWithNoNullColumns.get(11))
   }
 
+  testBothCodegenAndInterpreted("SPARK-41535: intervals initialized as null") {
+    val factory = UnsafeProjection
+    val fieldTypes: Array[DataType] = Array(CalendarIntervalType, CalendarIntervalType)
+    val converter = factory.create(fieldTypes)
+
+    val row = new SpecificInternalRow(fieldTypes.toImmutableArraySeq)
+    for (i <- 0 until row.numFields) {
+      row.setInterval(i, null)
+    }
+
+    val nullAtCreation = converter.apply(row)
+
+    for (i <- 0 until row.numFields) {
+      assert(nullAtCreation.isNullAt(i))
+    }
+
+    val intervals = Array(
+      new CalendarInterval(0, 7, 0L),
+      new CalendarInterval(12*17, 2, 0L)
+    )
+    // set interval values into previously null columns
+    for (i <- intervals.indices) {
+      nullAtCreation.setInterval(i, intervals(i))
+    }
+
+    for (i <- intervals.indices) {
+      assert(nullAtCreation.getInterval(i) == intervals(i))
+    }
+  }
+
+  testBothCodegenAndInterpreted("SPARK-41535: interval array containing nulls") {
+    val factory = UnsafeProjection
+    val fieldTypes: Array[DataType] = Array(ArrayType(CalendarIntervalType))
+    val converter = factory.create(fieldTypes)
+
+    val row = new SpecificInternalRow(fieldTypes.toImmutableArraySeq)
+    val values = Array(new CalendarInterval(0, 7, 0L), null)
+
+    row.update(0, createArray(values.toImmutableArraySeq: _*))
+    val unsafeRow: UnsafeRow = converter.apply(row)
+    testArrayInterval(unsafeRow.getArray(0), values.toImmutableArraySeq)
+  }
+
   testBothCodegenAndInterpreted("basic conversion with struct type") {
     val factory = UnsafeProjection
     val fieldTypes: Array[DataType] = Array(
@@ -327,6 +425,13 @@ class UnsafeRowConverterSuite extends SparkFunSuite with Matchers with PlanTestB
       8 + scala.math.ceil(values.length / 64.toDouble) * 8 + roundedSize(4 * values.length))
     values.zipWithIndex.foreach {
       case (value, index) => assert(array.getInt(index) == value)
+    }
+  }
+
+  private def testArrayInterval(array: UnsafeArrayData, values: Seq[CalendarInterval]): Unit = {
+    assert(array.numElements == values.length)
+    values.zipWithIndex.foreach {
+      case (value, index) => assert(array.getInterval(index) == value)
     }
   }
 
@@ -637,5 +742,21 @@ class UnsafeRowConverterSuite extends SparkFunSuite with Matchers with PlanTestB
     val udtRow = InternalRow.fromSeq(Seq(udt.serialize(vector)))
     val fields5 = Array[DataType](udt)
     assert(convertBackToInternalRow(udtRow, fields5) === udtRow)
+  }
+
+  testBothCodegenAndInterpreted("SPARK-41804: Array of UDTs") {
+    val udt = new ExampleBaseTypeUDT
+    val objs = Seq(
+      udt.serialize(new ExampleSubClass(1)),
+      udt.serialize(new ExampleSubClass(2)))
+    val arr = new GenericArrayData(objs)
+    val row = new GenericInternalRow(Array[Any](arr))
+    val unsafeProj = UnsafeProjection.create(Array[DataType](ArrayType(udt)))
+    val unsafeRow = unsafeProj.apply(row)
+    val unsafeOuterArray = unsafeRow.getArray(0)
+    // get second element from unsafe array
+    val unsafeStruct = unsafeOuterArray.getStruct(1, 1)
+    val result = unsafeStruct.getInt(0)
+    assert(result == 2)
   }
 }

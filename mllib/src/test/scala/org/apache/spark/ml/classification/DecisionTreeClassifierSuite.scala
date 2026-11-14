@@ -29,6 +29,7 @@ import org.apache.spark.mllib.tree.{DecisionTree => OldDecisionTree,
   DecisionTreeSuite => OldDecisionTreeSuite}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Row}
+import org.apache.spark.util.ArrayImplicits._
 
 class DecisionTreeClassifierSuite extends MLTest with DefaultReadWriteTest {
 
@@ -47,24 +48,44 @@ class DecisionTreeClassifierSuite extends MLTest with DefaultReadWriteTest {
   override def beforeAll(): Unit = {
     super.beforeAll()
     categoricalDataPointsRDD =
-      sc.parallelize(OldDecisionTreeSuite.generateCategoricalDataPoints()).map(_.asML)
+      sc.parallelize(
+        OldDecisionTreeSuite.generateCategoricalDataPoints().toImmutableArraySeq).map(_.asML)
     orderedLabeledPointsWithLabel0RDD =
-      sc.parallelize(OldDecisionTreeSuite.generateOrderedLabeledPointsWithLabel0()).map(_.asML)
+      sc.parallelize(
+        OldDecisionTreeSuite.generateOrderedLabeledPointsWithLabel0().toImmutableArraySeq)
+        .map(_.asML)
     orderedLabeledPointsWithLabel1RDD =
-      sc.parallelize(OldDecisionTreeSuite.generateOrderedLabeledPointsWithLabel1()).map(_.asML)
+      sc.parallelize(
+        OldDecisionTreeSuite.generateOrderedLabeledPointsWithLabel1().toImmutableArraySeq)
+        .map(_.asML)
     categoricalDataPointsForMulticlassRDD =
-      sc.parallelize(OldDecisionTreeSuite.generateCategoricalDataPointsForMulticlass()).map(_.asML)
+      sc.parallelize(
+        OldDecisionTreeSuite.generateCategoricalDataPointsForMulticlass().toImmutableArraySeq)
+        .map(_.asML)
     continuousDataPointsForMulticlassRDD =
-      sc.parallelize(OldDecisionTreeSuite.generateContinuousDataPointsForMulticlass()).map(_.asML)
+      sc.parallelize(
+        OldDecisionTreeSuite.generateContinuousDataPointsForMulticlass().toImmutableArraySeq)
+        .map(_.asML)
     categoricalDataPointsForMulticlassForOrderedFeaturesRDD = sc.parallelize(
-      OldDecisionTreeSuite.generateCategoricalDataPointsForMulticlassForOrderedFeatures())
+      OldDecisionTreeSuite.generateCategoricalDataPointsForMulticlassForOrderedFeatures()
+        .toImmutableArraySeq)
       .map(_.asML)
   }
 
   test("params") {
-    ParamsSuite.checkParams(new DecisionTreeClassifier)
+    val classifier = new DecisionTreeClassifier
+    ParamsSuite.checkParams(classifier)
+    assert(classifier.getIntermediateStorageLevel === "MEMORY_AND_DISK")
+    classifier.setIntermediateStorageLevel("DISK_ONLY")
+    assert(classifier.getIntermediateStorageLevel === "DISK_ONLY")
     val model = new DecisionTreeClassificationModel("dtc", new LeafNode(0.0, 0.0, null), 1, 2)
     ParamsSuite.checkParams(model)
+  }
+
+  test("DecisionTreeClassifier validate input dataset") {
+    testInvalidClassificationLabels(new DecisionTreeClassifier().fit(_), None)
+    testInvalidWeights(new DecisionTreeClassifier().setWeightCol("weight").fit(_))
+    testInvalidVectors(new DecisionTreeClassifier().fit(_))
   }
 
   /////////////////////////////////////////////////////////////////////////////
@@ -111,7 +132,7 @@ class DecisionTreeClassifierSuite extends MLTest with DefaultReadWriteTest {
       LabeledPoint(1.0, Vectors.dense(1.0)),
       LabeledPoint(1.0, Vectors.dense(2.0)),
       LabeledPoint(1.0, Vectors.dense(3.0)))
-    val rdd = sc.parallelize(arr)
+    val rdd = sc.parallelize(arr.toImmutableArraySeq)
     val dt = new DecisionTreeClassifier()
       .setImpurity("Gini")
       .setMaxDepth(4)
@@ -125,7 +146,7 @@ class DecisionTreeClassifierSuite extends MLTest with DefaultReadWriteTest {
       LabeledPoint(1.0, Vectors.sparse(2, Seq((1, 1.0)))),
       LabeledPoint(0.0, Vectors.sparse(2, Seq((0, 0.0)))),
       LabeledPoint(1.0, Vectors.sparse(2, Seq((1, 2.0)))))
-    val rdd = sc.parallelize(arr)
+    val rdd = sc.parallelize(arr.toImmutableArraySeq)
     val dt = new DecisionTreeClassifier()
       .setImpurity("Gini")
       .setMaxDepth(4)
@@ -195,7 +216,7 @@ class DecisionTreeClassifierSuite extends MLTest with DefaultReadWriteTest {
       LabeledPoint(0.0, Vectors.sparse(2, Seq((0, 0.0)))),
       LabeledPoint(1.0, Vectors.sparse(2, Seq((1, 1.0)))),
       LabeledPoint(0.0, Vectors.sparse(2, Seq((0, 1.0)))))
-    val rdd = sc.parallelize(arr)
+    val rdd = sc.parallelize(arr.toImmutableArraySeq)
     val dt = new DecisionTreeClassifier()
       .setImpurity("Gini")
       .setMaxDepth(2)
@@ -212,7 +233,7 @@ class DecisionTreeClassifierSuite extends MLTest with DefaultReadWriteTest {
       LabeledPoint(1.0, Vectors.dense(1.0, 1.0)),
       LabeledPoint(0.0, Vectors.dense(0.0, 0.0)),
       LabeledPoint(0.0, Vectors.dense(0.0, 0.0)))
-    val rdd = sc.parallelize(arr)
+    val rdd = sc.parallelize(arr.toImmutableArraySeq)
     val dt = new DecisionTreeClassifier()
       .setImpurity("Gini")
       .setMaxBins(2)
@@ -228,7 +249,7 @@ class DecisionTreeClassifierSuite extends MLTest with DefaultReadWriteTest {
       LabeledPoint(0.0, Vectors.sparse(2, Seq((0, 0.0)))),
       LabeledPoint(1.0, Vectors.sparse(2, Seq((1, 1.0)))),
       LabeledPoint(0.0, Vectors.sparse(2, Seq((0, 1.0)))))
-    val rdd = sc.parallelize(arr)
+    val rdd = sc.parallelize(arr.toImmutableArraySeq)
 
     val dt = new DecisionTreeClassifier()
       .setImpurity("Gini")
@@ -253,7 +274,7 @@ class DecisionTreeClassifierSuite extends MLTest with DefaultReadWriteTest {
 
     val transformed = newTree.transform(newData)
     checkNominalOnDF(transformed, "prediction", newTree.numClasses)
-    checkNominalOnDF(transformed, "predictedLeafId", newTree.numLeave)
+    checkNominalOnDF(transformed, "predictedLeafId", newTree.numLeaves)
     checkVectorSizeOnDF(transformed, "rawPrediction", newTree.numClasses)
     checkVectorSizeOnDF(transformed, "probability", newTree.numClasses)
 
@@ -334,12 +355,39 @@ class DecisionTreeClassifierSuite extends MLTest with DefaultReadWriteTest {
     val data = TreeTests.getSingleTreeLeafData
     data.foreach { case (leafId, vec) => assert(leafId === model.predictLeaf(vec)) }
 
-    val df = sc.parallelize(data, 1).toDF("leafId", "features")
+    val df = sc.parallelize(data.toImmutableArraySeq, 1).toDF("leafId", "features")
     model.transform(df).select("leafId", "predictedLeafId")
       .collect()
       .foreach { case Row(leafId: Double, predictedLeafId: Double) =>
         assert(leafId === predictedLeafId)
     }
+  }
+
+  test("leaf indices are correct after training, loading, and conversion from old API") {
+    val rdd = TreeTests.getTreeReadWriteData(sc)
+    val categoricalFeatures = Map(0 -> 2, 1 -> 3)
+    val numClasses = 2
+    val data = TreeTests.setMetadata(rdd, categoricalFeatures, numClasses)
+    val dt = new DecisionTreeClassifier().setMaxDepth(2)
+    val trainedModel = dt.fit(data)
+
+    assert(trainedModel.numLeaves > 1)
+    TreeTests.checkLeafIndices(trainedModel.rootNode)
+
+    withTempDir { dir =>
+      val path = s"${dir.getAbsolutePath}/model"
+      trainedModel.write.save(path)
+      val loadedModel = DecisionTreeClassificationModel.load(path)
+      assert(loadedModel.numLeaves > 1)
+      TreeTests.checkLeafIndices(loadedModel.rootNode)
+    }
+
+    val oldStrategy = dt.getOldStrategy(categoricalFeatures, numClasses)
+    val oldTree = OldDecisionTree.train(rdd.map(OldLabeledPoint.fromML), oldStrategy)
+    val convertedModel = DecisionTreeClassificationModel.fromOld(
+      oldTree, dt, categoricalFeatures)
+    assert(convertedModel.numLeaves > 1)
+    TreeTests.checkLeafIndices(convertedModel.rootNode)
   }
 
   test("should support all NumericType labels and not support other types") {
@@ -410,6 +458,8 @@ class DecisionTreeClassifierSuite extends MLTest with DefaultReadWriteTest {
       TreeTests.checkEqual(model, model2)
       assert(model.numFeatures === model2.numFeatures)
       assert(model.numClasses === model2.numClasses)
+      val features = Vectors.dense(0.0, 0.0)
+      assert(model.predictLeaf(features) === model2.predictLeaf(features))
     }
 
     val dt = new DecisionTreeClassifier()
@@ -471,7 +521,8 @@ private[ml] object DecisionTreeClassifierSuite extends SparkFunSuite {
       dt: DecisionTreeClassifier,
       categoricalFeatures: Map[Int, Int],
       numClasses: Int): Unit = {
-    val numFeatures = data.first().features.size
+    val vec = data.first().features
+    val numFeatures = vec.size
     val oldStrategy = dt.getOldStrategy(categoricalFeatures, numClasses)
     val oldTree = OldDecisionTree.train(data.map(OldLabeledPoint.fromML), oldStrategy)
     val newData: DataFrame = TreeTests.setMetadata(data, categoricalFeatures, numClasses)
@@ -480,6 +531,7 @@ private[ml] object DecisionTreeClassifierSuite extends SparkFunSuite {
     val oldTreeAsNew = DecisionTreeClassificationModel.fromOld(
       oldTree, newTree.parent.asInstanceOf[DecisionTreeClassifier], categoricalFeatures)
     TreeTests.checkEqual(oldTreeAsNew, newTree)
+    assert(oldTreeAsNew.predictLeaf(vec) === newTree.predictLeaf(vec))
     assert(newTree.numFeatures === numFeatures)
   }
 }

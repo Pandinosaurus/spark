@@ -29,6 +29,7 @@ import org.apache.spark.ml.util._
 import org.apache.spark.sql.{DataFrame, Dataset}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.util.SizeEstimator
 
 
 /**
@@ -206,8 +207,8 @@ private[ml] abstract class Selector[T <: SelectorModel[T]]
     val spark = dataset.sparkSession
     import spark.implicits._
 
-    val numFeatures = MetadataUtils.getNumFeatures(dataset, $(featuresCol))
-    val resultDF = getSelectionTestResult(dataset.toDF)
+    val numFeatures = DatasetUtils.getNumFeatures(dataset, $(featuresCol))
+    val resultDF = getSelectionTestResult(dataset.toDF())
 
     def getTopIndices(k: Int): Array[Int] = {
       resultDF.sort("pValue", "featureIndex")
@@ -233,7 +234,7 @@ private[ml] abstract class Selector[T <: SelectorModel[T]]
         val maxIndex = resultDF.sort("pValue", "featureIndex")
           .select("pValue")
           .as[Double].rdd
-          .zipWithIndex
+          .zipWithIndex()
           .flatMap { case (pValue, index) =>
             if (pValue <= f * (index + 1)) {
               Iterator.single(index.toInt)
@@ -256,9 +257,9 @@ private[ml] abstract class Selector[T <: SelectorModel[T]]
 
   @Since("3.1.0")
   override def transformSchema(schema: StructType): StructType = {
-    SchemaUtils.checkColumnType(schema, $(featuresCol), new VectorUDT)
+    SchemaUtils.checkColumnType(schema, $(featuresCol), SQLDataTypes.VectorType)
     SchemaUtils.checkNumericType(schema, $(labelCol))
-    SchemaUtils.appendColumn(schema, $(outputCol), new VectorUDT)
+    SchemaUtils.appendColumn(schema, $(outputCol), SQLDataTypes.VectorType)
   }
 
   @Since("3.1.0")
@@ -274,6 +275,11 @@ private[ml] abstract class SelectorModel[T <: SelectorModel[T]] (
     @Since("3.1.0") val selectedFeatures: Array[Int])
   extends Model[T] with SelectorParams with MLWritable {
   self: T =>
+
+  private[spark] override def estimatedSize: Long = {
+    // selectedFeatures: Array[Int]
+    estimateMatadataSize + SizeEstimator.estimate(selectedFeatures)
+  }
 
   /** @group setParam */
   @Since("3.1.0")
@@ -295,7 +301,7 @@ private[ml] abstract class SelectorModel[T <: SelectorModel[T]] (
 
   @Since("3.1.0")
   override def transformSchema(schema: StructType): StructType = {
-    SchemaUtils.checkColumnType(schema, $(featuresCol), new VectorUDT)
+    SchemaUtils.checkColumnType(schema, $(featuresCol), SQLDataTypes.VectorType)
     val newField =
       SelectorModel.prepOutputField(schema, selectedFeatures, $(outputCol), $(featuresCol),
         isNumericAttribute)
@@ -341,7 +347,9 @@ private[feature] object SelectorModel {
       featuresCol: String,
       isNumericAttribute: Boolean): StructField = {
     val selector = selectedFeatures.toSet
-    val origAttrGroup = AttributeGroup.fromStructField(schema(featuresCol))
+    val origAttrGroup = AttributeGroup.fromStructField(
+      SchemaUtils.getSchemaField(schema, featuresCol)
+    )
     val featureAttributes: Array[Attribute] = if (origAttrGroup.attributes.nonEmpty) {
       origAttrGroup.attributes.get.zipWithIndex.filter(x => selector.contains(x._2)).map(_._1)
     } else {
@@ -383,4 +391,3 @@ private[feature] object SelectorModel {
     (newIndices.result(), newValues.result())
   }
 }
-

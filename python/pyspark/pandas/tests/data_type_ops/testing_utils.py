@@ -17,14 +17,12 @@
 
 import datetime
 import decimal
-from distutils.version import LooseVersion
 
 import numpy as np
 import pandas as pd
 
 import pyspark.pandas as ps
-from pyspark.pandas.typedef import extension_dtypes
-
+from pyspark.loose_version import LooseVersion
 from pyspark.pandas.typedef.typehints import (
     extension_dtypes_available,
     extension_float_dtypes_available,
@@ -41,8 +39,14 @@ if extension_object_dtypes_available:
     from pandas import BooleanDtype, StringDtype
 
 
-class TestCasesUtils(object):
-    """A utility holding common test cases for arithmetic operations of different data types."""
+class OpsTestBase:
+    """The test base for arithmetic operations of different data types."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Some nanosecond->microsecond conversions throw loss of precision errors
+        cls.spark.conf.set("spark.sql.execution.pandas.convertToArrowArraySafely", "false")
 
     @property
     def numeric_pdf(self):
@@ -50,20 +54,13 @@ class TestCasesUtils(object):
         sers = [pd.Series([1, 2, 3], dtype=dtype) for dtype in dtypes]
         sers.append(pd.Series([decimal.Decimal(1), decimal.Decimal(2), decimal.Decimal(3)]))
         sers.append(pd.Series([1, 2, np.nan], dtype=float))
-        # Skip decimal_nan test before v1.3.0, it not supported by pandas on spark yet.
-        if LooseVersion(pd.__version__) >= LooseVersion("1.3.0"):
-            sers.append(
-                pd.Series([decimal.Decimal(1), decimal.Decimal(2), decimal.Decimal(np.nan)])
-            )
+        sers.append(pd.Series([decimal.Decimal(1), decimal.Decimal(2), decimal.Decimal(np.nan)]))
         pdf = pd.concat(sers, axis=1)
-        if LooseVersion(pd.__version__) >= LooseVersion("1.3.0"):
-            pdf.columns = [dtype.__name__ for dtype in dtypes] + [
-                "decimal",
-                "float_nan",
-                "decimal_nan",
-            ]
-        else:
-            pdf.columns = [dtype.__name__ for dtype in dtypes] + ["decimal", "float_nan"]
+        pdf.columns = [dtype.__name__ for dtype in dtypes] + [
+            "decimal",
+            "float_nan",
+            "decimal_nan",
+        ]
         return pdf
 
     @property
@@ -91,6 +88,9 @@ class TestCasesUtils(object):
                 [datetime.date(1994, 1, 1), datetime.date(1994, 1, 2), datetime.date(1994, 1, 3)]
             ),
             "datetime": pd.to_datetime(pd.Series([1, 2, 3])),
+            "timedelta": pd.Series(
+                [datetime.timedelta(1), datetime.timedelta(hours=2), datetime.timedelta(weeks=3)]
+            ),
             "categorical": pd.Series(["a", "b", "a"], dtype="category"),
         }
         return pd.concat(psers, axis=1)
@@ -219,9 +219,7 @@ class TestCasesUtils(object):
         This utility is to adjust an issue for comparing numeric ExtensionDtypes in specific
         pandas versions. Please refer to https://github.com/pandas-dev/pandas/issues/39410.
         """
-        if LooseVersion("1.1") <= LooseVersion(pd.__version__) < LooseVersion("1.2.2"):
-            self.assert_eq(left, right, check_exact=False)
-            self.assertTrue(isinstance(left.dtype, extension_dtypes))
-            self.assertTrue(isinstance(right.dtype, extension_dtypes))
-        else:
-            self.assert_eq(left, right)
+        self.assert_eq(left, right)
+
+    def ignore_null(self, col):
+        return LooseVersion(pd.__version__) >= LooseVersion("3.0") and col == "decimal_nan"

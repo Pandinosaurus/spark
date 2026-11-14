@@ -18,7 +18,7 @@
 package org.apache.spark.ml.feature
 
 import org.apache.spark.ml.{Estimator, Model}
-import org.apache.spark.ml.linalg.{Vector, VectorUDT}
+import org.apache.spark.ml.linalg.{SQLDataTypes, Vector}
 import org.apache.spark.ml.param.{IntParam, ParamValidators}
 import org.apache.spark.ml.param.shared.{HasInputCol, HasOutputCol}
 import org.apache.spark.ml.util._
@@ -53,14 +53,15 @@ private[ml] trait LSHParams extends HasInputCol with HasOutputCol {
    * @return A derived schema with [[outputCol]] added.
    */
   protected[this] final def validateAndTransformSchema(schema: StructType): StructType = {
-    SchemaUtils.appendColumn(schema, $(outputCol), DataTypes.createArrayType(new VectorUDT))
+    SchemaUtils.appendColumn(schema, $(outputCol),
+      DataTypes.createArrayType(SQLDataTypes.VectorType))
   }
 }
 
 /**
  * Model produced by [[LSH]].
  */
-private[ml] abstract class LSHModel[T <: LSHModel[T]]
+private[spark] abstract class LSHModel[T <: LSHModel[T]]
   extends Model[T] with LSHParams with MLWritable {
   self: T =>
 
@@ -75,6 +76,12 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
    * @return The mapping of LSH function.
    */
   protected[ml] def hashFunction(elems: Vector): Array[Vector]
+
+  /**
+   * Returns the hash function used by [[transform]]. The returned function must not capture this
+   * model.
+   */
+  protected[ml] def createTransformFunc: Vector => Array[Vector]
 
   /**
    * Calculate the distance between two different keys using the distance metric corresponding
@@ -96,7 +103,7 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
 
   override def transform(dataset: Dataset[_]): DataFrame = {
     transformSchema(dataset.schema, logging = true)
-    val transformUDF = udf(hashFunction(_: Vector))
+    val transformUDF = udf(createTransformFunc)
     dataset.withColumn($(outputCol), transformUDF(dataset($(inputCol))))
   }
 
@@ -142,13 +149,13 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
           var s = new QuantileSummaries(
             QuantileSummaries.defaultCompressThreshold, relativeError)
           while (iter.hasNext) {
-            val row = iter.next
+            val row = iter.next()
             if (!row.isNullAt(0)) {
               val v = row.getDouble(0)
               if (!v.isNaN) s = s.insert(v)
             }
           }
-          Iterator.single(s.compress)
+          Iterator.single(s.compress())
         } else Iterator.empty
       }.treeReduce((s1, s2) => s1.merge(s2))
       val count = summary.count
@@ -346,7 +353,7 @@ private[ml] abstract class LSH[T <: LSHModel[T]]
 
   override def fit(dataset: Dataset[_]): T = {
     transformSchema(dataset.schema, logging = true)
-    val inputDim = MetadataUtils.getNumFeatures(dataset, $(inputCol))
+    val inputDim = DatasetUtils.getNumFeatures(dataset, $(inputCol))
     val model = createRawLSHModel(inputDim).setParent(this)
     copyValues(model)
   }

@@ -21,7 +21,9 @@ import java.io.PrintStream
 
 import scala.util.Random
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.{SparkFunSuite, SparkRuntimeException}
+import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.DataTypeMismatch
+import org.apache.spark.sql.catalyst.util.TypeUtils.ordinalNumber
 import org.apache.spark.sql.types._
 
 class MiscExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
@@ -36,11 +38,35 @@ class MiscExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkExceptionInExpression[RuntimeException](
       RaiseError(Literal.create(null, StringType)),
       EmptyRow,
-      null
+      "[USER_RAISED_EXCEPTION] null"
     )
 
     // Expects a string
-    assert(RaiseError(Literal(5)).checkInputDataTypes().isFailure)
+    assert(RaiseError(Literal(5)).checkInputDataTypes() ==
+      DataTypeMismatch(
+        errorSubClass = "UNEXPECTED_INPUT_TYPE",
+        messageParameters = Map(
+          "paramIndex" -> ordinalNumber(1),
+          "requiredType" -> "\"MAP<STRING, STRING>\"",
+          "inputSql" -> "\"map(errorMessage, 5)\"",
+          "inputType" -> "\"MAP<STRING, INT>\""
+        )
+      )
+    )
+  }
+
+  test("SPARK-58627: RaiseError is throwable") {
+    assert(RaiseError(Literal("error!")).throwable)
+  }
+
+  test("SPARK-55109: RaiseError.sql uses single-argument form only for known error classes") {
+    assert(RaiseError(Literal("error!")).sql === "raise_error('error!')")
+
+    // A custom errorClass should NOT produce the single-argument form
+    val customError = RaiseError(
+      Literal("CUSTOM_ERROR"),
+      CreateMap(Seq(Literal("errorMessage"), Literal("error!"))))
+    assert(customError.sql === "raise_error('CUSTOM_ERROR', map('errorMessage', 'error!'))")
   }
 
   test("uuid") {
@@ -60,11 +86,37 @@ class MiscExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     assert(evaluateWithUnsafeProjection(Uuid(seed1)) !==
       evaluateWithUnsafeProjection(Uuid(seed2)))
 
-    val uuid = Uuid(seed1)
-    assert(uuid.fastEquals(uuid))
-    assert(!uuid.fastEquals(Uuid(seed1)))
-    assert(!uuid.fastEquals(uuid.freshCopy()))
-    assert(!uuid.fastEquals(Uuid(seed2)))
+    val seed3 = Literal.create(r.nextInt())
+    assert(evaluateWithoutCodegen(new Uuid(seed3)) === evaluateWithoutCodegen(new Uuid(seed3)))
+    assert(evaluateWithMutableProjection(new Uuid(seed3)) ===
+      evaluateWithMutableProjection(new Uuid(seed3)))
+    assert(evaluateWithUnsafeProjection(new Uuid(seed3)) ===
+      evaluateWithUnsafeProjection(new Uuid(seed3)))
+  }
+
+  Seq(0L, 42L, Long.MinValue).foreach { seed =>
+    test(s"uuid fresh copies own independent generators for seed $seed") {
+      val original = Uuid(Some(seed))
+      val first = original.freshCopyIfContainsStatefulExpression().asInstanceOf[Uuid]
+      val second = original.freshCopyIfContainsStatefulExpression().asInstanceOf[Uuid]
+      assert(first ne original)
+      assert(second ne original)
+      assert(first ne second)
+      assert(first.randomSeed == original.randomSeed)
+      original.initialize(0)
+      first.initialize(0)
+      second.initialize(0)
+      for (_ <- 0 until 20) {
+        val expected = original.eval()
+        assert(first.eval() == expected)
+        assert(second.eval() == expected)
+      }
+      first.initialize(1)
+      assert(second.eval() == original.eval())
+      val otherPartition = Uuid(Some(seed))
+      otherPartition.initialize(1)
+      assert(first.eval() == otherPartition.eval())
+    }
   }
 
   test("PrintToStderr") {
@@ -88,5 +140,39 @@ class MiscExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
 
     assert(outputCodegen.contains(s"Result of $inputExpr is 1"))
     assert(outputEval.contains(s"Result of $inputExpr is 1"))
+  }
+
+  test("Hmac") {
+    def bytes(hex: String): Array[Byte] =
+      hex.grouped(2).map(Integer.parseInt(_, 16).toByte).toArray
+
+    val key = Literal("key".getBytes("UTF-8"))
+    val message = Literal("message".getBytes("UTF-8"))
+
+    // Default algorithm is SHA-256.
+    checkEvaluation(
+      new Hmac(key, message),
+      bytes("6e9ef29b75fffc5b7abae527d58fdadb2fe42e7219011976917343065f58ed4a"))
+
+    // Explicit algorithm.
+    checkEvaluation(
+      Hmac(key, message, Literal("SHA-1")),
+      bytes("2088df74d5f2146b48146caf4965377e9d0be3a4"))
+
+    // Null propagation.
+    checkEvaluation(Hmac(Literal.create(null, BinaryType), message, Literal("SHA-256")), null)
+    checkEvaluation(Hmac(key, Literal.create(null, BinaryType), Literal("SHA-256")), null)
+    checkEvaluation(Hmac(key, message, Literal.create(null, StringType)), null)
+  }
+
+  test("Hmac unsupported algorithm") {
+    checkErrorInExpression[SparkRuntimeException](
+      Hmac(Literal("key".getBytes("UTF-8")), Literal("message".getBytes("UTF-8")),
+        Literal("SHA-3")),
+      "INVALID_PARAMETER_VALUE.HMAC_ALGORITHM",
+      Map(
+        "parameter" -> "`algorithm`",
+        "functionName" -> "`hmac`",
+        "algorithm" -> "'SHA-3'"))
   }
 }

@@ -20,9 +20,10 @@ import org.apache.spark.SparkConf
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.{LongType, StructType}
+import org.apache.spark.tags.ExtendedSQLTest
 
 // Datasource tests for nested schemas
-trait NestedDataSourceSuiteBase extends QueryTest with SharedSparkSession {
+trait NestedDataSourceSuiteBase extends SharedSparkSession {
   protected val nestedDataSources: Seq[String] = Seq("orc", "parquet", "json")
   protected def readOptions(schema: StructType): Map[String, String] = Map.empty
   protected def save(selectExpr: Seq[String], format: String, path: String): Unit = {
@@ -55,16 +56,19 @@ trait NestedDataSourceSuiteBase extends QueryTest with SharedSparkSession {
             withTempPath { dir =>
               val path = dir.getCanonicalPath
               save(selectExpr, format, path)
-              val e = intercept[AnalysisException] {
-                spark
-                  .read
-                  .options(readOptions(caseInsensitiveSchema))
-                  .schema(caseInsensitiveSchema)
-                  .format(format)
-                  .load(path)
-                  .show
-              }
-              assert(e.getMessage.contains(s"Found duplicate column(s) $colType: `camelcase`"))
+              checkError(
+                exception = intercept[AnalysisException] {
+                  spark
+                    .read
+                    .options(readOptions(caseInsensitiveSchema))
+                    .schema(caseInsensitiveSchema)
+                    .format(format)
+                    .load(path)
+                    .collect()
+                },
+                condition = "COLUMN_ALREADY_EXISTS",
+                parameters = Map("columnName" -> "`camelcase`")
+              )
             }
           }
         }
@@ -80,6 +84,7 @@ class NestedDataSourceV1Suite extends NestedDataSourceSuiteBase {
       .set(SQLConf.USE_V1_SOURCE_LIST, nestedDataSources.mkString(","))
 }
 
+@ExtendedSQLTest
 class NestedDataSourceV2Suite extends NestedDataSourceSuiteBase {
   override protected def sparkConf: SparkConf =
     super

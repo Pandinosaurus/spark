@@ -17,14 +17,16 @@
 
 package org.apache.spark.sql.execution.datasources
 
-import org.apache.spark.sql.{QueryTest, Row}
+import org.apache.hadoop.mapreduce.JobContext
+
+import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.plans.CodegenInterpretedPlanTest
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 
 class FileFormatWriterSuite
-  extends QueryTest
-  with SharedSparkSession
-  with CodegenInterpretedPlanTest{
+  extends SharedSparkSession
+  with CodegenInterpretedPlanTest {
 
   import testImplicits._
 
@@ -39,12 +41,15 @@ class FileFormatWriterSuite
 
   test("SPARK-22252: FileFormatWriter should respect the input query schema") {
     withTable("t1", "t2", "t3", "t4") {
-      spark.range(1).select('id as 'col1, 'id as 'col2).write.saveAsTable("t1")
+      spark.range(1).select($"id" as Symbol("col1"), $"id" as Symbol("col2"))
+        .write.saveAsTable("t1")
       spark.sql("select COL1, COL2 from t1").write.saveAsTable("t2")
       checkAnswer(spark.table("t2"), Row(0, 0))
 
       // Test picking part of the columns when writing.
-      spark.range(1).select('id, 'id as 'col1, 'id as 'col2).write.saveAsTable("t3")
+      spark.range(1)
+        .select($"id", $"id" as Symbol("col1"), $"id" as Symbol("col2"))
+        .write.saveAsTable("t3")
       spark.sql("select COL1, COL2 from t3").write.saveAsTable("t4")
       checkAnswer(spark.table("t4"), Row(0, 0))
     }
@@ -73,5 +78,32 @@ class FileFormatWriterSuite
         checkAnswer(spark.table(t), Seq(Row(0), Row(100)))
       }
     }
+  }
+
+  test("SPARK-60023: writeJobUUID should be set before setupJob") {
+    withSQLConf(SQLConf.FILE_COMMIT_PROTOCOL_CLASS.key ->
+        classOf[WriteJobUUIDCheckingCommitProtocol].getName) {
+      withTempPath { path =>
+        // WriteJobUUIDCheckingCommitProtocol fails setupJob if the UUID is not set yet.
+        spark.range(10).write.parquet(path.getCanonicalPath)
+        checkAnswer(spark.read.parquet(path.getCanonicalPath), spark.range(10).toDF())
+      }
+    }
+  }
+}
+
+/**
+ * A file commit protocol that fails in setupJob if "spark.sql.sources.writeJobUUID" is not set,
+ * like committers (e.g. Hadoop's ManifestCommitter) that read it to build the job UUID.
+ */
+private class WriteJobUUIDCheckingCommitProtocol(
+    jobId: String,
+    path: String,
+    dynamicPartitionOverwrite: Boolean)
+  extends SQLHadoopMapReduceCommitProtocol(jobId, path, dynamicPartitionOverwrite) {
+  override def setupJob(jobContext: JobContext): Unit = {
+    assert(jobContext.getConfiguration.get("spark.sql.sources.writeJobUUID") != null,
+      "spark.sql.sources.writeJobUUID should be set before setupJob")
+    super.setupJob(jobContext)
   }
 }

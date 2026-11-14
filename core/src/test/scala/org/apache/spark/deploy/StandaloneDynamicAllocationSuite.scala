@@ -22,7 +22,7 @@ import scala.concurrent.duration._
 
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito.{mock, when}
-import org.scalatest.{BeforeAndAfterAll, PrivateMethodTester}
+import org.scalatest.PrivateMethodTester
 import org.scalatest.concurrent.Eventually._
 
 import org.apache.spark._
@@ -43,7 +43,6 @@ import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.{Launched
 class StandaloneDynamicAllocationSuite
   extends SparkFunSuite
   with LocalSparkContext
-  with BeforeAndAfterAll
   with PrivateMethodTester {
 
   private val numWorkers = 2
@@ -69,7 +68,7 @@ class StandaloneDynamicAllocationSuite
     workers = makeWorkers(10, 2048)
     // Wait until all workers register with master successfully
     eventually(timeout(1.minute), interval(10.milliseconds)) {
-      assert(getMasterState.workers.size === numWorkers)
+      assert(getMasterState.workers.length === numWorkers)
     }
   }
 
@@ -93,7 +92,7 @@ class StandaloneDynamicAllocationSuite
     val appId = sc.applicationId
     eventually(timeout(10.seconds), interval(10.millis)) {
       val apps = getApplications()
-      assert(apps.size === 1)
+      assert(apps.length === 1)
       assert(apps.head.id === appId)
       assert(apps.head.executors.size === 2)
       assert(apps.head.getExecutorLimit === Int.MaxValue)
@@ -140,7 +139,7 @@ class StandaloneDynamicAllocationSuite
     val appId = sc.applicationId
     eventually(timeout(10.seconds), interval(10.millis)) {
       val apps = getApplications()
-      assert(apps.size === 1)
+      assert(apps.length === 1)
       assert(apps.head.id === appId)
       assert(apps.head.executors.size === 2)
       assert(apps.head.executors.values.map(_.cores).toArray === Array(4, 4))
@@ -195,7 +194,7 @@ class StandaloneDynamicAllocationSuite
     val appId = sc.applicationId
     eventually(timeout(10.seconds), interval(10.millis)) {
       val apps = getApplications()
-      assert(apps.size === 1)
+      assert(apps.length === 1)
       assert(apps.head.id === appId)
       assert(apps.head.executors.size === 2)
       assert(apps.head.executors.values.map(_.cores).toArray === Array(8, 8))
@@ -248,7 +247,7 @@ class StandaloneDynamicAllocationSuite
     val appId = sc.applicationId
     eventually(timeout(10.seconds), interval(10.millis)) {
       val apps = getApplications()
-      assert(apps.size === 1)
+      assert(apps.length === 1)
       assert(apps.head.id === appId)
       assert(apps.head.executors.size === 10) // 20 cores total
       assert(apps.head.getExecutorLimit === Int.MaxValue)
@@ -302,7 +301,7 @@ class StandaloneDynamicAllocationSuite
     val appId = sc.applicationId
     eventually(timeout(10.seconds), interval(10.millis)) {
       val apps = getApplications()
-      assert(apps.size === 1)
+      assert(apps.length === 1)
       assert(apps.head.id === appId)
       assert(apps.head.executors.size === 4) // 8 cores total
       assert(apps.head.getExecutorLimit === Int.MaxValue)
@@ -360,7 +359,7 @@ class StandaloneDynamicAllocationSuite
     sc.requestExecutors(2)
     eventually(timeout(10.seconds), interval(10.millis)) {
       val apps = getApplications()
-      assert(apps.size === 1)
+      assert(apps.length === 1)
       assert(apps.head.id === appId)
       assert(apps.head.executors.size === 2)
       assert(apps.head.getExecutorLimit === 2)
@@ -385,7 +384,7 @@ class StandaloneDynamicAllocationSuite
     sc.requestExecutors(2)
     eventually(timeout(10.seconds), interval(10.millis)) {
       val apps = getApplications()
-      assert(apps.size === 1)
+      assert(apps.length === 1)
       assert(apps.head.id === appId)
       assert(apps.head.executors.size === 2)
       assert(apps.head.getExecutorLimit === 2)
@@ -425,7 +424,7 @@ class StandaloneDynamicAllocationSuite
     val appId = sc.applicationId
     eventually(timeout(10.seconds), interval(10.millis)) {
       val apps = getApplications()
-      assert(apps.size === 1)
+      assert(apps.length === 1)
       assert(apps.head.id === appId)
       assert(apps.head.executors.size === 2)
       assert(apps.head.getExecutorLimit === Int.MaxValue)
@@ -465,7 +464,7 @@ class StandaloneDynamicAllocationSuite
     val appId = sc.applicationId
     eventually(timeout(10.seconds), interval(10.millis)) {
       val apps = getApplications()
-      assert(apps.size === 1)
+      assert(apps.length === 1)
       assert(apps.head.id === appId)
       assert(apps.head.executors.size === initialExecutorLimit)
       assert(apps.head.getExecutorLimit === initialExecutorLimit)
@@ -477,7 +476,7 @@ class StandaloneDynamicAllocationSuite
     val appId = sc.applicationId
     eventually(timeout(10.seconds), interval(10.millis)) {
       val apps = getApplications()
-      assert(apps.size === 1)
+      assert(apps.length === 1)
       assert(apps.head.id === appId)
       assert(apps.head.executors.size === 2)
       assert(apps.head.getExecutorLimit === Int.MaxValue)
@@ -493,8 +492,53 @@ class StandaloneDynamicAllocationSuite
 
     eventually(timeout(10.seconds), interval(100.millis)) {
       val afterList = getApplications().head.executors.keys.toSet
-      assert(beforeList.intersect(afterList).size == 0)
+      assert(beforeList.intersect(afterList).isEmpty)
     }
+  }
+
+  test("SPARK-59055: SparkContext reports the hold status of the application to the Master") {
+    sc = new SparkContext(appConf
+      .set(config.SHUFFLE_SERVICE_ENABLED, true)
+      .set(config.DECOMMISSION_ENABLED, true))
+    // The report from the end of the SparkContext constructor.
+    eventually(timeout(10.seconds), interval(10.millis)) {
+      assert(getApplications().length === 1)
+      assert(getApplications().head.holdSupported)
+    }
+    assert(!getApplications().head.held)
+
+    assert(sc.holdExecutors())
+    eventually(timeout(10.seconds), interval(10.millis)) {
+      assert(getApplications().head.held)
+    }
+    // The faked executors never exit, so all of them are still counted as draining.
+    assert(getApplications().head.numDrainingExecutors === 2)
+
+    assert(sc.resumeExecutors())
+    eventually(timeout(10.seconds), interval(10.millis)) {
+      assert(!getApplications().head.held)
+    }
+  }
+
+  test("SPARK-59055: spark.ui.holdEnabled=false does not suppress the hold status") {
+    sc = new SparkContext(appConf
+      .set(config.SHUFFLE_SERVICE_ENABLED, true)
+      .set(config.DECOMMISSION_ENABLED, true)
+      .set(config.UI.UI_HOLD_ENABLED, false))
+    eventually(timeout(10.seconds), interval(10.millis)) {
+      assert(getApplications().length === 1)
+    }
+
+    // spark.ui.holdEnabled gates the controls on the driver UI, not the capability itself:
+    // holdExecutors() is a developer API that the config does not touch, so a hold made with
+    // the config off must still be visible on the Master.
+    assert(sc.holdExecutors())
+    eventually(timeout(10.seconds), interval(10.millis)) {
+      assert(getApplications().head.held)
+    }
+    assert(getApplications().head.holdSupported)
+    assert(getApplications().head.isHeld)
+    assert(getApplications().head.numDrainingExecutors === 2)
   }
 
   test("executor registration on a excluded host must fail") {
@@ -571,7 +615,7 @@ class StandaloneDynamicAllocationSuite
   }
 
   /** Get the applications that are active from Master */
-  private def getApplications(): Seq[ApplicationInfo] = {
+  private def getApplications(): Array[ApplicationInfo] = {
     getMasterState.activeApps
   }
 
@@ -632,6 +676,9 @@ class StandaloneDynamicAllocationSuite
         Map.empty, ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
       backend.driverEndpoint.askSync[Boolean](message)
       backend.driverEndpoint.send(LaunchedExecutor(id))
+      eventually(timeout(10.seconds), interval(100.millis)) {
+        assert(backend.getExecutorAvailableCpus(id).exists(_ > 0))
+      }
     }
   }
 
@@ -649,7 +696,7 @@ class StandaloneDynamicAllocationSuite
     override def receive: PartialFunction[Any, Unit] = testReceive.orElse(super.receive)
 
     private def testReceive: PartialFunction[Any, Unit] = synchronized {
-      case LaunchExecutor(_, appId, execId, _, _, _, _) =>
+      case LaunchExecutor(_, appId, execId, _, _, _, _, _) =>
         self.send(ExecutorStateChanged(appId, execId, ExecutorState.RUNNING, None, None))
     }
 

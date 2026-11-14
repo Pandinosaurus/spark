@@ -30,6 +30,7 @@ import org.apache.hadoop.mapreduce.lib.output.FileOutputCommitter
 import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.mapred.SparkHadoopMapRedUtil
 
 /**
@@ -57,6 +58,9 @@ import org.apache.spark.mapred.SparkHadoopMapRedUtil
  *                                  /path/to/outputPath/.spark-staging-{jobId}/a=1/b=1.
  *                                  2. When [[FileOutputCommitter]] algorithm version set to 2,
  *                                  committing tasks directly move task attempt output files to
+ *                                  /path/to/outputPath/.spark-staging-{jobId}/a=1/b=1.
+ *                                  3. When the committer is not a [[FileOutputCommitter]], task
+ *                                  attempts directly write files to
  *                                  /path/to/outputPath/.spark-staging-{jobId}/a=1/b=1.
  *
  *                                  At the end of committing job, we move output files from
@@ -98,13 +102,13 @@ class HadoopMapReduceCommitProtocol(
    * e.g. a=1/b=2. Files under these partitions will be saved into staging directory and moved to
    * destination directory at the end, if `dynamicPartitionOverwrite` is true.
    */
-  @transient private var partitionPaths: mutable.Set[String] = null
+  @transient protected var partitionPaths: mutable.Set[String] = null
 
   /**
    * The staging directory of this write job. Spark uses it to deal with files with absolute output
    * path, or writing data into partitioned directory with dynamicPartitionOverwrite=true.
    */
-  protected def stagingDir = getStagingDir(path, jobId)
+  @transient protected lazy val stagingDir = getStagingDir(path, jobId)
 
   protected def setupCommitter(context: TaskAttemptContext): OutputCommitter = {
     val format = context.getOutputFormatClass.getConstructor().newInstance()
@@ -117,23 +121,21 @@ class HadoopMapReduceCommitProtocol(
   }
 
   override def newTaskTempFile(
-      taskContext: TaskAttemptContext, dir: Option[String], ext: String): String = {
-    newTaskTempFile(taskContext, dir, FileNameSpec("", ext))
-  }
-
-  override def newTaskTempFile(
       taskContext: TaskAttemptContext, dir: Option[String], spec: FileNameSpec): String = {
     val filename = getFilename(taskContext, spec)
 
+    if (dynamicPartitionOverwrite) {
+      assert(dir.isDefined,
+        "The dataset to be written must be partitioned when dynamicPartitionOverwrite is true.")
+      partitionPaths += dir.get
+    }
     val stagingDir: Path = committer match {
       // For FileOutputCommitter it has its own staging path called "work path".
       case f: FileOutputCommitter =>
-        if (dynamicPartitionOverwrite) {
-          assert(dir.isDefined,
-            "The dataset to be written must be partitioned when dynamicPartitionOverwrite is true.")
-          partitionPaths += dir.get
-        }
         new Path(Option(f.getWorkPath).map(_.toString).getOrElse(path))
+      // Other committers, e.g. Hadoop's ManifestCommitter, do not commit the files written here,
+      // so write them to the staging directory, from which commitJob moves them into place.
+      case _ if dynamicPartitionOverwrite => this.stagingDir
       case _ => new Path(path)
     }
 
@@ -142,11 +144,6 @@ class HadoopMapReduceCommitProtocol(
     }.getOrElse {
       new Path(stagingDir, filename).toString
     }
-  }
-
-  override def newTaskTempFileAbsPath(
-      taskContext: TaskAttemptContext, absoluteDir: String, ext: String): String = {
-    newTaskTempFileAbsPath(taskContext, absoluteDir, FileNameSpec("", ext))
   }
 
   override def newTaskTempFileAbsPath(
@@ -167,7 +164,8 @@ class HadoopMapReduceCommitProtocol(
     // Note that %05d does not truncate the split number, so if we have more than 100000 tasks,
     // the file name is fine and won't overflow.
     val split = taskContext.getTaskAttemptID.getTaskID.getId
-    f"${spec.prefix}part-$split%05d-$jobId${spec.suffix}"
+    val basename = taskContext.getConfiguration.get("mapreduce.output.basename", "part")
+    f"${spec.prefix}$basename-$split%05d-$jobId${spec.suffix}"
   }
 
   override def setupJob(jobContext: JobContext): Unit = {
@@ -195,6 +193,21 @@ class HadoopMapReduceCommitProtocol(
       val (allAbsPathFiles, allPartitionPaths) =
         taskCommits.map(_.obj.asInstanceOf[(Map[String, String], Set[String])]).unzip
       val fs = stagingDir.getFileSystem(jobContext.getConfiguration)
+      val partitionPaths = allPartitionPaths.foldLeft(Set[String]())(_ ++ _)
+
+      if (dynamicPartitionOverwrite && !committer.isInstanceOf[FileOutputCommitter]) {
+        // Other committers may delete their output directory, which is the staging directory
+        // here, on job commit, e.g. S3A's directory committer in the replace conflict mode.
+        // Check the staged partitions before deleting any destination partition.
+        for (part <- partitionPaths) {
+          val stagingPartPath = new Path(stagingDir, part)
+          if (!fs.exists(stagingPartPath)) {
+            throw new IOException(s"Failed to overwrite dynamic partitions because " +
+              s"$stagingPartPath does not exist after the job commit of " +
+              s"${committer.getClass.getName}. No destination partition was changed.")
+          }
+        }
+      }
 
       val filesToMove = allAbsPathFiles.foldLeft(Map[String, String]())(_ ++ _)
       logDebug(s"Committing files staged for absolute locations $filesToMove")
@@ -213,7 +226,6 @@ class HadoopMapReduceCommitProtocol(
       }
 
       if (dynamicPartitionOverwrite) {
-        val partitionPaths = allPartitionPaths.foldLeft(Set[String]())(_ ++ _)
         logDebug(s"Clean up default partition directories for overwriting: $partitionPaths")
         for (part <- partitionPaths) {
           val finalPartPath = new Path(path, part)
@@ -252,7 +264,7 @@ class HadoopMapReduceCommitProtocol(
       committer.abortJob(jobContext, JobStatus.State.FAILED)
     } catch {
       case e: IOException =>
-        logWarning(s"Exception while aborting ${jobContext.getJobID}", e)
+        logWarning(log"Exception while aborting ${MDC(JOB_ID, jobContext.getJobID)}", e)
     }
     try {
       if (hasValidPath) {
@@ -261,7 +273,7 @@ class HadoopMapReduceCommitProtocol(
       }
     } catch {
       case e: IOException =>
-        logWarning(s"Exception while aborting ${jobContext.getJobID}", e)
+        logWarning(log"Exception while aborting ${MDC(JOB_ID, jobContext.getJobID)}", e)
     }
   }
 
@@ -292,7 +304,8 @@ class HadoopMapReduceCommitProtocol(
       committer.abortTask(taskContext)
     } catch {
       case e: IOException =>
-        logWarning(s"Exception while aborting ${taskContext.getTaskAttemptID}", e)
+        logWarning(log"Exception while aborting " +
+          log"${MDC(TASK_ATTEMPT_ID, taskContext.getTaskAttemptID)}", e)
     }
     // best effort cleanup of other staged files
     try {
@@ -302,7 +315,8 @@ class HadoopMapReduceCommitProtocol(
       }
     } catch {
       case e: IOException =>
-        logWarning(s"Exception while aborting ${taskContext.getTaskAttemptID}", e)
+        logWarning(log"Exception while aborting " +
+          log"${MDC(TASK_ATTEMPT_ID, taskContext.getTaskAttemptID)}", e)
     }
   }
 }

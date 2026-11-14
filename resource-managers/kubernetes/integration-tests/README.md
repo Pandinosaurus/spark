@@ -5,23 +5,23 @@ title: Spark on Kubernetes Integration Tests
 
 # Running the Kubernetes Integration Tests
 
-Note that the integration test framework is currently being heavily revised and
-is subject to change.
-
 The simplest way to run the integration tests is to install and run Minikube, then run the following from this
 directory:
 
     ./dev/dev-run-integration-tests.sh
 
-To run tests with Java 11 instead of Java 8, use `--java-image-tag` to specify the base image.
+To run tests with a specific Java version instead of Java 25, use `--java-image-tag` to specify the
+[base image](https://hub.docker.com/_/eclipse-temurin/tags) accordingly.
 
-    ./dev/dev-run-integration-tests.sh --java-image-tag 11-jre-slim
+    ./dev/dev-run-integration-tests.sh --java-image-tag 21-jre
 
-To run tests with Hadoop 2.7 instead of Hadoop 3.2, use `--hadoop-profile`.
+To run tests with a custom docker image, use `--docker-file` to specify the Dockerfile.
+Note that if both `--docker-file` and `--java-image-tag` are used, `--docker-file` is preferred,
+and the custom Dockerfile need to include a Java installation by itself.
 
-    ./dev/dev-run-integration-tests.sh --hadoop-profile hadoop-2.7
+    ./dev/dev-run-integration-tests.sh --docker-file ../docker/src/main/dockerfiles/spark/Dockerfile
 
-The minimum tested version of Minikube is 1.7.3. The kube-dns addon must be enabled. Minikube should
+The minimum tested version of Minikube is 1.38.0. The kube-dns addon must be enabled. Minikube should
 run with a minimum of 4 CPUs and 6G of memory:
 
     minikube start --cpus 4 --memory 6144
@@ -40,15 +40,21 @@ default this is set to `minikube`, the available backends are their prerequisite
 
 ### `minikube`
 
-Uses the local `minikube` cluster, this requires that `minikube` 1.7.3 or greater be installed and that it be allocated
+Uses the local `minikube` cluster, this requires that `minikube` 1.38.0 or greater be installed and that it be allocated
 at least 4 CPUs and 6GB memory (some users have reported success with as few as 3 CPUs and 4GB memory).  The tests will 
 check if `minikube` is started and abort early if it isn't currently running.
 
-### `docker-for-desktop`
+### `rancher-desktop`
+
+[Rancher Desktop](https://github.com/rancher-sandbox/rancher-desktop) is an open-source (Apache 2.0 license)
+project that brings Kubernetes and container management to the desktop. It runs on Windows, macOS and Linux.
+The `rancher-desktop` backend configures the tests to use it.
+
+### `docker-desktop`
 
 Since July 2018 Docker for Desktop provide an optional Kubernetes cluster that can be enabled as described in this 
 [blog post](https://blog.docker.com/2018/07/kubernetes-is-now-available-in-docker-desktop-stable-channel/).  Assuming 
-this is enabled using this backend will auto-configure itself from the `docker-for-desktop` context that Docker creates 
+this is enabled using this backend will auto-configure itself from the `docker-desktop` context that Docker creates
 in your `~/.kube/config` file. If your config file is in a different location you should set the `KUBECONFIG` 
 environment variable appropriately.
 
@@ -75,7 +81,11 @@ image tag that you have built by other means already, pass the tag to the test s
 where if you still want to use images that were built before by the test framework:
 
     ./dev/dev-run-integration-tests.sh --image-tag $(cat target/imageTag.txt)
-    
+
+The Docker image repository is customised via the `--image-repo <repo>` flag, this is the repository
+that contains the images when a specific image tag is set, or to which freshly built images are
+pushed. The default is `docker.io/kubespark`.
+
 ### Customising the Image Names
 
 If your image names do not follow the standard Spark naming convention - `spark`, `spark-py` and `spark-r` - then you can customise the names using several options.
@@ -90,8 +100,10 @@ Alternatively if you use completely custom names then you can set each individua
 
 ## Spark Distribution Under Test
 
-The Spark code to test is handed to the integration test system via a tarball. Here is the option that is used to 
-specify the tarball:
+By default, when neither `--spark-tgz` nor `--image-tag` is specified, the Docker images are built
+directly from the current source tree, so no extra option is needed.
+
+Alternatively, the Spark code to test can be handed to the integration test system via a tarball:
 
 * `--spark-tgz <path-to-tgz>` - set `<path-to-tgz>` to point to a tarball containing the Spark distribution to test.
 
@@ -100,9 +112,6 @@ as one of the options to ensure that Kubernetes support is included in the distr
 runnable distribution please see the 
 [Building Spark](https://spark.apache.org/docs/latest/building-spark.html#building-a-runnable-distribution) 
 documentation.
-
-**TODO:** Don't require the packaging of the built Spark artifacts into this tarball, just read them out of the current 
-tree.
 
 ## Customizing the Namespace and Service Account
 
@@ -120,19 +129,37 @@ to get, list, watch, and create pods. For clusters with RBAC turned on, it's imp
 granted to the service account in the namespace through an appropriate role and role binding. A reference RBAC 
 configuration is provided in `dev/spark-rbac.yaml`.
 
+## Selecting the Tests to Run
+
+The tests are tagged, and the set of tests to run can be controlled via the following flags:
+
+* `--include-tags <tags>` - comma separated list of tags to include in addition to the always
+  included `k8s` tag.
+* `--exclude-tags <tags>` - comma separated list of tags to exclude.
+* `--default-exclude-tags <tags>` - overrides the default list of excluded tags, which is
+  `org.apache.spark.deploy.k8s.integrationtest.YuniKornTag`. Pass an empty string to clear the
+  default exclusions, e.g. to run the YuniKorn tests.
+
+## Customising the Build
+
+* `--java-version <version>` - Java version to build Spark and the tests with. The default is `21`.
+* `--hadoop-profile <profile>` - Hadoop Maven profile to build with. The default is `hadoop-3`.
+* `--skip-building-dependencies` - skip rebuilding the modules the integration tests depend on
+  (drops Maven's `-am` flag). Useful for iterating when the current tree is already built.
+
 # Running the Test Directly
 
 If you prefer to run just the integration tests directly, then you can customise the behaviour via passing system 
 properties to Maven.  For example:
 
-    mvn integration-test -am -pl :spark-kubernetes-integration-tests_2.12 \
+    mvn integration-test -am -pl :spark-kubernetes-integration-tests_2.13 \
                             -Pkubernetes -Pkubernetes-integration-tests \
-                            -Phadoop-2.7 -Dhadoop.version=2.7.4 \
-                            -Dspark.kubernetes.test.sparkTgz=spark-3.0.0-SNAPSHOT-bin-example.tgz \
+                            -Phadoop-3 -Dhadoop.version=3.5.0 \
+                            -Dspark.kubernetes.test.sparkTgz=spark-5.0.0-SNAPSHOT-bin-example.tgz \
                             -Dspark.kubernetes.test.imageTag=sometag \
                             -Dspark.kubernetes.test.imageRepo=docker.io/somerepo \
                             -Dspark.kubernetes.test.namespace=spark-int-tests \
-                            -Dspark.kubernetes.test.deployMode=docker-for-desktop \
+                            -Dspark.kubernetes.test.deployMode=docker-desktop \
                             -Dtest.include.tags=k8s
                             
                             
@@ -165,7 +192,7 @@ to the wrapper scripts and using the wrapper scripts will simply set these appro
     <td><code>spark.kubernetes.test.deployMode</code></td>
     <td>
       The integration test backend to use.  Acceptable values are <code>minikube</code>, 
-      <code>docker-for-desktop</code> and <code>cloud</code>.
+      <code>docker-desktop</code>, <code>rancher-desktop</code> and <code>cloud</code>.
     <td><code>minikube</code></td>
   </tr>
   <tr>
@@ -180,7 +207,7 @@ to the wrapper scripts and using the wrapper scripts will simply set these appro
   <tr>
     <td><code>spark.kubernetes.test.master</code></td>
     <td>
-      When using the <code>cloud-url</code> backend must be specified to indicate the K8S master URL to communicate 
+      When using the <code>cloud</code> backend must be specified to indicate the K8S master URL to communicate
       with.
     </td>
     <td></td>
@@ -196,9 +223,9 @@ to the wrapper scripts and using the wrapper scripts will simply set these appro
   <tr>
     <td><code>spark.kubernetes.test.javaImageTag</code></td>
     <td>
-      A specific OpenJDK base image tag to use, when set uses it instead of 8-jre-slim.
+      A specific Eclipse Temurin OpenJDK base image tag to use, when set uses it instead of 25.
     </td>
-    <td><code>8-jre-slim</code></td>
+    <td><code>N/A</code></td>
   </tr>
   <tr>
     <td><code>spark.kubernetes.test.imageTagFile</code></td>
@@ -238,6 +265,13 @@ to the wrapper scripts and using the wrapper scripts will simply set these appro
     <td><code>spark-r</code></td>
   </tr>
   <tr>
+    <td><code>spark.kubernetes.test.dockerFile</code></td>
+    <td>
+      The path to the custom Dockerfile
+    </td>
+    <td><code>Dockerfile</code></td>
+  </tr>
+  <tr>
     <td><code>spark.kubernetes.test.namespace</code></td>
     <td>
       A specific Kubernetes namespace to run the tests in.  If specified then the tests assume that this namespace 
@@ -254,4 +288,151 @@ to the wrapper scripts and using the wrapper scripts will simply set these appro
     </td>
     <td></td>
   </tr>
+  <tr>
+    <td><code>spark.kubernetes.test.driverRequestCores</code></td>
+    <td>
+      Set cpu resource for each driver pod in test, this is currently only for test on cpu resource limited cluster,
+      it's not recommended for other scenarios.
+    </td>
+    <td></td>
+  </tr>
+  <tr>
+    <td><code>spark.kubernetes.test.executorRequestCores</code></td>
+    <td>
+      Set cpu resource for each executor pod in test, this is currently only for test on cpu resource limited cluster,
+      it's not recommended for other scenarios.
+    </td>
+    <td></td>
+  </tr>
+  <tr>
+    <td><code>spark.kubernetes.test.volcanoMaxConcurrencyJobNum</code></td>
+    <td>
+      Set maximum number for concurrency jobs, It helps developers setting suitable resources according to test env in
+      volcano test.
+    </td>
+    <td></td>
+  </tr>
+  <tr>
+    <td><code>test.include.tags</code></td>
+    <td>
+      Comma separated list of test tags to include, e.g. <code>k8s</code>, <code>minikube</code>,
+      <code>local</code>, <code>r</code>, <code>volcano</code>.
+    </td>
+    <td></td>
+  </tr>
+  <tr>
+    <td><code>test.exclude.tags</code></td>
+    <td>
+      Comma separated list of test tags to exclude.
+    </td>
+    <td></td>
+  </tr>
+  <tr>
+    <td><code>test.default.exclude.tags</code></td>
+    <td>
+      The default list of excluded test tags.  Set to an empty string to clear the default
+      exclusions, e.g. to run the YuniKorn tests.
+    </td>
+    <td><code>org.apache.spark.deploy.k8s.integrationtest.YuniKornTag</code></td>
+  </tr>
 </table>
+
+# Running the Kubernetes Integration Tests with SBT
+
+You can use SBT in the same way to build image and run all K8s integration tests except Minikube-only ones.
+
+    build/sbt -Psparkr -Pkubernetes -Pkubernetes-integration-tests \
+        -Dtest.exclude.tags=minikube \
+        -Dspark.kubernetes.test.deployMode=docker-desktop \
+        -Dspark.kubernetes.test.imageTag=2027-01-01 \
+        'kubernetes-integration-tests/test'
+
+The following is an example to rerun tests with the pre-built image.
+
+    build/sbt -Psparkr -Pkubernetes -Pkubernetes-integration-tests \
+        -Dtest.exclude.tags=minikube \
+        -Dspark.kubernetes.test.deployMode=docker-desktop \
+        -Dspark.kubernetes.test.imageTag=2027-01-01 \
+        'kubernetes-integration-tests/runIts'
+
+In addition, you can run a single test selectively.
+
+    build/sbt -Psparkr -Pkubernetes -Pkubernetes-integration-tests \
+        -Dspark.kubernetes.test.deployMode=docker-desktop \
+        -Dspark.kubernetes.test.imageTag=2027-01-01 \
+        'kubernetes-integration-tests/testOnly -- -z "Run SparkPi with a very long application name"'
+
+You can also specify your specific dockerfile to build JVM/Python/R based image to test.
+
+    build/sbt -Psparkr -Pkubernetes -Pkubernetes-integration-tests \
+        -Dtest.exclude.tags=minikube \
+        -Dspark.kubernetes.test.deployMode=docker-desktop \
+        -Dspark.kubernetes.test.imageTag=2027-01-01 \
+        -Dspark.kubernetes.test.dockerFile=/path/to/Dockerfile \
+        -Dspark.kubernetes.test.pyDockerFile=/path/to/py/Dockerfile \
+        -Dspark.kubernetes.test.rDockerFile=/path/to/r/Dockerfile \
+        'kubernetes-integration-tests/test'
+
+# Running the Volcano Integration Tests
+
+## Requirements
+- A minimum of 6 CPUs and 9G of memory is required to complete all Volcano test cases.
+- Volcano v1.14.2.
+
+## Installation
+
+    kubectl apply -f https://raw.githubusercontent.com/volcano-sh/volcano/v1.14.2/installer/volcano-development.yaml
+
+## Run tests
+
+You can specify `-Pvolcano` to enable volcano module to run all Kubernetes and Volcano tests
+
+    build/sbt -Pvolcano -Pkubernetes -Pkubernetes-integration-tests \
+        -Dtest.exclude.tags=minikube \
+        -Dspark.kubernetes.test.deployMode=docker-desktop \
+        'kubernetes-integration-tests/test'
+
+You can also specify `volcano` tag to only run Volcano test:
+
+    build/sbt -Pvolcano -Pkubernetes -Pkubernetes-integration-tests \
+        -Dtest.include.tags=volcano \
+        -Dtest.exclude.tags=minikube \
+        -Dspark.kubernetes.test.deployMode=docker-desktop \
+        'kubernetes-integration-tests/test'
+
+## Cleanup Volcano
+
+    kubectl delete -f https://raw.githubusercontent.com/volcano-sh/volcano/v1.14.2/installer/volcano-development.yaml
+
+# Running the YuniKorn Integration Tests
+
+`YuniKornSuite` runs the Kubernetes integration tests with the
+[Apache YuniKorn](https://yunikorn.apache.org/) scheduler instead of the default scheduler.
+The suite is tagged with `YuniKornTag` which is excluded by default via
+`test.default.exclude.tags`.
+
+## Requirements
+
+- Apache YuniKorn 1.9.0.
+
+## Installation
+
+    helm repo add yunikorn https://apache.github.io/yunikorn-release
+    helm repo update
+    helm install yunikorn yunikorn/yunikorn --namespace yunikorn --version 1.9.0 \
+        --create-namespace --set embedAdmissionController=false
+
+## Run tests
+
+Clear the default excluded tags to enable the YuniKorn tests:
+
+    build/sbt -Pkubernetes -Pkubernetes-integration-tests \
+        -Dtest.exclude.tags=minikube \
+        -Dtest.default.exclude.tags= \
+        -Dspark.kubernetes.test.deployMode=docker-desktop \
+        'kubernetes-integration-tests/testOnly *YuniKornSuite'
+
+## Cleanup YuniKorn
+
+    helm uninstall yunikorn --namespace yunikorn
+

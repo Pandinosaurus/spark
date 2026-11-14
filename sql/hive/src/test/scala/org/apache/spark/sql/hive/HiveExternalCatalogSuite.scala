@@ -18,18 +18,22 @@
 package org.apache.spark.sql.hive
 
 import org.apache.hadoop.conf.Configuration
+import org.apache.logging.log4j.Level
 
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog._
+import org.apache.spark.sql.catalyst.plans.SQLHelper
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.execution.QueryExecutionException
 import org.apache.spark.sql.execution.command.DDLUtils
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructType, TimestampLTZNanosType, TimestampNTZNanosType}
 
 /**
  * Test suite for the [[HiveExternalCatalog]].
  */
-class HiveExternalCatalogSuite extends ExternalCatalogSuite {
+class HiveExternalCatalogSuite extends ExternalCatalogSuite with SQLHelper {
 
   private val externalCatalog: HiveExternalCatalog = {
     val catalog = new HiveExternalCatalog(new SparkConf, new Configuration)
@@ -101,7 +105,7 @@ class HiveExternalCatalogSuite extends ExternalCatalogSuite {
       """.stripMargin)
 
     val newSchema = new StructType().add("a", "string").add("b", "string").add("c", "string")
-    catalog.alterTableDataSchema("db1", "t", newSchema)
+    catalog.alterTableSchema("db1", "t", newSchema)
 
     assert(catalog.getTable("db1", "t").schema == newSchema)
     val bucketString = externalCatalog.client.runSqlHive("DESC FORMATTED db1.t")
@@ -199,5 +203,118 @@ class HiveExternalCatalogSuite extends ExternalCatalogSuite {
       val alteredTable = externalCatalog.getTable("db1", "parq_tbl")
       assert(alteredTable.provider === Some("foo"))
     })
+  }
+
+  test("write collated strings as regular strings in hive - but read them back as collated") {
+    val catalog = newBasicCatalog()
+    val tableName = "collation_tbl"
+    val columnName = "col1"
+
+    val collationsSchema = StructType(Seq(
+      StructField(columnName, StringType("UNICODE"))
+    ))
+    val noCollationsSchema = StructType(Seq(
+      StructField(columnName, StringType)
+    ))
+
+    val tableDDL = CatalogTable(
+      identifier = TableIdentifier(tableName, Some("db1")),
+      tableType = CatalogTableType.MANAGED,
+      storage = storageFormat,
+      schema = collationsSchema,
+      provider = Some("hive"))
+
+    catalog.createTable(tableDDL, ignoreIfExists = false)
+
+    val rawTable = externalCatalog.getRawTable("db1", tableName)
+    assert(DataTypeUtils.sameType(rawTable.schema, noCollationsSchema))
+
+    val readBackTable = externalCatalog.getTable("db1", tableName)
+    assert(DataTypeUtils.sameType(readBackTable.schema, collationsSchema))
+
+    // perform alter table
+    val newSchema = StructType(Seq(
+      StructField("col1", StringType("UTF8_LCASE"))
+    ))
+    catalog.alterTableSchema("db1", tableName, newSchema)
+
+    val alteredRawTable = externalCatalog.getRawTable("db1", tableName)
+    assert(DataTypeUtils.sameType(alteredRawTable.schema, noCollationsSchema))
+
+    val alteredTable = externalCatalog.getTable("db1", tableName)
+    assert(DataTypeUtils.sameType(alteredTable.schema, newSchema))
+  }
+
+  test("SPARK-57835: restore a persisted nanos-typed table when the preview flag is off") {
+    val catalog = newBasicCatalog()
+    val tableName = "nanos_tbl"
+
+    // Nanos types are not Hive-compatible (SPARK-57831), so a datasource table persists an empty
+    // schema in the metastore and the real schema as JSON in the table properties. The table is
+    // created with the preview flag on (the test default via Utils.isTesting).
+    val nanosSchema = StructType(Seq(
+      StructField("id", IntegerType),
+      StructField("ntz", TimestampNTZNanosType(9)),
+      StructField("ltz", TimestampLTZNanosType(7))))
+
+    val tableDDL = CatalogTable(
+      identifier = TableIdentifier(tableName, Some("db1")),
+      tableType = CatalogTableType.MANAGED,
+      storage = storageFormat,
+      schema = nanosSchema,
+      provider = Some("parquet"))
+
+    catalog.createTable(tableDDL, ignoreIfExists = false)
+
+    // Because nanos types are not Hive-compatible, the metastore-visible (raw) schema is the
+    // placeholder EMPTY_DATA_SCHEMA; the true schema lives in the Spark-specific table properties.
+    val rawTable = externalCatalog.getRawTable("db1", tableName)
+    assert(rawTable.schema == HiveExternalCatalog.EMPTY_DATA_SCHEMA)
+
+    // Read-through policy (SPARK-57835): with the preview flag off, catalog restoration must still
+    // reconstruct the persisted nanos schema so the table remains describable and droppable.
+    // Before this change getTable threw FEATURE_NOT_ENABLED here.
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "false") {
+      val restored = externalCatalog.getTable("db1", tableName)
+      assert(DataTypeUtils.sameType(restored.schema, nanosSchema))
+      // The restored nanos columns render with their precision (used by DESCRIBE / SHOW CREATE).
+      assert(restored.schema("ntz").dataType === TimestampNTZNanosType(9))
+      assert(restored.schema("ltz").dataType === TimestampLTZNanosType(7))
+    }
+
+    // And it still round-trips with the flag on.
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      assert(DataTypeUtils.sameType(
+        externalCatalog.getTable("db1", tableName).schema, nanosSchema))
+    }
+  }
+
+  test("SPARK-50137: Avoid fallback to Hive-incompatible ways on thrift exception") {
+    val hadoopConf = new Configuration()
+    // Use an unavailable uri to mock client connection timeout.
+    hadoopConf.set("hive.metastore.uris", "thrift://192.0.2.1:9083")
+    hadoopConf.set("hive.metastore.client.connection.timeout", "1s")
+    // Dummy HiveExternalCatalog to mock that the hive client is still available
+    // when checking database and table.
+    val catalog = new HiveExternalCatalog(new SparkConf, hadoopConf) {
+      override def requireDbExists(db: String): Unit = {}
+      override def tableExists(db: String, table: String): Boolean = false
+    }
+    val logAppender = new LogAppender()
+    withLogAppender(logAppender, level = Some(Level.WARN)) {
+      val table = CatalogTable(
+        identifier = TableIdentifier("tbl", Some("default")),
+        tableType = CatalogTableType.EXTERNAL,
+        storage = storageFormat.copy(locationUri = Some(newUriForDatabase())),
+        schema = new StructType()
+            .add("col1", "string"),
+        provider = Some("parquet"))
+      intercept[Throwable] {
+        catalog.createTable(table, ignoreIfExists = false)
+      }
+    }
+    assert(!logAppender.loggingEvents.map(_.getMessage.getFormattedMessage).contains(
+      "Could not persist `default`.`tbl` in a Hive compatible way. " +
+      "Persisting it into Hive metastore in Spark SQL specific format."))
   }
 }

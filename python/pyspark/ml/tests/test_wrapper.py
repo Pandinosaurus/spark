@@ -15,17 +15,16 @@
 # limitations under the License.
 #
 
-import unittest
 
 import py4j
 
 from pyspark.ml.linalg import DenseVector, Vectors
 from pyspark.ml.regression import LinearRegression
-from pyspark.ml.wrapper import (  # type: ignore[attr-defined]
-    _java2py,
-    _py2java,
+from pyspark.ml.wrapper import (
     JavaParams,
     JavaWrapper,
+    _java2py,
+    _py2java,
 )
 from pyspark.testing.mllibutils import MLlibTestCase
 from pyspark.testing.mlutils import SparkSessionTestCase
@@ -63,11 +62,11 @@ class JavaWrapperMemoryTests(SparkSessionTestCase):
             self.assertIn("LinearRegressionTrainingSummary", summary._java_obj.toString())
             return True
 
-        eventually(condition, timeout=10, catch_assertions=True)
+        eventually(timeout=10, catch_assertions=True)(condition)()
 
         try:
             summary.__del__()
-        except:
+        except BaseException:
             pass
 
         def condition():
@@ -77,7 +76,7 @@ class JavaWrapperMemoryTests(SparkSessionTestCase):
                 summary._java_obj.toString()
             return True
 
-        eventually(condition, timeout=10, catch_assertions=True)
+        eventually(timeout=10, catch_assertions=True)(condition)()
 
 
 class WrapperTests(MLlibTestCase):
@@ -127,12 +126,6 @@ class WrapperTests(MLlibTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.test_wrapper import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

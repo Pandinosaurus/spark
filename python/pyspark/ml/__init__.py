@@ -19,15 +19,7 @@
 DataFrame-based machine learning APIs to let users quickly assemble and configure practical
 machine learning pipelines.
 """
-from pyspark.ml.base import (
-    Estimator,
-    Model,
-    Predictor,
-    PredictionModel,
-    Transformer,
-    UnaryTransformer,
-)
-from pyspark.ml.pipeline import Pipeline, PipelineModel
+
 from pyspark.ml import (
     classification,
     clustering,
@@ -35,14 +27,24 @@ from pyspark.ml import (
     feature,
     fpm,
     image,
+    linalg,
+    param,
     recommendation,
     regression,
     stat,
     tuning,
     util,
-    linalg,
-    param,
 )
+from pyspark.ml.base import (
+    Estimator,
+    Model,
+    PredictionModel,
+    Predictor,
+    Transformer,
+    UnaryTransformer,
+)
+from pyspark.ml.pipeline import Pipeline, PipelineModel
+from pyspark.ml.torch.distributor import TorchDistributor
 
 __all__ = [
     "Transformer",
@@ -66,4 +68,5 @@ __all__ = [
     "util",
     "linalg",
     "param",
+    "TorchDistributor",
 ]

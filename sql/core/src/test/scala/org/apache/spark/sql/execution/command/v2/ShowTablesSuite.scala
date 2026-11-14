@@ -17,15 +17,23 @@
 
 package org.apache.spark.sql.execution.command.v2
 
-import org.apache.spark.sql.{AnalysisException, Row}
-import org.apache.spark.sql.catalyst.analysis.NoSuchNamespaceException
+import org.json4s._
+import org.json4s.jackson.JsonMethods._
+
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.connector.catalog.{InMemoryRelationCatalog, TableSummary}
 import org.apache.spark.sql.execution.command
+import org.apache.spark.util.Utils
 
 /**
  * The class contains tests for the `SHOW TABLES` command to check V2 table catalogs.
  */
 class ShowTablesSuite extends command.ShowTablesSuiteBase with CommandSuiteBase {
   override def defaultNamespace: Seq[String] = Nil
+  // Extended JSON now uses TableSummary.tableType(), and TableCatalog.listTableSummaries
+  // defaults a missing V2 table type property to TableSummary.FOREIGN_TABLE_TYPE.
+  override def expectedTableTypeInJson: String = TableSummary.FOREIGN_TABLE_TYPE
+  override def expectsSessionTempViews: Boolean = false
 
   // The test fails for V1 catalog with the error:
   // org.apache.spark.sql.AnalysisException:
@@ -49,52 +57,104 @@ class ShowTablesSuite extends command.ShowTablesSuiteBase with CommandSuiteBase 
     }
   }
 
-  // The test fails for V1 catalog with the error:
-  // org.apache.spark.sql.AnalysisException:
-  //   The namespace in session catalog must have exactly one name part: spark_catalog.ns1.ns2.tbl
-  test("SHOW TABLE EXTENDED not valid v1 database") {
-    def testV1CommandNamespace(sqlCommand: String, namespace: String): Unit = {
-      val e = intercept[AnalysisException] {
-        sql(sqlCommand)
+  test("show table extended formats table properties") {
+    withNamespaceAndTable("ns", "tbl") { t =>
+      sql(s"CREATE TABLE $t (id bigint) $defaultUsing " +
+        "TBLPROPERTIES ('p1'='v1', 'p2'='v2')")
+
+      val information = sql(s"SHOW TABLE EXTENDED IN $catalog.ns LIKE 'tbl'")
+        .collect()(0)(3).toString
+
+      assert(information.split("\n").contains("Table Properties: [p1=v1, p2=v2]"))
+    }
+  }
+
+  gridTest("show table extended preserves reserved metadata with display properties")(
+      Seq((false, false), (true, true))) {
+    case (external, withLocation) =>
+      withNamespaceAndTable("ns", "tbl") { _ =>
+        createTableWithDisplayProperties("ns", "tbl", external, withLocation)
+
+        val information = sql(s"SHOW TABLE EXTENDED IN $catalog.ns LIKE 'tbl'")
+          .head().getString(3)
+        val tableType = if (external) "EXTERNAL" else "MANAGED"
+        val locationRow = if (withLocation) "Location: file:/tmp/display-properties\n" else ""
+        val properties =
+          "[catalog-label=catalog-value, password=*********(redacted), persisted=stored]"
+        assert(information ===
+          s"""Catalog: $catalog
+             |Namespace: ns
+             |Table: tbl
+             |Type: $tableType
+             |Comment: table comment
+             |${locationRow}Provider: _
+             |Owner: ${Utils.getCurrentUserName()}
+             |Table Properties: $properties
+             |Schema: root
+             | |-- id: long (nullable = true)
+             |
+             |""".stripMargin)
       }
-      assert(e.message.contains(s"SHOW TABLE EXTENDED is not supported for v2 tables"))
-    }
+  }
 
-    val namespace = s"$catalog.ns1.ns2"
-    val table = "tbl"
-    withTable(s"$namespace.$table") {
-      sql(s"CREATE TABLE $namespace.$table (id bigint, data string) " +
-        s"$defaultUsing PARTITIONED BY (id)")
+  test("show table extended omits empty table properties") {
+    withNamespaceAndTable("ns", "tbl") { t =>
+      sql(s"CREATE TABLE $t (id bigint) $defaultUsing")
 
-      testV1CommandNamespace(s"SHOW TABLE EXTENDED FROM $namespace LIKE 'tb*'",
-        namespace)
-      testV1CommandNamespace(s"SHOW TABLE EXTENDED IN $namespace LIKE 'tb*'",
-        namespace)
-      testV1CommandNamespace("SHOW TABLE EXTENDED " +
-        s"FROM $namespace LIKE 'tb*' PARTITION(id=1)",
-        namespace)
-      testV1CommandNamespace("SHOW TABLE EXTENDED " +
-        s"IN $namespace LIKE 'tb*' PARTITION(id=1)",
-        namespace)
+      val information = sql(s"SHOW TABLE EXTENDED IN $catalog.ns LIKE 'tbl'")
+        .collect()(0)(3).toString
+
+      assert(!information.split("\n").exists(_.startsWith("Table Properties")))
     }
   }
 
-  // TODO(SPARK-33393): Support SHOW TABLE EXTENDED in DSv2
-  test("SHOW TABLE EXTENDED: an existing table") {
-    val table = "people"
-    withTable(s"$catalog.$table") {
-      sql(s"CREATE TABLE $catalog.$table (name STRING, id INT) $defaultUsing")
-      val errMsg = intercept[AnalysisException] {
-        sql(s"SHOW TABLE EXTENDED FROM $catalog LIKE '*$table*'").collect()
-      }.getMessage
-      assert(errMsg.contains("SHOW TABLE EXTENDED is not supported for v2 tables"))
+  test("show table extended as json returns relation catalog table and view types") {
+    val relationCatalog = "show_table_extended_json_relation_catalog"
+    withSQLConf(s"spark.sql.catalog.$relationCatalog" ->
+        classOf[InMemoryRelationCatalog].getName) {
+      withNamespaceAndTable("ns", "tbl", relationCatalog) { t =>
+        sql(s"CREATE TABLE $t (id INT) $defaultUsing")
+        withView(s"$relationCatalog.ns.vw") {
+          sql(s"CREATE VIEW $relationCatalog.ns.vw AS SELECT 1 AS id")
+
+          val jsonStr = sql(
+            s"SHOW TABLE EXTENDED IN $relationCatalog.ns LIKE '*' AS JSON")
+            .collect()(0).getString(0)
+          val tables = (parse(jsonStr) \ "tables").asInstanceOf[JArray].arr
+          def entry(name: String): JValue = {
+            tables.find(e => (e \ "name").extract[String] == name)
+              .getOrElse(fail(s"Missing $name in SHOW TABLE EXTENDED AS JSON: $tables"))
+          }
+
+          assert((entry("tbl") \ "type").extract[String] ===
+            TableSummary.FOREIGN_TABLE_TYPE)
+          assert((entry("vw") \ "type").extract[String] ===
+            TableSummary.VIEW_TABLE_TYPE)
+          assert(tables.map(e => (e \ "name").extract[String]).toSet === Set("tbl", "vw"))
+        }
+      }
     }
   }
 
-  test("show table in a not existing namespace") {
-    val msg = intercept[NoSuchNamespaceException] {
-      runShowTablesSql(s"SHOW TABLES IN $catalog.unknown", Seq())
-    }.getMessage
-    assert(msg.matches("(Database|Namespace) 'unknown' not found"))
+  override protected def extendedPartInNonPartedTableError(
+      catalog: String,
+      namespace: String,
+      table: String): (String, Map[String, String]) = {
+    ("PARTITIONS_NOT_FOUND",
+      Map("partitionList" -> "`id`", "tableName" -> s"`$catalog`.`$namespace`.`$table`"))
   }
+
+  protected override def namespaceKey: String = "Namespace"
+
+  protected override def extendedTableInfo: String =
+    s"""Type: MANAGED
+       |Provider: _
+       |Owner: ${Utils.getCurrentUserName()}""".stripMargin
+
+  protected override def extendedTableSchema: String =
+    s"""Schema: root
+       | |-- id: long (nullable = true)
+       | |-- data: string (nullable = true)""".stripMargin
+
+  protected override def selectCommandSchema: Array[String] = Array("id", "data")
 }

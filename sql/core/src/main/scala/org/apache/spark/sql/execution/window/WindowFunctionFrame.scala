@@ -19,11 +19,13 @@ package org.apache.spark.sql.execution.window
 
 import java.util
 
+import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
 import org.apache.spark.sql.catalyst.expressions.aggregate.NoOp
 import org.apache.spark.sql.execution.ExternalAppendOnlyUnsafeRowArray
+import org.apache.spark.util.ArrayImplicits._
 
 
 /**
@@ -60,6 +62,17 @@ abstract class WindowFunctionFrame {
    * This should be called after the current row is updated via `write`.
    */
   def currentUpperBound(): Int
+
+  /**
+   * Whether this frame produces correct results for a partition with more than `Int.MaxValue`
+   * rows. The window driver rejects such a partition unless every frame returns `true` (see
+   * `WindowEvaluatorFactoryBase.checkPartitionSizeLimit`).
+   *
+   * A frame may return `true` only if it does not read the `index` passed to `write` or the
+   * window bounds, which are `Int`s, and tracks any position within the partition as a `Long`.
+   * Defaults to `false`, so a new frame is rejected for such partitions until shown to be safe.
+   */
+  def supportsLargePartition: Boolean = false
 }
 
 object WindowFunctionFrame {
@@ -86,7 +99,8 @@ abstract class OffsetWindowFunctionFrameBase(
     expressions: Array[OffsetWindowFunction],
     inputSchema: Seq[Attribute],
     newMutableProjection: (Seq[Expression], Seq[Attribute]) => MutableProjection,
-    offset: Int)
+    offset: Int,
+    ignoreNulls: Boolean)
   extends WindowFunctionFrame {
 
   /** Rows of the partition currently being processed. */
@@ -97,8 +111,11 @@ abstract class OffsetWindowFunctionFrameBase(
    */
   protected var inputIterator: Iterator[UnsafeRow] = _
 
-  /** Index of the input row currently used for output. */
-  protected var inputIndex = 0
+  /**
+   * Index of the input row currently used for output. This is a `Long` so that the frames that
+   * support partitions with more than `Int.MaxValue` rows do not overflow it.
+   */
+  protected var inputIndex: Long = 0
 
   /** Attributes of the input row currently used for output. */
   protected val inputAttrs = inputSchema.map(_.withNullability(true))
@@ -110,7 +127,7 @@ abstract class OffsetWindowFunctionFrameBase(
   protected val projection = {
     // Collect the expressions and bind them.
     val boundExpressions = Seq.fill(ordinal)(NoOp) ++ bindReferences(
-      expressions.toSeq.map(_.input), inputAttrs)
+      expressions.toImmutableArraySeq.map(_.input), inputAttrs)
 
     // Create the projection.
     newMutableProjection(boundExpressions, Nil).target(target)
@@ -119,10 +136,13 @@ abstract class OffsetWindowFunctionFrameBase(
   /** Create the projection used when the offset row DOES NOT exists. */
   protected val fillDefaultValue = {
     // Collect the expressions and bind them.
-    val boundExpressions = Seq.fill(ordinal)(NoOp) ++ expressions.toSeq.map { e =>
-      if (e.default == null || e.default.foldable && e.default.eval() == null) {
+    val boundExpressions = Seq.fill(ordinal)(NoOp) ++ expressions.toImmutableArraySeq.map { e =>
+      if (e.default == null) {
         // The default value is null.
         Literal.create(null, e.dataType)
+      } else if (e.default.foldable) {
+        // The default value is foldable.
+        Literal.create(e.default.eval(), e.dataType)
       } else {
         // The default value is an expression.
         BindReferences.bindReference(e.default, inputAttrs)
@@ -139,6 +159,8 @@ abstract class OffsetWindowFunctionFrameBase(
   // The number of rows skipped to get the next UnsafeRow where the input operator by function
   // is not null.
   protected var skippedNonNullCount = 0
+
+  protected val absOffset = Math.abs(offset)
 
   // Reset the states by the data of the new partition.
   protected def resetStates(rows: ExternalAppendOnlyUnsafeRowArray): Unit = {
@@ -157,6 +179,9 @@ abstract class OffsetWindowFunctionFrameBase(
 
   /** find the offset row whose input is not null */
   protected def findNextRowWithNonNullInput(): Unit = {
+    // In order to find the offset row whose input is not-null,
+    // offset < = input.length must be guaranteed.
+    assert(offset <= input.length)
     while (skippedNonNullCount < offset && inputIndex < input.length) {
       val r = WindowFunctionFrame.getNextOrNull(inputIterator)
       if (!nullCheck(r)) {
@@ -165,11 +190,54 @@ abstract class OffsetWindowFunctionFrameBase(
       }
       inputIndex += 1
     }
+    if (skippedNonNullCount < offset && inputIndex == input.length) {
+      // The size of non-null input is less than offset, cannot find the offset row whose input
+      // is not null. Therefore, reset `nextSelectedRow` with empty row.
+      nextSelectedRow = EmptyRow
+    }
   }
 
-  override def currentLowerBound(): Int = throw new UnsupportedOperationException()
+  /** Indicates whether the default values are Literal. */
+  protected lazy val onlyLiterals = expressions.forall { e =>
+    e.default == null || e.default.foldable
+  }
 
-  override def currentUpperBound(): Int = throw new UnsupportedOperationException()
+  override def prepare(rows: ExternalAppendOnlyUnsafeRowArray): Unit = {
+    resetStates(rows)
+    if (absOffset > rows.length) {
+      // Avoid evaluating non-literal defaults with EmptyRow,
+      // which causes NullPointerException.
+      // Check whether defaults are Literal.
+      if (onlyLiterals) {
+        fillDefaultValue(EmptyRow)
+      }
+      // Handle non-literal defaults in write().
+    } else {
+      if (ignoreNulls) {
+        prepareForIgnoreNulls()
+      } else {
+        prepareForRespectNulls()
+      }
+    }
+  }
+
+  protected def prepareForIgnoreNulls(): Unit = findNextRowWithNonNullInput()
+
+  protected def prepareForRespectNulls(): Unit = {
+    // drain the first few rows if offset is larger than one
+    while (inputIndex < offset) {
+      nextSelectedRow = WindowFunctionFrame.getNextOrNull(inputIterator)
+      inputIndex += 1
+    }
+    // `inputIndex` starts as 0, but the `offset` can be negative and we may not enter the
+    // while loop at all. We need to make sure `inputIndex` ends up as `offset` to meet the
+    // assumption of the write path.
+    inputIndex = offset
+  }
+
+  override def currentLowerBound(): Int = throw SparkUnsupportedOperationException()
+
+  override def currentUpperBound(): Int = throw SparkUnsupportedOperationException()
 }
 
 /**
@@ -188,21 +256,7 @@ class FrameLessOffsetWindowFunctionFrame(
     offset: Int,
     ignoreNulls: Boolean = false)
   extends OffsetWindowFunctionFrameBase(
-    target, ordinal, expressions, inputSchema, newMutableProjection, offset) {
-
-  override def prepare(rows: ExternalAppendOnlyUnsafeRowArray): Unit = {
-    resetStates(rows)
-    if (ignoreNulls) {
-      findNextRowWithNonNullInput()
-    } else {
-      // drain the first few rows if offset is larger than zero
-      while (inputIndex < offset) {
-        if (inputIterator.hasNext) inputIterator.next()
-        inputIndex += 1
-      }
-      inputIndex = offset
-    }
-  }
+    target, ordinal, expressions, inputSchema, newMutableProjection, offset, ignoreNulls) {
 
   private val doWrite = if (ignoreNulls && offset > 0) {
     // For illustration, here is one example: the input data contains nine rows,
@@ -248,7 +302,6 @@ class FrameLessOffsetWindowFunctionFrame(
     // 7. current row -> z, next selected row -> y, output: y;
     // 8. current row -> v, next selected row -> z, output: z;
     // 9. current row -> null, next selected row -> v, output: v;
-    val absOffset = Math.abs(offset)
     (current: InternalRow) =>
       if (skippedNonNullCount == absOffset) {
         nextSelectedRow = EmptyRow
@@ -282,8 +335,21 @@ class FrameLessOffsetWindowFunctionFrame(
       inputIndex += 1
   }
 
+  // `write` ignores the driver row index and the cursor is a `Long`, so partitions with more
+  // than `Int.MaxValue` rows are supported.
+  override def supportsLargePartition: Boolean = true
+
   override def write(index: Int, current: InternalRow): Unit = {
-    doWrite(current)
+    if (absOffset > input.length) {
+      if (!onlyLiterals) {
+        // Handle non-literal defaults, e.g., column references
+        // Use default values since the offset row does not exist.
+        fillDefaultValue(current)
+      }
+      // Literal default values were already evaluated in prepare().
+    } else {
+      doWrite(current)
+    }
   }
 }
 
@@ -305,33 +371,27 @@ class UnboundedOffsetWindowFunctionFrame(
     offset: Int,
     ignoreNulls: Boolean = false)
   extends OffsetWindowFunctionFrameBase(
-    target, ordinal, expressions, inputSchema, newMutableProjection, offset) {
+    target, ordinal, expressions, inputSchema, newMutableProjection, offset, ignoreNulls) {
   assert(offset > 0)
 
-  override def prepare(rows: ExternalAppendOnlyUnsafeRowArray): Unit = {
-    if (offset > rows.length) {
+  override def prepareForIgnoreNulls(): Unit = {
+    super.prepareForIgnoreNulls()
+    if (nextSelectedRow == EmptyRow) {
+      // Use default values since the offset row whose input value is not null does not exist.
       fillDefaultValue(EmptyRow)
     } else {
-      resetStates(rows)
-      if (ignoreNulls) {
-        findNextRowWithNonNullInput()
-        if (nextSelectedRow == EmptyRow) {
-          // Use default values since the offset row whose input value is not null does not exist.
-          fillDefaultValue(EmptyRow)
-        } else {
-          projection(nextSelectedRow)
-        }
-      } else {
-        var selectedRow: UnsafeRow = null
-        // drain the first few rows if offset is larger than one
-        while (inputIndex < offset) {
-          selectedRow = WindowFunctionFrame.getNextOrNull(inputIterator)
-          inputIndex += 1
-        }
-        projection(selectedRow)
-      }
+      projection(nextSelectedRow)
     }
   }
+
+  override def prepareForRespectNulls(): Unit = {
+    super.prepareForRespectNulls()
+    projection(nextSelectedRow)
+  }
+
+  // The result is computed once in `prepare`, whose cursor is a `Long`, and `write` ignores the
+  // driver row index, so partitions with more than `Int.MaxValue` rows are supported.
+  override def supportsLargePartition: Boolean = true
 
   override def write(index: Int, current: InternalRow): Unit = {
     // The results are the same for each row in the partition, and have been evaluated in prepare.
@@ -358,24 +418,13 @@ class UnboundedPrecedingOffsetWindowFunctionFrame(
     offset: Int,
     ignoreNulls: Boolean = false)
   extends OffsetWindowFunctionFrameBase(
-    target, ordinal, expressions, inputSchema, newMutableProjection, offset) {
+    target, ordinal, expressions, inputSchema, newMutableProjection, offset, ignoreNulls) {
   assert(offset > 0)
 
-  override def prepare(rows: ExternalAppendOnlyUnsafeRowArray): Unit = {
-    resetStates(rows)
-    if (ignoreNulls) {
-      findNextRowWithNonNullInput()
-    } else {
-      // drain the first few rows if offset is larger than one
-      while (inputIndex < offset) {
-        nextSelectedRow = WindowFunctionFrame.getNextOrNull(inputIterator)
-        inputIndex += 1
-      }
-    }
-  }
-
   override def write(index: Int, current: InternalRow): Unit = {
-    if (index >= inputIndex - 1 && nextSelectedRow != null) {
+    if (absOffset > input.length) {
+      // Already use default values in prepare.
+    } else if (index >= inputIndex - 1 && nextSelectedRow != null) {
       projection(nextSelectedRow)
     } else {
       fillDefaultValue(EmptyRow)
@@ -462,7 +511,10 @@ final class SlidingWindowFunctionFrame(
 
     // Only recalculate and update when the buffer changes.
     if (processor != null && bufferUpdated) {
-      processor.initialize(input.length)
+      // The window driver rejects partitions larger than Int.MaxValue rows before any frame runs
+      // (see WindowEvaluatorFactoryBase.checkPartitionSizeLimit); toIntExact is a defensive
+      // backstop that fails loudly rather than silently truncating if that guard is bypassed.
+      processor.initialize(Math.toIntExact(input.length))
       val iter = buffer.iterator()
       while (iter.hasNext) {
         processor.update(iter.next())
@@ -497,8 +549,12 @@ final class UnboundedWindowFunctionFrame(
 
   /** Prepare the frame for calculating a new partition. Process all rows eagerly. */
   override def prepare(rows: ExternalAppendOnlyUnsafeRowArray): Unit = {
+    // The window driver rejects partitions larger than Int.MaxValue rows before any frame runs
+    // (see WindowEvaluatorFactoryBase.checkPartitionSizeLimit); toIntExact is a defensive
+    // backstop that fails loudly rather than silently truncating if that guard is bypassed.
+    val numRows = Math.toIntExact(rows.length)
     if (processor != null) {
-      processor.initialize(rows.length)
+      processor.initialize(numRows)
       val iterator = rows.generateIterator()
       while (iterator.hasNext) {
         processor.update(iterator.next())
@@ -507,7 +563,7 @@ final class UnboundedWindowFunctionFrame(
       processor.evaluate(target)
     }
 
-    upperBound = rows.length
+    upperBound = numRows
   }
 
   /** Write the frame columns for the current row to the given target row. */
@@ -568,7 +624,10 @@ final class UnboundedPrecedingWindowFunctionFrame(
     }
 
     if (processor != null) {
-      processor.initialize(input.length)
+      // The window driver rejects partitions larger than Int.MaxValue rows before any frame runs
+      // (see WindowEvaluatorFactoryBase.checkPartitionSizeLimit); toIntExact is a defensive
+      // backstop that fails loudly rather than silently truncating if that guard is bypassed.
+      processor.initialize(Math.toIntExact(input.length))
     }
   }
 
@@ -652,7 +711,10 @@ final class UnboundedFollowingWindowFunctionFrame(
 
     // Only recalculate and update when the buffer changes.
     if (processor != null && bufferUpdated) {
-      processor.initialize(input.length)
+      // The window driver rejects partitions larger than Int.MaxValue rows before any frame runs
+      // (see WindowEvaluatorFactoryBase.checkPartitionSizeLimit); toIntExact is a defensive
+      // backstop that fails loudly rather than silently truncating if that guard is bypassed.
+      processor.initialize(Math.toIntExact(input.length))
       if (nextRow != null) {
         processor.update(nextRow)
       }
@@ -665,5 +727,5 @@ final class UnboundedFollowingWindowFunctionFrame(
 
   override def currentLowerBound(): Int = inputIndex
 
-  override def currentUpperBound(): Int = input.length
+  override def currentUpperBound(): Int = Math.toIntExact(input.length)
 }

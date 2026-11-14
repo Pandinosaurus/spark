@@ -19,22 +19,22 @@ package org.apache.spark.sql.util
 
 import java.util
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.{SparkFunSuite, SparkIllegalArgumentException, SparkUnsupportedOperationException}
 
 class CaseInsensitiveStringMapSuite extends SparkFunSuite {
 
   test("put and get") {
     val options = CaseInsensitiveStringMap.empty()
-    intercept[UnsupportedOperationException] {
+    intercept[SparkUnsupportedOperationException] {
       options.put("kEy", "valUE")
     }
   }
 
   test("clear") {
     val options = new CaseInsensitiveStringMap(Map("kEy" -> "valUE").asJava)
-    intercept[UnsupportedOperationException] {
+    intercept[SparkUnsupportedOperationException] {
       options.clear()
     }
   }
@@ -43,6 +43,31 @@ class CaseInsensitiveStringMapSuite extends SparkFunSuite {
     val options = new CaseInsensitiveStringMap(Map("kEy" -> "valUE").asJava)
     assert(options.keySet().asScala == Set("key"))
     assert(options.values().asScala.toSeq == Seq("valUE"))
+  }
+
+  test("collection views are read-only") {
+    def checkMutationBlocked(mutate: CaseInsensitiveStringMap => Any): Unit = {
+      val options = new CaseInsensitiveStringMap(Map("kEy" -> "valUE").asJava)
+
+      intercept[UnsupportedOperationException] {
+        mutate(options)
+      }
+
+      assert(options.get("key") == "valUE")
+      assert(options.asCaseSensitiveMap().asScala == Map("kEy" -> "valUE"))
+    }
+
+    checkMutationBlocked(_.keySet().remove("key"))
+    checkMutationBlocked(_.values().remove("valUE"))
+    checkMutationBlocked(_.entrySet().iterator().next().setValue("newValue"))
+    checkMutationBlocked { options =>
+      val iterator = options.entrySet().iterator()
+      iterator.next()
+      iterator.remove()
+    }
+    checkMutationBlocked { options =>
+      options.replaceAll((_, _) => "newValue")
+    }
   }
 
   test("getInt") {
@@ -63,9 +88,12 @@ class CaseInsensitiveStringMapSuite extends SparkFunSuite {
     assert(options.getBoolean("isBar", true))
     assert(!options.getBoolean("isBar", false))
 
-    intercept[IllegalArgumentException] {
-      options.getBoolean("FOO", true)
-    }
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        options.getBoolean("FOO", true)
+      },
+      condition = "_LEGACY_ERROR_TEMP_3206",
+      parameters = Map("value" -> "bar"))
   }
 
   test("getLong") {
@@ -104,5 +132,9 @@ class CaseInsensitiveStringMapSuite extends SparkFunSuite {
     intercept[UnsupportedOperationException] {
       caseSensitiveMap.put("kEy", "valUE")
     }
+    intercept[UnsupportedOperationException] {
+      caseSensitiveMap.entrySet().iterator().next().setValue("newValue")
+    }
+    assert(caseSensitiveMap.equals(originalMap))
   }
 }

@@ -19,23 +19,22 @@ package org.apache.spark.sql.hive
 
 import java.nio.ByteBuffer
 
-import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.hive.ql.exec._
-import org.apache.hadoop.hive.ql.udf.{UDFType => HiveUDFType}
 import org.apache.hadoop.hive.ql.udf.generic._
 import org.apache.hadoop.hive.ql.udf.generic.GenericUDAFEvaluator.AggregationBuffer
-import org.apache.hadoop.hive.ql.udf.generic.GenericUDF._
-import org.apache.hadoop.hive.ql.udf.generic.GenericUDFUtils.ConversionHelper
-import org.apache.hadoop.hive.serde2.objectinspector.{ConstantObjectInspector, ObjectInspector, ObjectInspectorFactory}
-import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory.ObjectInspectorOptions
+import org.apache.hadoop.hive.serde2.objectinspector.{ConstantObjectInspector, ObjectInspector}
+import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory
+import org.apache.hadoop.hive.serde2.objectinspector.StructObjectInspector
 
-import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
-import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
+import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodeGenerator, CodegenFallback, ExprCode}
+import org.apache.spark.sql.catalyst.expressions.codegen.Block.BlockHelper
+import org.apache.spark.sql.catalyst.trees.TreePattern.{TreePattern, USER_DEFINED_AGGREGATION}
 import org.apache.spark.sql.hive.HiveShim._
 import org.apache.spark.sql.types._
 
@@ -48,59 +47,29 @@ private[hive] case class HiveSimpleUDF(
     name: String, funcWrapper: HiveFunctionWrapper, children: Seq[Expression])
   extends Expression
   with HiveInspectors
-  with CodegenFallback
-  with Logging
   with UserDefinedExpression {
 
-  override lazy val deterministic: Boolean = isUDFDeterministic && children.forall(_.deterministic)
+  @transient
+  private lazy val evaluator = new HiveSimpleUDFEvaluator(funcWrapper, children)
+
+  override lazy val deterministic: Boolean =
+    evaluator.isUDFDeterministic && children.forall(_.deterministic)
+
+  // It's stateful because `evaluator.inputs` is stateful.
+  override def stateful: Boolean = true
 
   override def nullable: Boolean = true
 
-  @transient
-  lazy val function = funcWrapper.createFunction[UDF]()
+  override def foldable: Boolean = evaluator.isUDFDeterministic && children.forall(_.foldable)
 
-  @transient
-  private lazy val method =
-    function.getResolver.getEvalMethod(children.map(_.dataType.toTypeInfo).asJava)
-
-  @transient
-  private lazy val arguments = children.map(toInspector).toArray
-
-  @transient
-  private lazy val isUDFDeterministic = {
-    val udfType = function.getClass.getAnnotation(classOf[HiveUDFType])
-    udfType != null && udfType.deterministic() && !udfType.stateful()
-  }
-
-  override def foldable: Boolean = isUDFDeterministic && children.forall(_.foldable)
-
-  // Create parameter converters
-  @transient
-  private lazy val conversionHelper = new ConversionHelper(method, arguments)
-
-  override lazy val dataType = javaTypeToDataType(method.getGenericReturnType)
-
-  @transient
-  private lazy val wrappers = children.map(x => wrapperFor(toInspector(x), x.dataType)).toArray
-
-  @transient
-  lazy val unwrapper = unwrapperFor(ObjectInspectorFactory.getReflectionObjectInspector(
-    method.getGenericReturnType, ObjectInspectorOptions.JAVA))
-
-  @transient
-  private lazy val cached: Array[AnyRef] = new Array[AnyRef](children.length)
-
-  @transient
-  private lazy val inputDataTypes: Array[DataType] = children.map(_.dataType).toArray
+  override lazy val dataType: DataType = javaTypeToDataType(evaluator.method.getGenericReturnType)
 
   // TODO: Finish input output types.
   override def eval(input: InternalRow): Any = {
-    val inputs = wrap(children.map(_.eval(input)), wrappers, cached, inputDataTypes)
-    val ret = FunctionRegistry.invoke(
-      method,
-      function,
-      conversionHelper.convertIfNecessary(inputs : _*): _*)
-    unwrapper(ret)
+    children.zipWithIndex.foreach {
+      case (child, idx) => evaluator.setArg(idx, child.eval(input))
+    }
+    evaluator.evaluate()
   }
 
   override def toString: String = {
@@ -113,75 +82,80 @@ private[hive] case class HiveSimpleUDF(
 
   override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Expression =
     copy(children = newChildren)
-}
 
-// Adapter from Catalyst ExpressionResult to Hive DeferredObject
-private[hive] class DeferredObjectAdapter(oi: ObjectInspector, dataType: DataType)
-  extends DeferredObject with HiveInspectors {
+  protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    val refEvaluator = ctx.addReferenceObj("evaluator", evaluator)
+    val evals = children.map(_.genCode(ctx))
 
-  private val wrapper = wrapperFor(oi, dataType)
-  private var func: () => Any = _
-  def set(func: () => Any): Unit = {
-    this.func = func
+    val setValues = evals.zipWithIndex.map {
+      case (eval, i) =>
+        s"""
+           |if (${eval.isNull}) {
+           |  $refEvaluator.setArg($i, null);
+           |} else {
+           |  $refEvaluator.setArg($i, ${eval.value});
+           |}
+           |""".stripMargin
+    }
+
+    val resultType = CodeGenerator.boxedType(dataType)
+    val resultTerm = ctx.freshName("result")
+    ev.copy(code =
+      code"""
+         |${evals.map(_.code).mkString("\n")}
+         |${setValues.mkString("\n")}
+         |$resultType $resultTerm = ($resultType) $refEvaluator.evaluate();
+         |boolean ${ev.isNull} = $resultTerm == null;
+         |${CodeGenerator.javaType(dataType)} ${ev.value} = ${CodeGenerator.defaultValue(dataType)};
+         |if (!${ev.isNull}) {
+         |  ${ev.value} = $resultTerm;
+         |}
+         |""".stripMargin
+    )
   }
-  override def prepare(i: Int): Unit = {}
-  override def get(): AnyRef = wrapper(func()).asInstanceOf[AnyRef]
 }
 
+/**
+ * A Hive GenericUDF whose Catalyst return type is snapshotted at analysis.
+ *
+ * Example: `SELECT hive_upper(CAST('Ab' AS CHAR(5)))` stores `CharType(5)` on `dataType` so
+ * executor conversion still pads even if first-class types are disabled there.
+ */
 private[hive] case class HiveGenericUDF(
-    name: String, funcWrapper: HiveFunctionWrapper, children: Seq[Expression])
+    name: String,
+    funcWrapper: HiveFunctionWrapper,
+    children: Seq[Expression],
+    override val dataType: DataType)
   extends Expression
   with HiveInspectors
-  with CodegenFallback
-  with Logging
   with UserDefinedExpression {
+
+  // It's stateful because `evaluator.deferredObjects` is stateful.
+  override def stateful: Boolean = true
 
   override def nullable: Boolean = true
 
-  override lazy val deterministic: Boolean = isUDFDeterministic && children.forall(_.deterministic)
+  override lazy val deterministic: Boolean =
+    evaluator.isUDFDeterministic && children.forall(_.deterministic)
 
-  override def foldable: Boolean =
-    isUDFDeterministic && returnInspector.isInstanceOf[ConstantObjectInspector]
-
-  @transient
-  lazy val function = funcWrapper.createFunction[GenericUDF]()
+  override def foldable: Boolean = evaluator.isUDFDeterministic &&
+    evaluator.returnInspector.isInstanceOf[ConstantObjectInspector]
 
   @transient
-  private lazy val argumentInspectors = children.map(toInspector)
-
-  @transient
-  private lazy val returnInspector = {
-    function.initializeAndFoldConstants(argumentInspectors.toArray)
-  }
-
-  @transient
-  private lazy val unwrapper = unwrapperFor(returnInspector)
-
-  @transient
-  private lazy val isUDFDeterministic = {
-    val udfType = function.getClass.getAnnotation(classOf[HiveUDFType])
-    udfType != null && udfType.deterministic() && !udfType.stateful()
-  }
-
-  @transient
-  private lazy val deferredObjects = argumentInspectors.zip(children).map { case (inspect, child) =>
-    new DeferredObjectAdapter(inspect, child.dataType)
-  }.toArray[DeferredObject]
-
-  override lazy val dataType: DataType = inspectorToDataType(returnInspector)
+  private lazy val evaluator =
+    new HiveGenericUDFEvaluator(funcWrapper, children, dataType)
 
   override def eval(input: InternalRow): Any = {
-    returnInspector // Make sure initialized.
-
-    var i = 0
-    val length = children.length
-    while (i < length) {
-      val idx = i
-      deferredObjects(i).asInstanceOf[DeferredObjectAdapter]
-        .set(() => children(idx).eval(input))
-      i += 1
+    children.zipWithIndex.foreach {
+      case (child, idx) =>
+        try {
+          evaluator.setArg(idx, child.eval(input))
+        } catch {
+          case t: Throwable =>
+            evaluator.setException(idx, t)
+        }
     }
-    unwrapper(function.evaluate(deferredObjects))
+    evaluator.evaluate()
   }
 
   override def prettyName: String = name
@@ -192,6 +166,54 @@ private[hive] case class HiveGenericUDF(
 
   override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Expression =
     copy(children = newChildren)
+
+  protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    val refEvaluator = ctx.addReferenceObj("evaluator", evaluator)
+    val evals = children.map(_.genCode(ctx))
+
+    val setValues = evals.zipWithIndex.map {
+      case (eval, i) =>
+        s"""
+           |try {
+           |  ${eval.code}
+           |  if (${eval.isNull}) {
+           |    $refEvaluator.setArg($i, null);
+           |  } else {
+           |    $refEvaluator.setArg($i, ${eval.value});
+           |  }
+           |} catch (Throwable t) {
+           |  $refEvaluator.setException($i, t);
+           |}
+           |""".stripMargin
+    }
+
+    val resultType = CodeGenerator.boxedType(dataType)
+    val resultTerm = ctx.freshName("result")
+    ev.copy(code =
+      code"""
+         |${setValues.mkString("\n")}
+         |$resultType $resultTerm = ($resultType) $refEvaluator.evaluate();
+         |boolean ${ev.isNull} = $resultTerm == null;
+         |${CodeGenerator.javaType(dataType)} ${ev.value} = ${CodeGenerator.defaultValue(dataType)};
+         |if (!${ev.isNull}) {
+         |  ${ev.value} = $resultTerm;
+         |}
+         |""".stripMargin
+    )
+  }
+}
+
+object HiveGenericUDF {
+  def apply(
+      name: String,
+      funcWrapper: HiveFunctionWrapper,
+      children: Seq[Expression]): HiveGenericUDF = {
+    HiveGenericUDF(
+      name,
+      funcWrapper,
+      children,
+      HiveGenericUDFEvaluator.inferReturnType(funcWrapper, children))
+  }
 }
 
 /**
@@ -208,36 +230,25 @@ private[hive] case class HiveGenericUDF(
 private[hive] case class HiveGenericUDTF(
     name: String,
     funcWrapper: HiveFunctionWrapper,
-    children: Seq[Expression])
+    children: Seq[Expression],
+    override val elementSchema: StructType)
   extends Generator with HiveInspectors with CodegenFallback with UserDefinedExpression {
-
-  @transient
-  protected lazy val function: GenericUDTF = {
-    val fun: GenericUDTF = funcWrapper.createFunction()
-    fun.setCollector(collector)
-    fun
-  }
-
-  @transient
-  protected lazy val inputInspector = {
-    val inspectors = children.map(toInspector)
-    val fields = inspectors.indices.map(index => s"_col$index").asJava
-    ObjectInspectorFactory.getStandardStructObjectInspector(fields, inspectors.asJava)
-  }
-
-  @transient
-  protected lazy val outputInspector = function.initialize(inputInspector)
-
-  @transient
-  protected lazy val udtInput = new Array[AnyRef](children.length)
 
   @transient
   protected lazy val collector = new UDTFCollector
 
-  override lazy val elementSchema = StructType(outputInspector.getAllStructFieldRefs.asScala.map {
-    field => StructField(field.getFieldName, inspectorToDataType(field.getFieldObjectInspector),
-      nullable = true)
-  }.toSeq)
+  @transient
+  private lazy val initialized = HiveGenericUDTF.initialize(
+    funcWrapper, children, collector, Some(elementSchema))
+
+  @transient
+  protected lazy val function: GenericUDTF = initialized.function
+
+  @transient
+  protected lazy val outputInspector = initialized.outputInspector
+
+  @transient
+  protected lazy val udtInput = new Array[AnyRef](children.length)
 
   @transient
   private lazy val inputDataTypes: Array[DataType] = children.map(_.dataType).toArray
@@ -246,14 +257,25 @@ private[hive] case class HiveGenericUDTF(
   private lazy val wrappers = children.map(x => wrapperFor(toInspector(x), x.dataType)).toArray
 
   @transient
-  private lazy val unwrapper = unwrapperFor(outputInspector)
+  private lazy val unwrapper = unwrapperFor(outputInspector, elementSchema)
 
-  override def eval(input: InternalRow): TraversableOnce[InternalRow] = {
+  @transient
+  private lazy val inputExpressions = children.toArray
+
+  override def eval(input: InternalRow): IterableOnce[InternalRow] = {
     outputInspector // Make sure initialized.
-
-    val inputProjection = new InterpretedProjection(children)
-
-    function.process(wrap(inputProjection(input), wrappers, udtInput, inputDataTypes))
+    // GenerateExec has initialized these children for the partition. A projection would create
+    // fresh stateful copies without initializing them. Fill the final array directly to avoid
+    // creating an intermediate collection for each row.
+    val expressions = inputExpressions
+    val outputArray = new Array[Any](expressions.length)
+    var i = 0
+    while (i < expressions.length) {
+      outputArray(i) = expressions(i).eval(input)
+      i += 1
+    }
+    val inputRow = new GenericInternalRow(outputArray)
+    function.process(wrap(inputRow, wrappers, udtInput, inputDataTypes))
     collector.collectRows()
   }
 
@@ -274,7 +296,7 @@ private[hive] case class HiveGenericUDTF(
     }
   }
 
-  override def terminate(): TraversableOnce[InternalRow] = {
+  override def terminate(): IterableOnce[InternalRow] = {
     outputInspector // Make sure initialized.
     function.close()
     collector.collectRows()
@@ -288,6 +310,52 @@ private[hive] case class HiveGenericUDTF(
 
   override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Expression =
     copy(children = newChildren)
+}
+
+object HiveGenericUDTF extends HiveInspectors {
+  private[hive] case class InitializedUDTF(
+      function: GenericUDTF,
+      outputInspector: StructObjectInspector)
+
+  def apply(
+      name: String,
+      funcWrapper: HiveFunctionWrapper,
+      children: Seq[Expression]): HiveGenericUDTF = {
+    HiveGenericUDTF(name, funcWrapper, children, inferElementSchema(funcWrapper, children))
+  }
+
+  private[hive] def initialize(
+      funcWrapper: HiveFunctionWrapper,
+      children: Seq[Expression],
+      collector: Collector,
+      expectedSchema: Option[StructType] = None): InitializedUDTF = {
+    val function: GenericUDTF = funcWrapper.createFunction()
+    function.setCollector(collector)
+    val inspectors = children.map(toInspector)
+    val fields = inspectors.indices.map(index => s"_col$index").asJava
+    val inputInspector =
+      ObjectInspectorFactory.getStandardStructObjectInspector(fields, inspectors.asJava)
+    val outputInspector = function.initialize(inputInspector)
+    expectedSchema.foreach(checkCompatibleHiveReturnType(outputInspector, _))
+    InitializedUDTF(function, outputInspector)
+  }
+
+  def inferElementSchema(
+      funcWrapper: HiveFunctionWrapper,
+      children: Seq[Expression]): StructType = {
+    val initialized = initialize(
+      funcWrapper,
+      children,
+      new Collector {
+        override def collect(input: java.lang.Object): Unit = {}
+      })
+    StructType(initialized.outputInspector.getAllStructFieldRefs.asScala.map { field =>
+      StructField(
+        field.getFieldName,
+        inspectorToDataType(field.getFieldObjectInspector),
+        nullable = true)
+    }.toArray)
+  }
 }
 
 /**
@@ -332,12 +400,16 @@ private[hive] case class HiveUDAFFunction(
     name: String,
     funcWrapper: HiveFunctionWrapper,
     children: Seq[Expression],
-    isUDAFBridgeRequired: Boolean = false,
-    mutableAggBufferOffset: Int = 0,
-    inputAggBufferOffset: Int = 0)
+    isUDAFBridgeRequired: Boolean,
+    mutableAggBufferOffset: Int,
+    inputAggBufferOffset: Int,
+    partialResultDataType: DataType,
+    override val dataType: DataType)
   extends TypedImperativeAggregate[HiveUDAFBuffer]
   with HiveInspectors
   with UserDefinedExpression {
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(USER_DEFINED_AGGREGATION)
 
   override def withNewMutableAggBufferOffset(newMutableAggBufferOffset: Int): ImperativeAggregate =
     copy(mutableAggBufferOffset = newMutableAggBufferOffset)
@@ -345,24 +417,17 @@ private[hive] case class HiveUDAFFunction(
   override def withNewInputAggBufferOffset(newInputAggBufferOffset: Int): ImperativeAggregate =
     copy(inputAggBufferOffset = newInputAggBufferOffset)
 
-  // Hive `ObjectInspector`s for all child expressions (input parameters of the function).
   @transient
-  private lazy val inputInspectors = children.map(toInspector).toArray
+  private lazy val initialized = HiveUDAFFunction.initializeEvaluators(
+    funcWrapper,
+    children,
+    isUDAFBridgeRequired,
+    Some(partialResultDataType),
+    Some(dataType))
 
   // Spark SQL data types of input parameters.
   @transient
   private lazy val inputDataTypes: Array[DataType] = children.map(_.dataType).toArray
-
-  private def newEvaluator(): GenericUDAFEvaluator = {
-    val resolver = if (isUDAFBridgeRequired) {
-      new GenericUDAFBridge(funcWrapper.createFunction[UDAF]())
-    } else {
-      funcWrapper.createFunction[AbstractGenericUDAFResolver]()
-    }
-
-    val parameterInfo = new SimpleGenericUDAFParameterInfo(inputInspectors, false, false, false)
-    resolver.getEvaluator(parameterInfo)
-  }
 
   private case class HiveEvaluator(
       evaluator: GenericUDAFEvaluator,
@@ -371,34 +436,20 @@ private[hive] case class HiveUDAFFunction(
   // The UDAF evaluator used to consume raw input rows and produce partial aggregation results.
   // Hive `ObjectInspector` used to inspect partial aggregation results.
   @transient
-  private lazy val partial1HiveEvaluator = {
-    val evaluator = newEvaluator()
-    HiveEvaluator(evaluator, evaluator.init(GenericUDAFEvaluator.Mode.PARTIAL1, inputInspectors))
-  }
+  private lazy val partial1HiveEvaluator = HiveEvaluator(
+    initialized.partialEvaluator, initialized.partialInspector)
 
   // The UDAF evaluator used to consume partial aggregation results and produce final results.
   // Hive `ObjectInspector` used to inspect final results.
   @transient
-  private lazy val finalHiveEvaluator = {
-    val evaluator = newEvaluator()
-    HiveEvaluator(
-      evaluator,
-      evaluator.init(GenericUDAFEvaluator.Mode.FINAL, Array(partial1HiveEvaluator.objectInspector)))
-  }
+  private lazy val finalHiveEvaluator = HiveEvaluator(
+    initialized.finalEvaluator, initialized.finalInspector)
 
-  // Spark SQL data type of partial aggregation results
-  @transient
-  private lazy val partialResultDataType =
-    inspectorToDataType(partial1HiveEvaluator.objectInspector)
-
-  // Wrapper functions used to wrap Spark SQL input arguments into Hive specific format.
   @transient
   private lazy val inputWrappers = children.map(x => wrapperFor(toInspector(x), x.dataType)).toArray
 
-  // Unwrapper function used to unwrap final aggregation result objects returned by Hive UDAFs into
-  // Spark SQL specific format.
   @transient
-  private lazy val resultUnwrapper = unwrapperFor(finalHiveEvaluator.objectInspector)
+  private lazy val resultUnwrapper = unwrapperFor(finalHiveEvaluator.objectInspector, dataType)
 
   @transient
   private lazy val cached: Array[AnyRef] = new Array[AnyRef](children.length)
@@ -407,8 +458,6 @@ private[hive] case class HiveUDAFFunction(
   private lazy val aggBufferSerDe: AggregationBufferSerDe = new AggregationBufferSerDe
 
   override def nullable: Boolean = true
-
-  override lazy val dataType: DataType = inspectorToDataType(finalHiveEvaluator.objectInspector)
 
   override def prettyName: String = name
 
@@ -453,14 +502,7 @@ private[hive] case class HiveUDAFFunction(
     // implementation can't mix the `update` and `merge` calls during its life cycle. To work
     // around it, here we create a fresh buffer with final evaluator, and merge the existing buffer
     // to it, and replace the existing buffer with it.
-    val mergeableBuf = if (!nonNullBuffer.canDoMerge) {
-      val newBuf = finalHiveEvaluator.evaluator.getNewAggregationBuffer
-      finalHiveEvaluator.evaluator.merge(
-        newBuf, partial1HiveEvaluator.evaluator.terminatePartial(nonNullBuffer.buf))
-      HiveUDAFBuffer(newBuf, true)
-    } else {
-      nonNullBuffer
-    }
+    val mergeableBuf = toFinalBuffer(nonNullBuffer)
 
     // The 2nd argument of the Hive `GenericUDAFEvaluator.merge()` method is an input aggregation
     // buffer in the 3rd format mentioned in the ScalaDoc of this class. Originally, Hive converts
@@ -471,12 +513,30 @@ private[hive] case class HiveUDAFFunction(
     mergeableBuf
   }
 
+  // Convert a buffer to a FINAL-mode buffer if it is a PARTIAL1-mode buffer created by `update`
+  // (or deserialized). Some Hive UDAFs legally use different buffer classes per mode, so a
+  // PARTIAL1 buffer cannot be passed directly to the FINAL evaluator's `terminate`. This mirrors
+  // the on-demand conversion `merge` performs, and is also needed by `eval` for the Complete-mode
+  // path (enabled by `CombineAdjacentAggregation`), where `update` is called but `merge` is not.
+  private def toFinalBuffer(buffer: HiveUDAFBuffer): HiveUDAFBuffer = {
+    if (!buffer.canDoMerge) {
+      val newBuf = finalHiveEvaluator.evaluator.getNewAggregationBuffer
+      finalHiveEvaluator.evaluator.merge(
+        newBuf, partial1HiveEvaluator.evaluator.terminatePartial(buffer.buf))
+      HiveUDAFBuffer(newBuf, true)
+    } else {
+      buffer
+    }
+  }
+
   override def eval(buffer: HiveUDAFBuffer): Any = {
     resultUnwrapper(finalHiveEvaluator.evaluator.terminate(
       if (buffer == null) {
         finalHiveEvaluator.evaluator.getNewAggregationBuffer
       } else {
-        buffer.buf
+        // A buffer that only went through `update` (Complete mode) is a PARTIAL1-mode buffer; turn
+        // it into a FINAL-mode buffer before terminating so mode-aware UDAFs see the right class.
+        toFinalBuffer(buffer).buf
       }
     ))
   }
@@ -495,7 +555,8 @@ private[hive] case class HiveUDAFFunction(
 
   // Helper class used to de/serialize Hive UDAF `AggregationBuffer` objects
   private class AggregationBufferSerDe {
-    private val partialResultUnwrapper = unwrapperFor(partial1HiveEvaluator.objectInspector)
+    private val partialResultUnwrapper =
+      unwrapperFor(partial1HiveEvaluator.objectInspector, partialResultDataType)
 
     private val partialResultWrapper =
       wrapperFor(partial1HiveEvaluator.objectInspector, partialResultDataType)
@@ -540,6 +601,79 @@ private[hive] case class HiveUDAFFunction(
 
   override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Expression =
     copy(children = newChildren)
+}
+
+object HiveUDAFFunction extends HiveInspectors {
+  private[hive] case class InitializedEvaluators(
+      partialEvaluator: GenericUDAFEvaluator,
+      partialInspector: ObjectInspector,
+      finalEvaluator: GenericUDAFEvaluator,
+      finalInspector: ObjectInspector)
+
+  def apply(
+      name: String,
+      funcWrapper: HiveFunctionWrapper,
+      children: Seq[Expression]): HiveUDAFFunction = {
+    apply(name, funcWrapper, children, isUDAFBridgeRequired = false)
+  }
+
+  def apply(
+      name: String,
+      funcWrapper: HiveFunctionWrapper,
+      children: Seq[Expression],
+      isUDAFBridgeRequired: Boolean): HiveUDAFFunction = {
+    val (partialType, resultType) =
+      inferResolvedTypes(funcWrapper, children, isUDAFBridgeRequired)
+    HiveUDAFFunction(
+      name,
+      funcWrapper,
+      children,
+      isUDAFBridgeRequired,
+      mutableAggBufferOffset = 0,
+      inputAggBufferOffset = 0,
+      partialType,
+      resultType)
+  }
+
+  private[hive] def initializeEvaluators(
+      funcWrapper: HiveFunctionWrapper,
+      children: Seq[Expression],
+      isUDAFBridgeRequired: Boolean,
+      expectedPartialType: Option[DataType] = None,
+      expectedResultType: Option[DataType] = None): InitializedEvaluators = {
+    val inputInspectors = children.map(toInspector).toArray
+    def newEvaluator(): GenericUDAFEvaluator = {
+      val resolver = if (isUDAFBridgeRequired) {
+        new SparkGenericUDAFBridge(funcWrapper.createFunction[UDAF]())
+      } else {
+        funcWrapper.createFunction[AbstractGenericUDAFResolver]()
+      }
+      val parameterInfo = new SimpleGenericUDAFParameterInfo(
+        inputInspectors, false, false, false)
+      resolver.getEvaluator(parameterInfo)
+    }
+    val partial1 = newEvaluator()
+    val partialInspector = partial1.init(GenericUDAFEvaluator.Mode.PARTIAL1, inputInspectors)
+    val finalEvaluator = newEvaluator()
+    val finalInspector =
+      finalEvaluator.init(GenericUDAFEvaluator.Mode.FINAL, Array(partialInspector))
+    expectedPartialType.foreach(checkCompatibleHiveReturnType(partialInspector, _))
+    expectedResultType.foreach(checkCompatibleHiveReturnType(finalInspector, _))
+    InitializedEvaluators(
+      partial1,
+      partialInspector,
+      finalEvaluator,
+      finalInspector)
+  }
+
+  def inferResolvedTypes(
+      funcWrapper: HiveFunctionWrapper,
+      children: Seq[Expression],
+      isUDAFBridgeRequired: Boolean): (DataType, DataType) = {
+    val initialized = initializeEvaluators(funcWrapper, children, isUDAFBridgeRequired)
+    (inspectorToDataType(initialized.partialInspector),
+      inspectorToDataType(initialized.finalInspector))
+  }
 }
 
 case class HiveUDAFBuffer(buf: AggregationBuffer, canDoMerge: Boolean)

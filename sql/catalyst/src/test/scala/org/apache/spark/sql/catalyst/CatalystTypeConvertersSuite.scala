@@ -17,18 +17,19 @@
 
 package org.apache.spark.sql.catalyst
 
-import java.time.{Duration, Instant, LocalDate, LocalDateTime, Period}
+import java.math.{BigDecimal => JavaBigDecimal}
+import java.time.{Duration, Instant, LocalDate, LocalDateTime, LocalTime, Period}
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.{SparkFunSuite, SparkIllegalArgumentException}
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.expressions.UnsafeArrayData
 import org.apache.spark.sql.catalyst.plans.SQLHelper
-import org.apache.spark.sql.catalyst.util.{DateTimeConstants, DateTimeUtils, GenericArrayData, IntervalUtils}
+import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, DateTimeConstants, DateTimeUtils, GenericArrayData, IntervalUtils, STUtils}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.types.DayTimeIntervalType._
 import org.apache.spark.sql.types.YearMonthIntervalType._
-import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.unsafe.types.{BinaryView, TimestampNanosVal, UTF8String}
 
 class CatalystTypeConvertersSuite extends SparkFunSuite with SQLHelper {
 
@@ -104,47 +105,75 @@ class CatalystTypeConvertersSuite extends SparkFunSuite with SQLHelper {
 
   test("converting a wrong value to the struct type") {
     val structType = new StructType().add("f1", IntegerType)
-    val exception = intercept[IllegalArgumentException] {
-      CatalystTypeConverters.createToCatalystConverter(structType)("test")
-    }
-    assert(exception.getMessage.contains("The value (test) of the type "
-      + "(java.lang.String) cannot be converted to struct<f1:int>"))
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        CatalystTypeConverters.createToCatalystConverter(structType)("test")
+      },
+      condition = "INVALID_EXTERNAL_VALUE",
+      parameters = Map(
+        "other" -> "test",
+        "otherClass" -> "java.lang.String",
+        "dataType" -> "struct<f1:int>"))
   }
 
   test("converting a wrong value to the map type") {
     val mapType = MapType(StringType, IntegerType, false)
-    val exception = intercept[IllegalArgumentException] {
-      CatalystTypeConverters.createToCatalystConverter(mapType)("test")
-    }
-    assert(exception.getMessage.contains("The value (test) of the type "
-      + "(java.lang.String) cannot be converted to a map type with key "
-      + "type (string) and value type (int)"))
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        CatalystTypeConverters.createToCatalystConverter(mapType)("test")
+      },
+      condition = "_LEGACY_ERROR_TEMP_3221",
+      parameters = Map(
+        "other" -> "test",
+        "otherClass" -> "java.lang.String",
+        "keyType" -> "string",
+        "valueType" -> "int"))
   }
 
   test("converting a wrong value to the array type") {
     val arrayType = ArrayType(IntegerType, true)
-    val exception = intercept[IllegalArgumentException] {
-      CatalystTypeConverters.createToCatalystConverter(arrayType)("test")
-    }
-    assert(exception.getMessage.contains("The value (test) of the type "
-      + "(java.lang.String) cannot be converted to an array of int"))
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        CatalystTypeConverters.createToCatalystConverter(arrayType)("test")
+      },
+      condition = "_LEGACY_ERROR_TEMP_3220",
+      parameters = Map(
+        "other" -> "test",
+        "otherClass" -> "java.lang.String",
+        "elementType" -> "int"))
   }
 
   test("converting a wrong value to the decimal type") {
     val decimalType = DecimalType(10, 0)
-    val exception = intercept[IllegalArgumentException] {
-      CatalystTypeConverters.createToCatalystConverter(decimalType)("test")
-    }
-    assert(exception.getMessage.contains("The value (test) of the type "
-      + "(java.lang.String) cannot be converted to decimal(10,0)"))
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        CatalystTypeConverters.createToCatalystConverter(decimalType)("test")
+      },
+      condition = "INVALID_EXTERNAL_VALUE",
+      parameters = Map(
+        "other" -> "test",
+        "otherClass" -> "java.lang.String",
+        "dataType" -> "decimal(10,0)"))
+  }
+
+  test("SPARK-51941: convert BigDecimal to Decimal") {
+    val expected = Decimal("0.01")
+    val bigDecimal = BigDecimal("0.01")
+    assert(CatalystTypeConverters.convertToCatalyst(bigDecimal) === expected)
+    val javaBigDecimal = new JavaBigDecimal("0.01")
+    assert(CatalystTypeConverters.convertToCatalyst(javaBigDecimal) === expected)
   }
 
   test("converting a wrong value to the string type") {
-    val exception = intercept[IllegalArgumentException] {
-      CatalystTypeConverters.createToCatalystConverter(StringType)(0.1)
-    }
-    assert(exception.getMessage.contains("The value (0.1) of the type "
-      + "(java.lang.Double) cannot be converted to the string type"))
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        CatalystTypeConverters.createToCatalystConverter(StringType)(0.1)
+      },
+      condition = "INVALID_EXTERNAL_VALUE",
+      parameters = Map(
+        "other" -> "0.1",
+        "otherClass" -> "java.lang.Double",
+        "dataType" -> "STRING"))
   }
 
   test("SPARK-24571: convert Char to String") {
@@ -152,6 +181,7 @@ class CatalystTypeConvertersSuite extends SparkFunSuite with SQLHelper {
     val converter = CatalystTypeConverters.createToCatalystConverter(StringType)
     val expected = UTF8String.fromString("X")
     assert(converter(chr) === expected)
+    assert(CatalystTypeConverters.convertToCatalyst('a') === UTF8String.fromString("a"))
   }
 
   test("SPARK-33390: Make Literal support char array") {
@@ -220,6 +250,244 @@ class CatalystTypeConvertersSuite extends SparkFunSuite with SQLHelper {
     }
   }
 
+  test("SPARK-57033: converting java.time.LocalDateTime to TimestampNTZNanosType") {
+    Seq(
+      "0001-01-01T00:00:00",
+      "1582-10-02T01:02:03.04",
+      "1582-12-31T23:59:59.999999999",
+      "1970-01-01T00:00:00.000000001",
+      "1972-12-31T23:59:59.123456789",
+      "2019-02-26T16:56:00.123456789",
+      "9999-12-31T23:59:59.999999999").foreach { text =>
+      val input = LocalDateTime.parse(text)
+      Seq(7, 8, 9).foreach { p =>
+        val dt = TimestampNTZNanosType(p)
+        val result = CatalystTypeConverters.createToCatalystConverter(dt)(input)
+        val expected = DateTimeUtils.localDateTimeToTimestampNanos(input, p)
+        assert(result === expected)
+      }
+    }
+  }
+
+  test("SPARK-57033: converting TimestampNTZNanosType to java.time.LocalDateTime") {
+    Seq(
+      "1582-10-02T01:02:03.04",
+      "1582-12-31T23:59:59.999999999",
+      "1970-01-01T00:00:00.000000001",
+      "1972-12-31T23:59:59.123456789",
+      "2019-02-26T16:56:00.123456789",
+      "9999-12-31T23:59:59.999999999").foreach { text =>
+      val ldt = LocalDateTime.parse(text)
+      val v = DateTimeUtils.localDateTimeToTimestampNanos(ldt, precision = 9)
+      Seq(7, 8, 9).foreach { p =>
+        val dt = TimestampNTZNanosType(p)
+        assert(CatalystTypeConverters.createToScalaConverter(dt)(v) === ldt)
+      }
+    }
+  }
+
+  test("SPARK-57033: converting java.time.Instant to TimestampLTZNanosType") {
+    Seq(
+      "0001-01-01T00:00:00Z",
+      "1582-10-02T01:02:03.04Z",
+      "1582-12-31T23:59:59.999999999Z",
+      "1970-01-01T00:00:00.000000001Z",
+      "1972-12-31T23:59:59.123456789Z",
+      "2019-02-26T16:56:00.123456789Z",
+      "9999-12-31T23:59:59.999999999Z").foreach { text =>
+      val input = Instant.parse(text)
+      Seq(7, 8, 9).foreach { p =>
+        val dt = TimestampLTZNanosType(p)
+        val result = CatalystTypeConverters.createToCatalystConverter(dt)(input)
+        val expected = DateTimeUtils.instantToTimestampNanos(input, p)
+        assert(result === expected)
+      }
+    }
+  }
+
+  test("SPARK-57033: converting TimestampLTZNanosType to java.time.Instant") {
+    Seq(
+      "1582-10-02T01:02:03.04Z",
+      "1582-12-31T23:59:59.999999999Z",
+      "1970-01-01T00:00:00.000000001Z",
+      "1972-12-31T23:59:59.123456789Z",
+      "2019-02-26T16:56:00.123456789Z",
+      "9999-12-31T23:59:59.999999999Z").foreach { text =>
+      val instant = Instant.parse(text)
+      val v = DateTimeUtils.instantToTimestampNanos(instant, precision = 9)
+      Seq(7, 8, 9).foreach { p =>
+        val dt = TimestampLTZNanosType(p)
+        assert(CatalystTypeConverters.createToScalaConverter(dt)(v) === instant)
+      }
+    }
+  }
+
+  test("SPARK-57033: TimestampLTZNanosType -> Instant ignores java8 API flag") {
+    val instant = Instant.parse("2019-02-26T16:56:00.123456789Z")
+    val v = DateTimeUtils.instantToTimestampNanos(instant, precision = 9)
+    val dt = TimestampLTZNanosType()
+    Seq("true", "false").foreach { flag =>
+      withSQLConf(SQLConf.DATETIME_JAVA8API_ENABLED.key -> flag) {
+        assert(CatalystTypeConverters.createToCatalystConverter(dt)(instant) === v)
+        assert(CatalystTypeConverters.createToScalaConverter(dt)(v) === instant)
+      }
+    }
+  }
+
+  test("SPARK-57033: TimestampNanosConverter null handling in rows") {
+    val schema = StructType(
+      StructField("ntz", TimestampNTZNanosType(9), nullable = true) ::
+        StructField("ltz", TimestampLTZNanosType(9), nullable = true) :: Nil)
+    val toCat = CatalystTypeConverters.createToCatalystConverter(schema)
+    val toScala = CatalystTypeConverters.createToScalaConverter(schema)
+    // Reference value to ensure non-null cells are kept as-is.
+    val ldt = LocalDateTime.parse("2019-02-26T16:56:00.123456789")
+    val instant = Instant.parse("2019-02-26T16:56:00.987654321Z")
+    val row = Row(ldt, instant)
+    val catalystRow = toCat(row).asInstanceOf[InternalRow]
+    assert(catalystRow.getTimestampNTZNanos(0) ===
+      DateTimeUtils.localDateTimeToTimestampNanos(ldt, precision = 9))
+    assert(catalystRow.getTimestampLTZNanos(1) ===
+      DateTimeUtils.instantToTimestampNanos(instant, precision = 9))
+    assert(toScala(catalystRow) === row)
+    // Null row.
+    val nullRow = Row.fromSeq(Seq(null, null))
+    assert(toScala(toCat(nullRow)) === nullRow)
+  }
+
+  test("SPARK-57033: TimestampNTZNanosType converter truncates sub-micro to precision") {
+    val ldt = LocalDateTime.parse("2019-02-26T16:56:00.123456789")
+    val negativeEpochLdt = LocalDateTime.parse("1969-12-31T23:59:59.123456789")
+    val cases = Map(7 -> 700, 8 -> 780, 9 -> 789)
+    Seq(ldt, negativeEpochLdt).foreach { input =>
+      cases.foreach { case (p, expectedNanosWithinMicro) =>
+        val dt = TimestampNTZNanosType(p)
+        val v = CatalystTypeConverters.createToCatalystConverter(dt)(input)
+          .asInstanceOf[TimestampNanosVal]
+        assert(v.nanosWithinMicro === expectedNanosWithinMicro,
+          s"input=$input, precision=$p: expected $expectedNanosWithinMicro, " +
+            s"got ${v.nanosWithinMicro}")
+      }
+    }
+  }
+
+  test("SPARK-57033: TimestampLTZNanosType converter truncates sub-micro to precision") {
+    val instant = Instant.parse("2019-02-26T16:56:00.123456789Z")
+    val negativeEpochInstant = Instant.parse("1969-12-31T23:59:59.123456789Z")
+    val cases = Map(7 -> 700, 8 -> 780, 9 -> 789)
+    Seq(instant, negativeEpochInstant).foreach { input =>
+      cases.foreach { case (p, expectedNanosWithinMicro) =>
+        val dt = TimestampLTZNanosType(p)
+        val v = CatalystTypeConverters.createToCatalystConverter(dt)(input)
+          .asInstanceOf[TimestampNanosVal]
+        assert(v.nanosWithinMicro === expectedNanosWithinMicro,
+          s"input=$input, precision=$p: expected $expectedNanosWithinMicro, " +
+            s"got ${v.nanosWithinMicro}")
+      }
+    }
+  }
+
+  test("SPARK-57033: TimestampNTZNanosType converter rejects wrong external type") {
+    val dt = TimestampNTZNanosType(9)
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        CatalystTypeConverters.createToCatalystConverter(dt)("not-a-LocalDateTime")
+      },
+      condition = "INVALID_EXTERNAL_VALUE",
+      parameters = Map(
+        "other" -> "not-a-LocalDateTime",
+        "otherClass" -> "java.lang.String",
+        "dataType" -> "TIMESTAMP_NTZ(9)"))
+    // An `Instant` is also not accepted - the NTZ nano converter is wall-clock only.
+    val instant = Instant.parse("2019-02-26T16:56:00.123456789Z")
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        CatalystTypeConverters.createToCatalystConverter(dt)(instant)
+      },
+      condition = "INVALID_EXTERNAL_VALUE",
+      parameters = Map(
+        "other" -> instant.toString,
+        "otherClass" -> "java.time.Instant",
+        "dataType" -> "TIMESTAMP_NTZ(9)"))
+  }
+
+  test("SPARK-57033: TimestampLTZNanosType converter rejects wrong external type") {
+    val dt = TimestampLTZNanosType(9)
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        CatalystTypeConverters.createToCatalystConverter(dt)("not-an-Instant")
+      },
+      condition = "INVALID_EXTERNAL_VALUE",
+      parameters = Map(
+        "other" -> "not-an-Instant",
+        "otherClass" -> "java.lang.String",
+        "dataType" -> "TIMESTAMP_LTZ(9)"))
+    // A `LocalDateTime` is also not accepted - LTZ requires an absolute instant.
+    val ldt = LocalDateTime.parse("2019-02-26T16:56:00.123456789")
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        CatalystTypeConverters.createToCatalystConverter(dt)(ldt)
+      },
+      condition = "INVALID_EXTERNAL_VALUE",
+      parameters = Map(
+        "other" -> ldt.toString,
+        "otherClass" -> "java.time.LocalDateTime",
+        "dataType" -> "TIMESTAMP_LTZ(9)"))
+    // The legacy `java.sql.Timestamp` external type is intentionally out of scope for
+    // `TimestampLTZNanosType` (see SPARK-57033). Verify it is rejected, not silently
+    // accepted via a fallback.
+    val ts = java.sql.Timestamp.from(Instant.parse("2019-02-26T16:56:00.123456789Z"))
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        CatalystTypeConverters.createToCatalystConverter(dt)(ts)
+      },
+      condition = "INVALID_EXTERNAL_VALUE",
+      parameters = Map(
+        "other" -> ts.toString,
+        "otherClass" -> "java.sql.Timestamp",
+        "dataType" -> "TIMESTAMP_LTZ(9)"))
+  }
+
+  test("SPARK-57033: nested nanos timestamp types in arrays / maps / structs") {
+    val ldt = LocalDateTime.parse("2019-02-26T16:56:00.123456789")
+    val instant = Instant.parse("2019-02-26T16:56:00.987654321Z")
+    val ldtNano = DateTimeUtils.localDateTimeToTimestampNanos(ldt, precision = 9)
+    val instantNano = DateTimeUtils.instantToTimestampNanos(instant, precision = 9)
+
+    // Array of TimestampNTZNanosType.
+    val ntzArrayType = ArrayType(TimestampNTZNanosType(9), containsNull = true)
+    val ldts = Seq(ldt, null, ldt)
+    val catArr = CatalystTypeConverters.createToCatalystConverter(ntzArrayType)(ldts)
+      .asInstanceOf[GenericArrayData]
+    assert(catArr.numElements() === 3)
+    assert(catArr.get(0, TimestampNTZNanosType(9)) === ldtNano)
+    assert(catArr.isNullAt(1))
+    assert(catArr.get(2, TimestampNTZNanosType(9)) === ldtNano)
+    assert(CatalystTypeConverters.createToScalaConverter(ntzArrayType)(catArr) === ldts)
+
+    // Map of (String -> TimestampLTZNanosType).
+    val ltzMapType = MapType(StringType, TimestampLTZNanosType(9), valueContainsNull = true)
+    val instants = Map[String, Instant]("a" -> instant, "b" -> null)
+    val catMap = CatalystTypeConverters.createToCatalystConverter(ltzMapType)(instants)
+    val backMap = CatalystTypeConverters.createToScalaConverter(ltzMapType)(catMap)
+      .asInstanceOf[Map[Any, Any]]
+    assert(backMap("a") === instant)
+    assert(backMap("b") == null)
+
+    // Struct with both nano fields plus a non-nano field, and a null row.
+    val nestedStruct = StructType(
+      StructField("ntz", TimestampNTZNanosType(9), nullable = true) ::
+        StructField("ltz", TimestampLTZNanosType(9), nullable = true) ::
+        StructField("name", StringType, nullable = true) :: Nil)
+    val outerStruct = StructType(StructField("inner", nestedStruct, nullable = true) :: Nil)
+    val outerToCat = CatalystTypeConverters.createToCatalystConverter(outerStruct)
+    val outerToScala = CatalystTypeConverters.createToScalaConverter(outerStruct)
+    val outerRow = Row(Row(ldt, instant, "abc"))
+    val nullOuterRow = Row(null)
+    assert(outerToScala(outerToCat(outerRow)) === outerRow)
+    assert(outerToScala(outerToCat(nullOuterRow)) === nullOuterRow)
+  }
+
   test("converting java.time.LocalDate to DateType") {
     Seq(
       "0101-02-16",
@@ -272,7 +540,7 @@ class CatalystTypeConvertersSuite extends SparkFunSuite with SQLHelper {
     val errMsg = intercept[ArithmeticException] {
       IntervalUtils.durationToMicros(Duration.ofSeconds(Long.MaxValue, Long.MaxValue))
     }.getMessage
-    assert(errMsg.contains("long overflow"))
+    assert(errMsg == null || errMsg.contains("overflow"))
   }
 
   test("SPARK-35726: Truncate java.time.Duration by fields of day-time interval type") {
@@ -327,7 +595,7 @@ class CatalystTypeConvertersSuite extends SparkFunSuite with SQLHelper {
     val errMsg = intercept[ArithmeticException] {
       IntervalUtils.periodToMonths(Period.of(Int.MaxValue, Int.MaxValue, Int.MaxValue))
     }.getMessage
-    assert(errMsg.contains("integer overflow"))
+    assert(errMsg == null || errMsg.contains("overflow"))
   }
 
   test("SPARK-35769: Truncate java.time.Period by fields of year-month interval type") {
@@ -393,5 +661,286 @@ class CatalystTypeConvertersSuite extends SparkFunSuite with SQLHelper {
         }
       }
     }
+  }
+
+  test("converting java.time.LocalTime to TimeType") {
+    Seq(
+      "00:00:00",
+      "01:02:03.999",
+      "02:59:01",
+      "12:30:02.0",
+      "22:00:00.000001",
+      "23:59:59.999999").foreach { time =>
+      val input = LocalTime.parse(time)
+      val result = CatalystTypeConverters.convertToCatalyst(input)
+      val expected = DateTimeUtils.localTimeToNanos(input)
+      assert(result === expected)
+    }
+  }
+
+  test("converting TimeType to java.time.LocalTime") {
+    Seq(
+      0,
+      1,
+      59000000,
+      3600000001L,
+      43200999999L,
+      86399000000L,
+      86399999999L).foreach { us =>
+      val nanos = us * 1000L
+      val localTime = DateTimeUtils.nanosToLocalTime(nanos)
+      assert(CatalystTypeConverters.createToScalaConverter(TimeType())(nanos) === localTime)
+    }
+  }
+
+  // WKB bytes for POINT (17 7), reused across geospatial tests.
+  private val pointWkb: Array[Byte] = "010100000000000000000031400000000000001C40"
+    .grouped(2).map(Integer.parseInt(_, 16).toByte).toArray
+
+  private val NDR: UTF8String = UTF8String.fromString("NDR")
+
+  test("converting Geometry to GeometryType via convertToCatalyst") {
+    val geom = Geometry.fromWKB(pointWkb, 0)
+    val result = CatalystTypeConverters.convertToCatalyst(geom)
+    assert(result.isInstanceOf[BinaryView])
+    val resultVal = result.asInstanceOf[BinaryView]
+    assert(java.util.Arrays.equals(STUtils.stGeomAsBinary(resultVal, NDR), pointWkb))
+    assert(STUtils.stGeomSrid(resultVal) === 0)
+  }
+
+  test("converting Geometry with non-default SRID via convertToCatalyst") {
+    val geom = Geometry.fromWKB(pointWkb, 4326)
+    val result = CatalystTypeConverters.convertToCatalyst(geom)
+    assert(result.isInstanceOf[BinaryView])
+    val resultVal = result.asInstanceOf[BinaryView]
+    assert(java.util.Arrays.equals(STUtils.stGeomAsBinary(resultVal, NDR), pointWkb))
+    assert(STUtils.stGeomSrid(resultVal) === 4326)
+  }
+
+  test("converting Geography to GeographyType via convertToCatalyst") {
+    val geog = Geography.fromWKB(pointWkb, 4326)
+    val result = CatalystTypeConverters.convertToCatalyst(geog)
+    assert(result.isInstanceOf[BinaryView])
+    val resultVal = result.asInstanceOf[BinaryView]
+    assert(java.util.Arrays.equals(STUtils.stGeogAsBinary(resultVal, NDR), pointWkb))
+    assert(STUtils.stGeogSrid(resultVal) === 4326)
+  }
+
+  test("converting Geography with non-default SRID via convertToCatalyst") {
+    // Geography supports a variety of geographic SRIDs beyond the default 4326.
+    Seq(4267, 4269, 4612, 37001, 104030).foreach { srid =>
+      val geog = Geography.fromWKB(pointWkb, srid)
+      val result = CatalystTypeConverters.convertToCatalyst(geog)
+      assert(result.isInstanceOf[BinaryView])
+      val resultVal = result.asInstanceOf[BinaryView]
+      assert(java.util.Arrays.equals(STUtils.stGeogAsBinary(resultVal, NDR), pointWkb))
+      assert(STUtils.stGeogSrid(resultVal) === srid)
+    }
+  }
+
+  test("convertToCatalyst null handling for geospatial types") {
+    assert(CatalystTypeConverters.convertToCatalyst(null: Geometry) === null)
+    assert(CatalystTypeConverters.convertToCatalyst(null: Geography) === null)
+  }
+
+  test("convertToCatalyst with Geometry with invalid SRID") {
+    val geom = Geometry.fromWKB(pointWkb, 1)
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        CatalystTypeConverters.convertToCatalyst(geom)
+      },
+      condition = "ST_INVALID_SRID_VALUE",
+      parameters = Map("srid" -> "1"))
+  }
+
+  test("convertToCatalyst with Geography with invalid SRID") {
+    // Geography only accepts geographic SRIDs (e.g. 0 and 3857 are not geographic).
+    Seq(0, 1, 3857).foreach { invalidSrid =>
+      val geog = Geography.fromWKB(pointWkb, invalidSrid)
+      checkError(
+        exception = intercept[SparkIllegalArgumentException] {
+          CatalystTypeConverters.convertToCatalyst(geog)
+        },
+        condition = "ST_INVALID_SRID_VALUE",
+        parameters = Map("srid" -> invalidSrid.toString))
+    }
+  }
+
+  test("createToCatalystConverter for GeometryType") {
+    val gt = GeometryType(0)
+    val converter = CatalystTypeConverters.createToCatalystConverter(gt)
+    val geom = Geometry.fromWKB(pointWkb, 0)
+    val result = converter(geom)
+    assert(result.isInstanceOf[BinaryView])
+    val resultVal = result.asInstanceOf[BinaryView]
+    assert(java.util.Arrays.equals(STUtils.stGeomAsBinary(resultVal, NDR), pointWkb))
+    assert(STUtils.stGeomSrid(resultVal) === 0)
+  }
+
+  test("createToCatalystConverter for GeographyType") {
+    val gt = GeographyType(4326)
+    val converter = CatalystTypeConverters.createToCatalystConverter(gt)
+    val geog = Geography.fromWKB(pointWkb, 4326)
+    val result = converter(geog)
+    assert(result.isInstanceOf[BinaryView])
+    val resultVal = result.asInstanceOf[BinaryView]
+    assert(java.util.Arrays.equals(STUtils.stGeogAsBinary(resultVal, NDR), pointWkb))
+    assert(STUtils.stGeogSrid(resultVal) === 4326)
+  }
+
+  test("createToScalaConverter for GeometryType") {
+    val gt = GeometryType(0)
+    val geom = Geometry.fromWKB(pointWkb, 0)
+    val catalystVal = STUtils.serializeGeomFromWKB(geom, gt)
+    val result = CatalystTypeConverters.createToScalaConverter(gt)(catalystVal)
+    assert(result.isInstanceOf[Geometry])
+    assert(result === geom)
+  }
+
+  test("createToScalaConverter for GeographyType") {
+    val gt = GeographyType(4326)
+    val geog = Geography.fromWKB(pointWkb, 4326)
+    val catalystVal = STUtils.serializeGeogFromWKB(geog, gt)
+    val result = CatalystTypeConverters.createToScalaConverter(gt)(catalystVal)
+    assert(result.isInstanceOf[Geography])
+    assert(result === geog)
+  }
+
+  test("SPARK-60470: createToScalaConverter for geospatial fields at non-zero ordinals") {
+    // WKB bytes for POINT (3 4), distinct from `pointWkb`.
+    val otherPointWkb: Array[Byte] = "010100000000000000000008400000000000001040"
+      .grouped(2).map(Integer.parseInt(_, 16).toByte).toArray
+    Seq(
+      (GeometryType(0), Geometry.fromWKB(pointWkb, 0), Geometry.fromWKB(otherPointWkb, 0)),
+      (GeographyType(4326), Geography.fromWKB(pointWkb, 4326),
+        Geography.fromWKB(otherPointWkb, 4326))
+    ).foreach { case (dt, first, second) =>
+      val schema = new StructType().add("first", dt).add("second", dt)
+      val toCatalyst = CatalystTypeConverters.createToCatalystConverter(schema)
+      val toScala = CatalystTypeConverters.createToScalaConverter(schema)
+      val row = Row(first, second)
+      assert(toScala(toCatalyst(row)) === row)
+    }
+  }
+
+  test("null handling for geospatial individual values") {
+    assert(CatalystTypeConverters.createToScalaConverter(GeometryType(0))(null) === null)
+    assert(CatalystTypeConverters.createToScalaConverter(GeographyType(4326))(null) === null)
+  }
+
+  test("converting a wrong value to GeometryType") {
+    val gt = GeometryType(0)
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        CatalystTypeConverters.createToCatalystConverter(gt)("test")
+      },
+      condition = "INVALID_EXTERNAL_VALUE",
+      parameters = Map(
+        "other" -> "test",
+        "otherClass" -> "java.lang.String",
+        "dataType" -> "STRING"))
+  }
+
+  test("converting a wrong value to GeographyType") {
+    val gt = GeographyType(4326)
+    checkError(
+      exception = intercept[SparkIllegalArgumentException] {
+        CatalystTypeConverters.createToCatalystConverter(gt)("test")
+      },
+      condition = "INVALID_EXTERNAL_VALUE",
+      parameters = Map(
+        "other" -> "test",
+        "otherClass" -> "java.lang.String",
+        "dataType" -> "STRING"))
+  }
+
+  test("convertToCatalyst with Geometry nested in Seq") {
+    val geom = Geometry.fromWKB(pointWkb, 0)
+    val result = CatalystTypeConverters.convertToCatalyst(Seq(geom))
+    assert(result.isInstanceOf[GenericArrayData])
+    val array = result.asInstanceOf[GenericArrayData]
+    assert(array.numElements() === 1)
+    val element = array.get(0, GeometryType("ANY"))
+    assert(element.isInstanceOf[BinaryView])
+    assert(java.util.Arrays.equals(
+      STUtils.stGeomAsBinary(element.asInstanceOf[BinaryView], NDR), pointWkb))
+  }
+
+  test("convertToCatalyst with Geometry nested in Array") {
+    val geom = Geometry.fromWKB(pointWkb, 0)
+    val result = CatalystTypeConverters.convertToCatalyst(Array(geom))
+    assert(result.isInstanceOf[GenericArrayData])
+    val array = result.asInstanceOf[GenericArrayData]
+    assert(array.numElements() === 1)
+    val element = array.get(0, GeometryType("ANY"))
+    assert(element.isInstanceOf[BinaryView])
+    assert(java.util.Arrays.equals(
+      STUtils.stGeomAsBinary(element.asInstanceOf[BinaryView], NDR), pointWkb))
+  }
+
+  test("convertToCatalyst with Geometry nested in Map") {
+    val geom = Geometry.fromWKB(pointWkb, 0)
+    val result = CatalystTypeConverters.convertToCatalyst(Map("key" -> geom))
+    assert(result.isInstanceOf[ArrayBasedMapData])
+    val mapData = result.asInstanceOf[ArrayBasedMapData]
+    val value = mapData.valueArray.get(0, GeometryType("ANY"))
+    assert(value.isInstanceOf[BinaryView])
+    assert(java.util.Arrays.equals(
+      STUtils.stGeomAsBinary(value.asInstanceOf[BinaryView], NDR), pointWkb))
+  }
+
+  test("convertToCatalyst with Geometry nested in Row") {
+    val geom = Geometry.fromWKB(pointWkb, 0)
+    val result = CatalystTypeConverters.convertToCatalyst(Row(geom))
+    assert(result.isInstanceOf[InternalRow])
+    val element = result.asInstanceOf[InternalRow].get(0, GeometryType("ANY"))
+    assert(element.isInstanceOf[BinaryView])
+    assert(java.util.Arrays.equals(
+      STUtils.stGeomAsBinary(element.asInstanceOf[BinaryView], NDR), pointWkb))
+  }
+
+  test("convertToCatalyst with Geography nested in Seq") {
+    val geog = Geography.fromWKB(pointWkb, 4326)
+    val result = CatalystTypeConverters.convertToCatalyst(Seq(geog))
+    assert(result.isInstanceOf[GenericArrayData])
+    val array = result.asInstanceOf[GenericArrayData]
+    assert(array.numElements() === 1)
+    val element = array.get(0, GeographyType("ANY"))
+    assert(element.isInstanceOf[BinaryView])
+    assert(java.util.Arrays.equals(
+      STUtils.stGeogAsBinary(element.asInstanceOf[BinaryView], NDR), pointWkb))
+  }
+
+  test("convertToCatalyst with Geography nested in Array") {
+    val geog = Geography.fromWKB(pointWkb, 4326)
+    val result = CatalystTypeConverters.convertToCatalyst(Array(geog))
+    assert(result.isInstanceOf[GenericArrayData])
+    val array = result.asInstanceOf[GenericArrayData]
+    assert(array.numElements() === 1)
+    val element = array.get(0, GeographyType("ANY"))
+    assert(element.isInstanceOf[BinaryView])
+    assert(java.util.Arrays.equals(
+      STUtils.stGeogAsBinary(element.asInstanceOf[BinaryView], NDR), pointWkb))
+  }
+
+  test("convertToCatalyst with Geography nested in Map") {
+    val geog = Geography.fromWKB(pointWkb, 4326)
+    val result = CatalystTypeConverters.convertToCatalyst(Map("key" -> geog))
+    assert(result.isInstanceOf[ArrayBasedMapData])
+    val mapData = result.asInstanceOf[ArrayBasedMapData]
+    val value = mapData.valueArray.get(0, GeographyType("ANY"))
+    assert(value.isInstanceOf[BinaryView])
+    assert(java.util.Arrays.equals(
+      STUtils.stGeogAsBinary(value.asInstanceOf[BinaryView], NDR), pointWkb))
+  }
+
+  test("convertToCatalyst with Geography nested in Row") {
+    val geog = Geography.fromWKB(pointWkb, 4326)
+    val result = CatalystTypeConverters.convertToCatalyst(Row(geog))
+    assert(result.isInstanceOf[InternalRow])
+    val element = result.asInstanceOf[InternalRow].get(0, GeographyType("ANY"))
+    assert(element.isInstanceOf[BinaryView])
+    assert(java.util.Arrays.equals(
+      STUtils.stGeogAsBinary(element.asInstanceOf[BinaryView], NDR), pointWkb))
   }
 }

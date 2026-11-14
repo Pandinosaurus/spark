@@ -17,7 +17,9 @@
 
 package org.apache.spark.sql.catalyst.plans.logical
 
-import org.apache.spark.sql.catalyst.expressions.Attribute
+import java.util.Locale
+
+import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression}
 import org.apache.spark.sql.catalyst.trees.TreePattern.{TreePattern, UNRESOLVED_HINT}
 
 /**
@@ -27,7 +29,7 @@ import org.apache.spark.sql.catalyst.trees.TreePattern.{TreePattern, UNRESOLVED_
  * @param parameters the parameters of the hint
  * @param child the [[LogicalPlan]] on which this hint applies
  */
-case class UnresolvedHint(name: String, parameters: Seq[Any], child: LogicalPlan)
+case class UnresolvedHint(name: String, parameters: Seq[Expression], child: LogicalPlan)
   extends UnaryNode {
 
   // we need it to be resolved so that the analyzer can continue to analyze the rest of the query
@@ -61,6 +63,8 @@ case class ResolvedHint(child: LogicalPlan, hints: HintInfo = HintInfo())
  * right child respectively.
  */
 case class JoinHint(leftHint: Option[HintInfo], rightHint: Option[HintInfo]) {
+
+  def isEmpty: Boolean = leftHint.isEmpty && rightHint.isEmpty
 
   override def toString: String = {
     Seq(
@@ -126,6 +130,13 @@ object JoinStrategyHint {
     SHUFFLE_MERGE,
     SHUFFLE_HASH,
     SHUFFLE_REPLICATE_NL)
+
+  private lazy val allHintAliasesUpperCase: Set[String] =
+    strategies.flatMap(_.hintAliases).map(_.toUpperCase(Locale.ROOT))
+
+  def isJoinStrategyHintName(hintName: String): Boolean = {
+    allHintAliasesUpperCase.contains(hintName.toUpperCase(Locale.ROOT))
+  }
 }
 
 /**
@@ -178,12 +189,20 @@ case object NO_BROADCAST_HASH extends JoinStrategyHint {
 }
 
 /**
- * An internal hint to encourage shuffle hash join, used by adaptive query execution.
+ * An internal hint to prohibit broadcasting and replicating one side of a join. This hint is used
+ * by some rules where broadcasting or replicating a particular side of the join is not permitted,
+ * such as the cardinality check in MERGE operations.
  */
-case object PREFER_SHUFFLE_HASH extends JoinStrategyHint {
-  override def displayName: String = "prefer_shuffle_hash"
+case object NO_BROADCAST_AND_REPLICATION extends JoinStrategyHint {
+  override def displayName: String = "no_broadcast_and_replication"
   override def hintAliases: Set[String] = Set.empty
 }
+
+abstract class AggregateHint
+
+abstract class WindowHint
+
+abstract class SortHint
 
 /**
  * The callback for implementing customized strategies of handling hint errors.
@@ -195,7 +214,7 @@ trait HintErrorHandler {
    * @param name the unrecognized hint name
    * @param parameters the hint parameters
    */
-  def hintNotRecognized(name: String, parameters: Seq[Any]): Unit
+  def hintNotRecognized(name: String, parameters: Seq[Expression]): Unit
 
   /**
    * Callback for relation names specified in a hint that cannot be associated with any relation

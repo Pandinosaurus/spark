@@ -16,16 +16,29 @@
  */
 package org.apache.spark.sql.execution
 
+import scala.collection.mutable
+import scala.concurrent.duration.DurationInt
 import scala.io.Source
+import scala.util.Try
 
-import org.apache.spark.sql.{AnalysisException, FastOperator}
-import org.apache.spark.sql.catalyst.analysis.UnresolvedNamespace
+import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent, SparkListenerJobStart}
+import org.apache.spark.sql.{AnalysisException, ExtendedExplainGenerator, FastOperator, SaveMode}
+import org.apache.spark.sql.catalyst.{QueryPlanningTracker, QueryPlanningTrackerCallback, TableIdentifier}
+import org.apache.spark.sql.catalyst.analysis.{CurrentNamespace, UnresolvedFunction, UnresolvedRelation}
+import org.apache.spark.sql.catalyst.expressions.{Alias, NamedLambdaVariable, RegExpReplace, UnsafeRow}
 import org.apache.spark.sql.catalyst.plans.QueryPlan
-import org.apache.spark.sql.catalyst.plans.logical.{CommandResult, LogicalPlan, OneRowRelation, Project, ShowTables, SubqueryAlias}
+import org.apache.spark.sql.catalyst.plans.logical.{Command, CommandResult, LogicalPlan, OneRowRelation, Project, ShowTables, SubqueryAlias, Union, WithCTE}
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
+import org.apache.spark.sql.catalyst.util.StringUtils.PlanStringConcat
+import org.apache.spark.sql.classic.Dataset
+import org.apache.spark.sql.connector.catalog.CatalogManager.SESSION_CATALOG_NAME
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStageExec}
 import org.apache.spark.sql.execution.datasources.v2.ShowTablesExec
+import org.apache.spark.sql.execution.joins.SortMergeJoinExec
+import org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.storage.ShuffleIndexBlockId
 import org.apache.spark.util.Utils
 
 case class QueryExecutionTestRecord(
@@ -39,9 +52,28 @@ case class QueryExecutionTestRecord(
 class QueryExecutionSuite extends SharedSparkSession {
   import testImplicits._
 
+  override protected def sparkConf =
+    super.sparkConf.set(SQLConf.ADAPTIVE_MAX_SHUFFLE_HASH_JOIN_LOCAL_MAP_THRESHOLD.key, "0")
+
+  private def collectLambdaVariables(plan: LogicalPlan): Seq[NamedLambdaVariable] = {
+    plan.collect {
+      case node => node.expressions.flatMap(_.collect {
+        case variable: NamedLambdaVariable => variable
+      })
+    }.flatten
+  }
+
+  private def collectRegExpReplaceExpressions(plan: LogicalPlan): Seq[RegExpReplace] = {
+    plan.collect {
+      case node => node.expressions.flatMap(_.collect {
+        case expression: RegExpReplace => expression
+      })
+    }.flatten
+  }
+
   def checkDumpedPlans(path: String, expected: Int): Unit = Utils.tryWithResource(
     Source.fromFile(path)) { source =>
-    assert(source.getLines.toList
+    assert(source.getLines().toList
       .takeWhile(_ != "== Whole Stage Codegen ==") == List(
       "== Parsed Logical Plan ==",
       s"Range (0, $expected, step=1, splits=Some(2))",
@@ -87,6 +119,34 @@ class QueryExecutionSuite extends SharedSparkSession {
       df.queryExecution.debug.toFile(path)
       checkDumpedPlans(path, expected = 100)
     }
+  }
+
+  test("SPARK-58208: optimizedPlan uses fresh stateful expressions") {
+    val df = spark.range(1).selectExpr("transform(array(id), x -> x + 1) AS v")
+    val queryExecution = df.queryExecution
+
+    val beforeOptimize = collectLambdaVariables(queryExecution.withCachedData)
+    val optimized = collectLambdaVariables(queryExecution.optimizedPlan)
+
+    assert(beforeOptimize.nonEmpty)
+    assert(beforeOptimize.size == optimized.size)
+    beforeOptimize.zip(optimized).foreach { case (before, after) =>
+      assert(before.exprId == after.exprId)
+      assert(before.value ne after.value)
+    }
+  }
+
+  test("SPARK-58208: optimizedPlan keeps structurally equal fresh stateful expressions") {
+    val df = spark.range(1).selectExpr(
+      "regexp_replace(cast(id AS STRING), cast(id AS STRING), 'x') AS v")
+    val queryExecution = df.queryExecution
+
+    val beforeOptimize = collectRegExpReplaceExpressions(queryExecution.withCachedData)
+    val optimized = collectRegExpReplaceExpressions(queryExecution.optimizedPlan)
+
+    assert(beforeOptimize.size == 1)
+    assert(optimized.size == 1)
+    assert(beforeOptimize.head ne optimized.head)
   }
 
   test("dumping query execution info by invalid path") {
@@ -157,7 +217,9 @@ class QueryExecutionSuite extends SharedSparkSession {
 
     // Throw an AnalysisException - this should be captured.
     spark.experimental.extraStrategies = Seq[SparkStrategy](
-      (_: LogicalPlan) => throw new AnalysisException("exception"))
+      (_: LogicalPlan) => throw new AnalysisException(
+        "UNSUPPORTED_DATASOURCE_FOR_DIRECT_QUERY",
+        messageParameters = Map("dataSourceType" -> "XXX")))
     assert(qe.toString.contains("org.apache.spark.sql.AnalysisException"))
 
     // Throw an Error - this should not be captured.
@@ -226,8 +288,10 @@ class QueryExecutionSuite extends SharedSparkSession {
       }
     }
     Seq("=== Applying Rule org.apache.spark.sql.execution",
-        "=== Result of Batch Preparations ===").foreach { expectedMsg =>
-      assert(testAppender.loggingEvents.exists(_.getRenderedMessage.contains(expectedMsg)))
+        "=== Result of Batch Preparations ===",
+        "Output Information:").foreach { expectedMsg =>
+      assert(testAppender.loggingEvents.exists(
+        _.getMessage.getFormattedMessage.contains(expectedMsg)))
     }
   }
 
@@ -235,23 +299,33 @@ class QueryExecutionSuite extends SharedSparkSession {
     withTable("spark_34129") {
       spark.sql("CREATE TABLE spark_34129(id INT) using parquet")
       val df = spark.table("spark_34129")
-      assert(df.queryExecution.optimizedPlan.toString.startsWith("Relation default.spark_34129["))
+      assert(df.queryExecution.optimizedPlan.toString.startsWith(
+        s"Relation $SESSION_CATALOG_NAME.default.spark_34129["))
     }
   }
 
   test("SPARK-35378: Eagerly execute non-root Command") {
-    def qe(logicalPlan: LogicalPlan): QueryExecution = new QueryExecution(spark, logicalPlan)
+    val mockCallback1 = MockCallbackEagerCommand()
+    val mockCallback2 = MockCallbackEagerCommand()
+    def qe(logicalPlan: LogicalPlan, callback: QueryPlanningTrackerCallback): QueryExecution =
+      new QueryExecution(spark, logicalPlan, new QueryPlanningTracker(Some(callback)))
 
-    val showTables = ShowTables(UnresolvedNamespace(Seq.empty[String]), None)
-    val showTablesQe = qe(showTables)
+    val showTables = ShowTables(CurrentNamespace, None)
+    val showTablesQe = qe(showTables, mockCallback1)
+    showTablesQe.assertAnalyzed()
+    mockCallback1.assertAnalyzed()
     assert(showTablesQe.commandExecuted.isInstanceOf[CommandResult])
+    mockCallback1.assertCommandExecuted()
     assert(showTablesQe.executedPlan.isInstanceOf[CommandResultExec])
     val showTablesResultExec = showTablesQe.executedPlan.asInstanceOf[CommandResultExec]
     assert(showTablesResultExec.commandPhysicalPlan.isInstanceOf[ShowTablesExec])
 
     val project = Project(showTables.output, SubqueryAlias("s", showTables))
-    val projectQe = qe(project)
+    val projectQe = qe(project, mockCallback2)
+    projectQe.assertAnalyzed()
+    mockCallback2.assertAnalyzed()
     assert(projectQe.commandExecuted.isInstanceOf[Project])
+    mockCallback2.assertCommandExecuted()
     assert(projectQe.commandExecuted.children.length == 1)
     assert(projectQe.commandExecuted.children(0).isInstanceOf[SubqueryAlias])
     assert(projectQe.commandExecuted.children(0).children.length == 1)
@@ -259,5 +333,490 @@ class QueryExecutionSuite extends SharedSparkSession {
     assert(projectQe.executedPlan.isInstanceOf[CommandResultExec])
     val cmdResultExec = projectQe.executedPlan.asInstanceOf[CommandResultExec]
     assert(cmdResultExec.commandPhysicalPlan.isInstanceOf[ShowTablesExec])
+  }
+
+  test("SPARK-44145: non eagerly executed command setReadyForExecution") {
+    val mockCallback = MockCallback()
+
+    val showTables = ShowTables(CurrentNamespace, None)
+    val showTablesQe = new QueryExecution(
+      spark,
+      showTables,
+      new QueryPlanningTracker(Some(mockCallback)),
+      CommandExecutionMode.SKIP)
+    showTablesQe.assertAnalyzed()
+    mockCallback.assertAnalyzed()
+    showTablesQe.assertOptimized()
+    mockCallback.assertOptimized()
+    showTablesQe.assertSparkPlanPrepared()
+    mockCallback.assertSparkPlanPrepared()
+    showTablesQe.assertExecutedPlanPrepared()
+    mockCallback.assertExecutedPlanPrepared()
+  }
+
+  test("SPARK-44145: Plan setReadyForExecution") {
+    val mockCallback = MockCallback()
+    val plan: LogicalPlan = org.apache.spark.sql.catalyst.plans.logical.Range(0, 1, 1, 1)
+    val df = Dataset.ofRows(spark, plan, new QueryPlanningTracker(Some(mockCallback)))
+    df.queryExecution.assertAnalyzed()
+    mockCallback.assertAnalyzed()
+    df.queryExecution.assertOptimized()
+    mockCallback.assertOptimized()
+    df.queryExecution.assertSparkPlanPrepared()
+    mockCallback.assertSparkPlanPrepared()
+    df.queryExecution.assertExecutedPlanPrepared()
+    mockCallback.assertExecutedPlanPrepared()
+  }
+
+  private def cleanupShuffles(): Unit = {
+    val blockManager = spark.sparkContext.env.blockManager
+    blockManager.diskBlockManager.getAllBlocks().foreach {
+      case ShuffleIndexBlockId(shuffleId, _, _) =>
+        spark.sparkContext.shuffleDriverComponents.removeShuffle(shuffleId, true)
+      case _ =>
+    }
+  }
+
+  test("SPARK-53413: Cleanup shuffle dependencies for commands") {
+    Seq(true, false).foreach { adaptiveEnabled => {
+      withSQLConf((SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, adaptiveEnabled.toString),
+        (SQLConf.CLASSIC_SHUFFLE_DEPENDENCY_FILE_CLEANUP_ENABLED.key, true.toString)) {
+        val plan = spark.range(100).repartition(10).logicalPlan
+        val df = Dataset.ofRows(spark, plan)
+        df.write.format("noop").mode(SaveMode.Overwrite).save()
+
+        val blockManager = spark.sparkContext.env.blockManager
+        assert(blockManager.migratableResolver.getStoredShuffles().isEmpty)
+        assert(blockManager.diskBlockManager.getAllBlocks().isEmpty)
+        }
+      }
+    }
+  }
+
+  test("SPARK-53413: Cleanup shuffle dependencies for DataWritingCommandExec") {
+    withTempDir { dir =>
+      Seq(true, false).foreach { adaptiveEnabled => {
+        withSQLConf((SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, adaptiveEnabled.toString),
+          (SQLConf.CLASSIC_SHUFFLE_DEPENDENCY_FILE_CLEANUP_ENABLED.key, true.toString)) {
+          val plan = spark.range(100).repartition(10).logicalPlan
+          val df = Dataset.ofRows(spark, plan)
+          // V1 API write
+          df.write.format("csv").mode(SaveMode.Overwrite).save(dir.getCanonicalPath)
+
+          val blockManager = spark.sparkContext.env.blockManager
+          assert(blockManager.migratableResolver.getStoredShuffles().isEmpty)
+          assert(blockManager.diskBlockManager.getAllBlocks().isEmpty)
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-47764: Cleanup shuffle dependencies - DoNotCleanup mode") {
+    Seq(true, false).foreach { adaptiveEnabled => {
+      withSQLConf((SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, adaptiveEnabled.toString)) {
+        val plan = spark.range(100).repartition(10).logicalPlan
+        val df = Dataset.ofRows(spark, plan, DoNotCleanup)
+        df.collect()
+
+        val blockManager = spark.sparkContext.env.blockManager
+        assert(blockManager.migratableResolver.getStoredShuffles().nonEmpty)
+        assert(blockManager.diskBlockManager.getAllBlocks().nonEmpty)
+        cleanupShuffles()
+        }
+      }
+    }
+  }
+
+  test("SPARK-47764: Cleanup shuffle dependencies - SkipMigration mode") {
+    Seq(true, false).foreach { adaptiveEnabled => {
+      withSQLConf((SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, adaptiveEnabled.toString)) {
+        val plan = spark.range(100).repartition(10).logicalPlan
+        val df = Dataset.ofRows(spark, plan, SkipMigration)
+        df.collect()
+
+        val blockManager = spark.sparkContext.env.blockManager
+        assert(blockManager.migratableResolver.getStoredShuffles().isEmpty)
+        assert(blockManager.diskBlockManager.getAllBlocks().nonEmpty)
+        cleanupShuffles()
+        }
+      }
+    }
+  }
+
+  test("SPARK-47764: Cleanup shuffle dependencies - RemoveShuffleFiles mode") {
+    Seq(true, false).foreach { adaptiveEnabled => {
+      withSQLConf((SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, adaptiveEnabled.toString)) {
+        val plan = spark.range(100).repartition(10).logicalPlan
+        val df = Dataset.ofRows(spark, plan, RemoveShuffleFiles)
+        df.collect()
+
+        val blockManager = spark.sparkContext.env.blockManager
+        assert(blockManager.migratableResolver.getStoredShuffles().isEmpty)
+        assert(blockManager.diskBlockManager.getAllBlocks().isEmpty)
+        cleanupShuffles()
+        }
+      }
+    }
+  }
+
+  test("SPARK-55035: Shuffle cleanup performed in child executions") {
+    val sourceDF = spark.range(100).repartition(10)
+    sourceDF.createOrReplaceTempView("source")
+
+    val createTablePlan = spark.sessionState.sqlParser.parsePlan(
+      """
+        CREATE TABLE child_exec_test
+        USING parquet
+        AS SELECT * FROM source WHERE id < 50
+      """)
+    val df = Dataset.ofRows(spark, createTablePlan, RemoveShuffleFiles)
+    df.collect()
+
+    val blockManager = spark.sparkContext.env.blockManager
+    assert(blockManager.migratableResolver.getStoredShuffles().isEmpty)
+    assert(blockManager.diskBlockManager.getAllBlocks().isEmpty)
+    cleanupShuffles()
+  }
+
+  test("SPARK-35378: Return UnsafeRow in CommandResultExecCheck execute methods") {
+    val plan = spark.sql("SHOW FUNCTIONS").queryExecution.executedPlan
+    assert(plan.isInstanceOf[CommandResultExec])
+    plan.executeCollect().foreach { row => assert(row.isInstanceOf[UnsafeRow]) }
+    plan.executeTake(10).foreach { row => assert(row.isInstanceOf[UnsafeRow]) }
+    plan.executeTail(10).foreach { row => assert(row.isInstanceOf[UnsafeRow]) }
+  }
+
+  test("SPARK-38198: check specify maxFields when call toFile method") {
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath + "/plans.txt"
+      // Define a dataset with 6 columns
+      val ds = spark.createDataset(Seq((0, 1, 2, 3, 4, 5), (6, 7, 8, 9, 10, 11)))
+      // `CodegenMode` and `FormattedMode` doesn't use the maxFields, so not tested in this case
+      Seq(SimpleMode.name, ExtendedMode.name, CostMode.name).foreach { modeName =>
+        val maxFields = 3
+        ds.queryExecution.debug.toFile(path, explainMode = Some(modeName), maxFields = maxFields)
+        Utils.tryWithResource(Source.fromFile(path)) { source =>
+          val tableScan = source.getLines().filter(_.contains("LocalTableScan"))
+          assert(tableScan.exists(_.contains("more fields")),
+            s"Specify maxFields = $maxFields doesn't take effect when explainMode is $modeName")
+        }
+      }
+    }
+  }
+
+  test("SPARK-47289: extended explain info") {
+    val concat = new PlanStringConcat()
+    withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+      SQLConf.EXTENDED_EXPLAIN_PROVIDERS.key -> "org.apache.spark.sql.execution.ExtendedInfo") {
+      val left = Seq((1, 10L), (2, 100L), (3, 1000L)).toDF("l1", "l2")
+      val right = Seq((1, 2), (2, 3), (3, 5)).toDF("r1", "r2")
+      val data = left.join(right, $"l1" === $"r1")
+      val df = data.selectExpr("l2 + r2")
+      // execute the plan so that the final adaptive plan is available
+      df.collect()
+      val qe = df.queryExecution
+      qe.extendedExplainInfo(concat.append, qe.executedPlan)
+      val info = concat.toString
+      val expected = "\n== Extended Information (Test) ==\n" +
+        "Scan Info: LocalTableScan\n" +
+        "Project Info: Project\n" +
+        "SMJ Info: SortMergeJoin"
+      assert(info == expected)
+    }
+  }
+
+  test("SPARK-50600: Failed analysis should send analyzed event") {
+    val mockCallback = MockCallback()
+
+    def table(ref: String): LogicalPlan = UnresolvedRelation(TableIdentifier(ref))
+
+    val unresolvedUndefinedFunc = UnresolvedFunction("unknown", Seq.empty, isDistinct = false)
+    val plan = Project(Seq(Alias(unresolvedUndefinedFunc, "call1")()), table("table"))
+    val dataset = Try {
+      val df = Dataset.ofRows(spark, plan, new QueryPlanningTracker(Some(mockCallback)))
+      df.queryExecution.assertAnalyzed()
+    }
+    assert(dataset.failed.get.isInstanceOf[AnalysisException])
+    mockCallback.assertAnalyzed()
+  }
+
+  test("dynamic INSERT target analysis is tracked") {
+    withTable("target_table") {
+      sql("CREATE TABLE target_table (id INT) USING parquet")
+
+      val tracker = new QueryPlanningTracker
+      val plan = spark.sessionState.sqlParser.parsePlan(
+        "INSERT INTO IDENTIFIER(lower('TARGET_TABLE')) VALUES (1)")
+      new QueryExecution(spark, plan, tracker).assertAnalyzed()
+
+      val identifierResolution = tracker.rules.collectFirst {
+        case (name, summary) if name.endsWith("ResolveIdentifierClause") => summary
+      }.getOrElse(fail("ResolveIdentifierClause was not tracked"))
+      assert(identifierResolution.numEffectiveInvocations === 1)
+    }
+  }
+
+  test("dynamic INSERT target analysis failure is reported") {
+    var failedPlan: LogicalPlan = null
+    val callback = new QueryPlanningTrackerCallback {
+      override def analysisFailed(
+          tracker: QueryPlanningTracker,
+          parsedPlan: LogicalPlan): Unit = failedPlan = parsedPlan
+
+      override def analyzed(tracker: QueryPlanningTracker, analyzedPlan: LogicalPlan): Unit =
+        fail("analysis should fail")
+
+      override def readyForExecution(tracker: QueryPlanningTracker): Unit =
+        fail("query should not be ready for execution")
+    }
+    val plan = spark.sessionState.sqlParser.parsePlan(
+      "INSERT INTO IDENTIFIER(1) VALUES (1)")
+    val qe = new QueryExecution(
+      spark,
+      plan,
+      new QueryPlanningTracker(Some(callback)))
+
+    intercept[AnalysisException](qe.assertAnalyzed())
+    assert(failedPlan eq plan)
+  }
+
+  test("SPARK-51265: IncrementalExecution should set the command execution code correctly") {
+    withTempView("s") {
+      val streamDf = spark.readStream.format("rate").load()
+      streamDf.createOrReplaceTempView("s")
+      withTable("output") {
+        val ex = intercept[AnalysisException] {
+          // Creates a table from streaming source with batch query. This should fail.
+          spark.sql("CREATE TABLE output USING csv AS SELECT * FROM s")
+        }
+        assert(
+          ex.getMessage.contains("Queries with streaming sources must be executed with " +
+            "writeStream.start(), or from a streaming table or flow definition within a Spark " +
+            "Declarative Pipeline.")
+        )
+      }
+    }
+  }
+
+  test("determineShuffleCleanupMode should return correct mode based on SQL configuration") {
+    withSQLConf((SQLConf.CLASSIC_SHUFFLE_DEPENDENCY_FILE_CLEANUP_ENABLED.key, "false")) {
+      assert(QueryExecution.determineShuffleCleanupMode(conf) === DoNotCleanup)
+    }
+    withSQLConf((SQLConf.CLASSIC_SHUFFLE_DEPENDENCY_FILE_CLEANUP_ENABLED.key, "true")) {
+      assert(QueryExecution.determineShuffleCleanupMode(conf) === RemoveShuffleFiles)
+    }
+  }
+
+  test("SPARK-55064: Jobs are tracked in DAGScheduler before query finished") {
+    val jobs = new mutable.HashSet[Int]()
+
+    var sqlExecutionEndVerified: Boolean = false
+    val listener = new SparkListener {
+      override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
+        jobs += jobStart.jobId
+      }
+
+      override def onOtherEvent(event: SparkListenerEvent): Unit = {
+        event match {
+          case e: SparkListenerSQLExecutionEnd =>
+            val jobsTracked = e.jobIds
+            assert(jobsTracked == jobs)
+            jobs.clear()
+            sqlExecutionEndVerified = true
+          case _ =>
+        }
+      }
+    }
+    spark.sparkContext.addSparkListener(listener)
+
+    try {
+      withTable("t1", "t2") {
+        spark.range(10).selectExpr("id as A", "id as D")
+          .write.partitionBy("A").mode("overwrite").saveAsTable("t1")
+        spark.range(2).selectExpr("id as B", "id as C")
+          .write.mode("overwrite").saveAsTable("t2")
+
+        Seq(true, false).foreach { adaptiveEnabled =>
+          withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> adaptiveEnabled.toString) {
+            sqlExecutionEndVerified = false
+            val df = sql(
+              """
+                |SELECT avg(A) FROM t1
+                |WHERE A = (
+                |  SELECT B from t2 where C = 1
+                |)
+              """.stripMargin)
+
+            df.collect()
+            spark.sparkContext.listenerBus.waitUntilEmpty()
+            assert(sqlExecutionEndVerified)
+            // The jobs tracked by DAGScheduler should be cleared after the query is done.
+            eventually(timeout(10.seconds)) {
+              assert(spark.sparkContext.dagScheduler.activeQueryToJobs.isEmpty)
+              assert(spark.sparkContext.dagScheduler.jobIdToQueryExecutionId.isEmpty)
+            }
+          }
+        }
+      }
+      eventually(timeout(10.seconds)) {
+        assert(spark.sparkContext.dagScheduler.activeQueryToJobs.isEmpty)
+        assert(spark.sparkContext.dagScheduler.jobIdToQueryExecutionId.isEmpty)
+      }
+    } finally {
+      spark.sparkContext.removeSparkListener(listener)
+    }
+  }
+
+  case class MockCallbackEagerCommand(
+      var trackerAnalyzed: QueryPlanningTracker = null,
+      var trackerReadyForExecution: QueryPlanningTracker = null)
+      extends QueryPlanningTrackerCallback {
+    def analyzed(trackerFromCallback: QueryPlanningTracker, plan: LogicalPlan): Unit = {
+      trackerAnalyzed = trackerFromCallback
+      assert(trackerAnalyzed.phases.keySet.contains(QueryPlanningTracker.ANALYSIS))
+      assert(!trackerAnalyzed.phases.keySet.contains(QueryPlanningTracker.OPTIMIZATION))
+      assert(!trackerAnalyzed.phases.keySet.contains(QueryPlanningTracker.PLANNING))
+      assert(plan != null)
+    }
+    def readyForExecution(trackerFromCallback: QueryPlanningTracker): Unit = {
+      trackerReadyForExecution = trackerFromCallback
+      assert(trackerReadyForExecution.phases.keySet.contains(QueryPlanningTracker.ANALYSIS))
+      assert(!trackerReadyForExecution.phases.keySet.contains(QueryPlanningTracker.OPTIMIZATION))
+      assert(!trackerReadyForExecution.phases.keySet.contains(QueryPlanningTracker.PLANNING))
+    }
+    def assertAnalyzed(): Unit = {
+      assert(trackerAnalyzed != null)
+      assert(trackerReadyForExecution == null)
+    }
+    def assertCommandExecuted(): Unit = {
+      assert(trackerAnalyzed != null)
+      assert(trackerReadyForExecution != null)
+    }
+    def assertOptimized(): Unit = {
+      assert(trackerAnalyzed != null)
+      assert(trackerReadyForExecution != null)
+    }
+    def assertSparkPlanPrepared(): Unit = {
+      assert(trackerAnalyzed != null)
+      assert(trackerReadyForExecution != null)
+    }
+    def assertExecutedPlanPrepared(): Unit = {
+      assert(trackerAnalyzed != null)
+      assert(trackerReadyForExecution != null)
+    }
+  }
+  case class MockCallback(
+      var trackerAnalyzed: QueryPlanningTracker = null,
+      var trackerReadyForExecution: QueryPlanningTracker = null)
+      extends QueryPlanningTrackerCallback {
+    override def analysisFailed(
+        trackerFromCallback: QueryPlanningTracker,
+        analyzedPlan: LogicalPlan): Unit = {
+      trackerAnalyzed = trackerFromCallback
+      assert(!trackerAnalyzed.phases.keySet.contains(QueryPlanningTracker.ANALYSIS))
+      assert(!trackerAnalyzed.phases.keySet.contains(QueryPlanningTracker.OPTIMIZATION))
+      assert(!trackerAnalyzed.phases.keySet.contains(QueryPlanningTracker.PLANNING))
+      assert(analyzedPlan != null)
+    }
+    def analyzed(trackerFromCallback: QueryPlanningTracker, plan: LogicalPlan): Unit = {
+      trackerAnalyzed = trackerFromCallback
+      assert(trackerAnalyzed.phases.keySet.contains(QueryPlanningTracker.ANALYSIS))
+      assert(!trackerAnalyzed.phases.keySet.contains(QueryPlanningTracker.OPTIMIZATION))
+      assert(!trackerAnalyzed.phases.keySet.contains(QueryPlanningTracker.PLANNING))
+      assert(plan != null)
+    }
+    def readyForExecution(trackerFromCallback: QueryPlanningTracker): Unit = {
+      trackerReadyForExecution = trackerFromCallback
+      assert(trackerReadyForExecution.phases.keySet.contains(QueryPlanningTracker.ANALYSIS))
+      assert(trackerReadyForExecution.phases.keySet.contains(QueryPlanningTracker.OPTIMIZATION))
+      assert(trackerReadyForExecution.phases.keySet.contains(QueryPlanningTracker.PLANNING))
+    }
+    def assertAnalyzed(): Unit = {
+      assert(trackerAnalyzed != null)
+      assert(trackerReadyForExecution == null)
+    }
+    def assertCommandExecuted(): Unit = {
+      assert(trackerAnalyzed != null)
+      assert(trackerReadyForExecution == null)
+    }
+    def assertOptimized(): Unit = {
+      assert(trackerAnalyzed != null)
+      assert(trackerReadyForExecution == null)
+    }
+    def assertSparkPlanPrepared(): Unit = {
+      assert(trackerAnalyzed != null)
+      assert(trackerReadyForExecution == null)
+    }
+    def assertExecutedPlanPrepared(): Unit = {
+      assert(trackerAnalyzed != null)
+      assert(trackerReadyForExecution != null)
+    }
+  }
+
+  test("SPARK-59689: isEagerlyExecutedCommand classifies eager-command plan shapes") {
+    val parser = spark.sessionState.sqlParser
+    // A bare command and a non-command query, obtained without executing them.
+    val command = parser.parsePlan("SET spark.sql.ansi.enabled=true")
+    assert(command.isInstanceOf[Command])
+    val query = parser.parsePlan("SELECT 1")
+    assert(!query.isInstanceOf[Command])
+
+    // The WithCTE-wrapped shapes cannot arise from SQL parsing (a CTE on a DML command is pushed
+    // into the command's query child), so build them directly. This is the classifier EXECUTE
+    // IMMEDIATE's deferral and INTO rejection both gate on.
+    assert(QueryExecution.isEagerlyExecutedCommand(command))
+    assert(QueryExecution.isEagerlyExecutedCommand(Union(Seq(command, command))))
+    assert(QueryExecution.isEagerlyExecutedCommand(WithCTE(command, Nil)))
+    assert(QueryExecution.isEagerlyExecutedCommand(WithCTE(Union(Seq(command, command)), Nil)))
+
+    // Queries -- including a Union or WithCTE that wraps them -- are not eager commands.
+    assert(!QueryExecution.isEagerlyExecutedCommand(query))
+    assert(!QueryExecution.isEagerlyExecutedCommand(Union(Seq(query, query))))
+    assert(!QueryExecution.isEagerlyExecutedCommand(WithCTE(query, Nil)))
+    assert(!QueryExecution.isEagerlyExecutedCommand(Union(Seq(command, query))))
+  }
+}
+
+class ExtendedInfo extends ExtendedExplainGenerator {
+
+  override def title: String = "Test"
+
+  override def generateExtendedInfo(plan: SparkPlan): String = {
+    val info = mutable.LinkedHashSet[String]() // don't allow duplicates
+    extensionInfo(plan, info)
+    info.mkString("\n")
+  }
+
+  def getActualPlan(plan: SparkPlan): SparkPlan = {
+    plan match {
+      case p : AdaptiveSparkPlanExec => getActualPlan(p.executedPlan)
+      case p : QueryStageExec => p.plan
+      case p : WholeStageCodegenExec => p.child
+      case p => p
+    }
+  }
+
+  def extensionInfo(p: SparkPlan, info: mutable.Set[String]): Unit = {
+    //    val info = mutable.Set[String]() // don't allow duplicates
+    val actualPlan = getActualPlan(p)
+    if (actualPlan.innerChildren.nonEmpty) {
+      actualPlan.innerChildren.foreach(c => {
+        extensionInfo(c.asInstanceOf[SparkPlan], info)
+      })
+    }
+    if (actualPlan.children.nonEmpty) {
+      actualPlan.children.foreach(c => {
+        extensionInfo(c, info)
+      })
+    }
+    actualPlan match {
+      case p : LocalTableScanExec => info += s"Scan Info: ${p.nodeName}"
+      case p : SortMergeJoinExec => info += s"SMJ Info: ${p.nodeName}"
+      case p : ProjectExec => info += s"Project Info: ${p.nodeName}"
+      case _ =>
+    }
+    ()
   }
 }

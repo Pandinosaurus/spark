@@ -17,11 +17,11 @@
 
 package org.apache.spark.util.kvstore;
 
+import java.util.Set;
 import java.util.NoSuchElementException;
 
-import com.google.common.collect.ImmutableSet;
-import org.junit.Test;
-import static org.junit.Assert.*;
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
 
 public class InMemoryStoreSuite {
 
@@ -34,24 +34,14 @@ public class InMemoryStoreSuite {
     t.id = "id";
     t.name = "name";
 
-    try {
-      store.read(CustomType1.class, t.key);
-      fail("Expected exception for non-existent object.");
-    } catch (NoSuchElementException nsee) {
-      // Expected.
-    }
+    assertThrows(NoSuchElementException.class, () -> store.read(CustomType1.class, t.key));
 
     store.write(t);
     assertEquals(t, store.read(t.getClass(), t.key));
     assertEquals(1L, store.count(t.getClass()));
 
     store.delete(t.getClass(), t.key);
-    try {
-      store.read(t.getClass(), t.key);
-      fail("Expected exception for deleted object.");
-    } catch (NoSuchElementException nsee) {
-      // Expected.
-    }
+    assertThrows(NoSuchElementException.class, () -> store.read(t.getClass(), t.key));
   }
 
   @Test
@@ -78,12 +68,7 @@ public class InMemoryStoreSuite {
     store.delete(t1.getClass(), t1.key);
     assertEquals(t2, store.read(t2.getClass(), t2.key));
     store.delete(t2.getClass(), t2.key);
-    try {
-      store.read(t2.getClass(), t2.key);
-      fail("Expected exception for deleted object.");
-    } catch (NoSuchElementException nsee) {
-      // Expected.
-    }
+    assertThrows(NoSuchElementException.class, () -> store.read(t2.getClass(), t2.key));
   }
 
   @Test
@@ -159,28 +144,28 @@ public class InMemoryStoreSuite {
     assertEquals(9, store.count(ArrayKeyIndexType.class));
 
     // Try removing non-existing keys
-    assert(!store.removeAllByIndexValues(
+    assertFalse(store.removeAllByIndexValues(
       ArrayKeyIndexType.class,
       KVIndex.NATURAL_INDEX_NAME,
-      ImmutableSet.of(new int[] {10, 10, 10}, new int[] { 3, 3, 3 })));
+      Set.of(new int[] {10, 10, 10}, new int[] { 3, 3, 3 })));
     assertEquals(9, store.count(ArrayKeyIndexType.class));
 
-    assert(store.removeAllByIndexValues(
+    assertTrue(store.removeAllByIndexValues(
       ArrayKeyIndexType.class,
       KVIndex.NATURAL_INDEX_NAME,
-      ImmutableSet.of(new int[] {0, 0, 0}, new int[] { 2, 2, 2 })));
+      Set.of(new int[] {0, 0, 0}, new int[] { 2, 2, 2 })));
     assertEquals(7, store.count(ArrayKeyIndexType.class));
 
-    assert(store.removeAllByIndexValues(
+    assertTrue(store.removeAllByIndexValues(
       ArrayKeyIndexType.class,
       "id",
-      ImmutableSet.of(new String [] { "things" })));
+      Set.<String[]>of(new String [] { "things" })));
     assertEquals(4, store.count(ArrayKeyIndexType.class));
 
-    assert(store.removeAllByIndexValues(
+    assertTrue(store.removeAllByIndexValues(
       ArrayKeyIndexType.class,
       "id",
-      ImmutableSet.of(new String [] { "more things" })));
+      Set.<String[]>of(new String [] { "more things" })));
     assertEquals(0, store.count(ArrayKeyIndexType.class));
   }
 
@@ -251,5 +236,119 @@ public class InMemoryStoreSuite {
 
     store.delete(t4.getClass(), t4.key);
     assertEquals(0, store.count(CustomType2.class));
+  }
+
+  @Test
+  public void testRemoveAllByNaturalParentIndex() throws Exception {
+    KVStore store = new InMemoryStore();
+
+    CustomType2 t1 = new CustomType2();
+    t1.key = "key1";
+    t1.id = "id1";
+    t1.parentId = "parentId1";
+    store.write(t1);
+
+    CustomType2 t2 = new CustomType2();
+    t2.key = "key2";
+    t2.id = "id2";
+    t2.parentId = "parentId1";
+    store.write(t2);
+
+    CustomType2 t3 = new CustomType2();
+    t3.key = "key3";
+    t3.id = "id3";
+    t3.parentId = "parentId2";
+    store.write(t3);
+
+    assertEquals(3, store.count(CustomType2.class));
+
+    // A parent value with no children removes nothing.
+    assertFalse(store.removeAllByIndexValues(
+      CustomType2.class, "parentId", Set.of("noSuchParent")));
+    assertEquals(3, store.count(CustomType2.class));
+
+    // Removing by a parent value deletes all of its children, and only those.
+    assertTrue(store.removeAllByIndexValues(
+      CustomType2.class, "parentId", Set.of("parentId1")));
+    assertEquals(1, store.count(CustomType2.class));
+    assertEquals("id3", store.read(CustomType2.class, "key3").id);
+
+    assertTrue(store.removeAllByIndexValues(
+      CustomType2.class, "parentId", Set.of("parentId2")));
+    assertEquals(0, store.count(CustomType2.class));
+  }
+
+  @Test
+  public void testViewByNaturalParentIndex() throws Exception {
+    KVStore store = new InMemoryStore();
+
+    CustomType2 t1 = new CustomType2();
+    t1.key = "key1";
+    t1.id = "id1";
+    t1.parentId = "parentId1";
+    store.write(t1);
+
+    CustomType2 t2 = new CustomType2();
+    t2.key = "key2";
+    t2.id = "id2";
+    t2.parentId = "parentId1";
+    store.write(t2);
+
+    CustomType2 t3 = new CustomType2();
+    t3.key = "key3";
+    t3.id = "id3";
+    t3.parentId = "parentId2";
+    store.write(t3);
+
+    // A populated parent returns exactly its children, in natural-key order.
+    try (KVStoreIterator<CustomType2> it =
+        store.view(CustomType2.class).parent("parentId1").closeableIterator()) {
+      assertTrue(it.hasNext());
+      assertEquals("key1", it.next().key);
+      assertTrue(it.hasNext());
+      assertEquals("key2", it.next().key);
+      assertFalse(it.hasNext());
+    }
+
+    // A parent value with no children yields an empty iterator (the early-return branch).
+    try (KVStoreIterator<CustomType2> it =
+        store.view(CustomType2.class).parent("noSuchParent").closeableIterator()) {
+      assertFalse(it.hasNext());
+    }
+  }
+
+  @Test
+  public void testCountByIndexValue() throws Exception {
+    KVStore store = new InMemoryStore();
+
+    // Counting by an indexed value for a type that was never written must return 0 instead
+    // of throwing, consistent with count(Class) and the LevelDB/RocksDB implementations.
+    assertEquals(0, store.count(CustomType1.class, "id", "id"));
+
+    // An unknown index name must be rejected even when the type has no rows, matching both
+    // the populated-type path and the LevelDB/RocksDB stores (IllegalArgumentException),
+    // rather than being silently swallowed into a 0.
+    assertThrows(IllegalArgumentException.class,
+      () -> store.count(CustomType1.class, "nonexistentIndex", "id"));
+
+    CustomType1 t1 = new CustomType1();
+    t1.key = "key1";
+    t1.id = "id";
+    t1.name = "name1";
+    store.write(t1);
+
+    CustomType1 t2 = new CustomType1();
+    t2.key = "key2";
+    t2.id = "id";
+    t2.name = "name2";
+    store.write(t2);
+
+    assertEquals(2, store.count(CustomType1.class, "id", "id"));
+    assertEquals(1, store.count(CustomType1.class, "name", "name1"));
+    assertEquals(0, store.count(CustomType1.class, "name", "nonexistent"));
+
+    // Same rejection for a populated type, confirming the absent/present paths agree.
+    assertThrows(IllegalArgumentException.class,
+      () -> store.count(CustomType1.class, "nonexistentIndex", "id"));
   }
 }

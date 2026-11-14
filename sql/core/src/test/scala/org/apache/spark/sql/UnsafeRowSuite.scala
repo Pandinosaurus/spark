@@ -19,7 +19,7 @@ package org.apache.spark.sql
 
 import java.io.ByteArrayOutputStream
 
-import org.apache.spark.{SparkConf, SparkFunSuite}
+import org.apache.spark.{SparkConf, SparkFunSuite, SparkIllegalArgumentException}
 import org.apache.spark.serializer.{JavaSerializer, KryoSerializer}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{UnsafeProjection, UnsafeRow}
@@ -129,7 +129,12 @@ class UnsafeRowSuite extends SparkFunSuite {
   test("calling get(ordinal, datatype) on null columns") {
     val row = InternalRow.apply(null)
     val unsafeRow = UnsafeProjection.create(Array[DataType](NullType)).apply(row)
-    for (dataType <- DataTypeTestUtils.atomicTypes) {
+    // Iterate `atomicTypes` plus the parameterized nanosecond timestamp types, which aren't yet
+    // included in `DataTypeTestUtils.atomicTypes` but should still return null for null columns
+    // (their physical row support was added in SPARK-56981).
+    val typesToCheck: Set[DataType] = DataTypeTestUtils.atomicTypes.toSet[DataType] ++
+      Set(TimestampNTZNanosType(9), TimestampLTZNanosType(9))
+    for (dataType <- typesToCheck) {
       assert(unsafeRow.get(0, dataType) === null)
     }
   }
@@ -187,5 +192,41 @@ class UnsafeRowSuite extends SparkFunSuite {
     val d2 = (d1 * Decimal(10)).toPrecision(39, 18)
     unsafeRow.setDecimal(0, d2, 38)
     assert(unsafeRow.getDecimal(0, 38, 18) === null)
+  }
+
+  test("SPARK-48713: throw SparkIllegalArgumentException for illegal UnsafeRow.pointTo") {
+    val emptyRow = UnsafeRow.createFromByteArray(64, 2)
+    val byteArray = new Array[Byte](64)
+
+    // Out of bounds
+    var errorMsg = intercept[SparkIllegalArgumentException] {
+      emptyRow.pointTo(byteArray, Platform.BYTE_ARRAY_OFFSET + 50, 32)
+    }.getMessage
+    assert(
+      errorMsg.contains(
+        "Invalid byte array backed UnsafeRow: byte array length=64, offset=50, byte size=32"
+      )
+    )
+
+    // Negative size
+    errorMsg = intercept[SparkIllegalArgumentException] {
+      emptyRow.pointTo(byteArray, Platform.BYTE_ARRAY_OFFSET + 50, -32)
+    }.getMessage
+    assert(
+      errorMsg.contains(
+        "Invalid byte array backed UnsafeRow: byte array length=64, offset=50, byte size=-32"
+      )
+    )
+
+    // Negative offset
+    errorMsg = intercept[SparkIllegalArgumentException] {
+      emptyRow.pointTo(byteArray, -5, 32)
+    }.getMessage
+    assert(
+      errorMsg.contains(
+        s"Invalid byte array backed UnsafeRow: byte array length=64, " +
+          s"offset=${-5 - Platform.BYTE_ARRAY_OFFSET}, byte size=32"
+      )
+    )
   }
 }

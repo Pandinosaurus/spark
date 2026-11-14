@@ -27,8 +27,10 @@ import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
 import org.apache.spark.sql.catalyst.encoders.ExamplePointUDT
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenContext
+import org.apache.spark.sql.catalyst.optimizer.NormalizeNaNAndZero
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.util.{ArrayData, GenericArrayData}
+import org.apache.spark.sql.catalyst.util.TypeUtils.ordinalNumber
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
@@ -134,20 +136,27 @@ class PredicateSuite extends SparkFunSuite with ExpressionEvalHelper {
   }
 
   test("basic IN/INSET predicate test") {
-    checkInAndInSet(In(NonFoldableLiteral.create(null, IntegerType), Seq(Literal(1),
-      Literal(2))), null)
-    checkInAndInSet(In(NonFoldableLiteral.create(null, IntegerType),
-      Seq(NonFoldableLiteral.create(null, IntegerType))), null)
-    checkInAndInSet(In(NonFoldableLiteral.create(null, IntegerType), Seq.empty), null)
-    checkInAndInSet(In(Literal(1), Seq.empty), false)
-    checkInAndInSet(In(Literal(1), Seq(NonFoldableLiteral.create(null, IntegerType))), null)
-    checkInAndInSet(In(Literal(1), Seq(Literal(1), NonFoldableLiteral.create(null, IntegerType))),
-      true)
-    checkInAndInSet(In(Literal(2), Seq(Literal(1), NonFoldableLiteral.create(null, IntegerType))),
-      null)
-    checkInAndInSet(In(Literal(1), Seq(Literal(1), Literal(2))), true)
-    checkInAndInSet(In(Literal(2), Seq(Literal(1), Literal(2))), true)
-    checkInAndInSet(In(Literal(3), Seq(Literal(1), Literal(2))), false)
+    Seq(true, false).foreach { legacyNullInBehavior =>
+      withSQLConf(SQLConf.LEGACY_NULL_IN_EMPTY_LIST_BEHAVIOR.key -> legacyNullInBehavior.toString) {
+        checkInAndInSet(In(NonFoldableLiteral.create(null, IntegerType), Seq(Literal(1),
+          Literal(2))), null)
+        checkInAndInSet(In(NonFoldableLiteral.create(null, IntegerType),
+          Seq(NonFoldableLiteral.create(null, IntegerType))), null)
+        checkInAndInSet(In(NonFoldableLiteral.create(null, IntegerType), Seq.empty),
+          expected = if (legacyNullInBehavior) null else false)
+        checkInAndInSet(In(Literal(1), Seq.empty), false)
+        checkInAndInSet(In(Literal(1), Seq(NonFoldableLiteral.create(null, IntegerType))), null)
+        checkInAndInSet(In(Literal(1),
+          Seq(Literal(1), NonFoldableLiteral.create(null, IntegerType))),
+          true)
+        checkInAndInSet(In(Literal(2),
+          Seq(Literal(1), NonFoldableLiteral.create(null, IntegerType))),
+          null)
+        checkInAndInSet(In(Literal(1), Seq(Literal(1), Literal(2))), true)
+        checkInAndInSet(In(Literal(2), Seq(Literal(1), Literal(2))), true)
+        checkInAndInSet(In(Literal(3), Seq(Literal(1), Literal(2))), false)
+      }
+    }
 
     checkEvaluation(
       And(In(Literal(1), Seq(Literal(1), Literal(2))), In(Literal(2), Seq(Literal(1),
@@ -239,7 +248,10 @@ class PredicateSuite extends SparkFunSuite with ExpressionEvalHelper {
     In(map, Seq(map)).checkInputDataTypes() match {
       case TypeCheckResult.TypeCheckFailure(msg) =>
         assert(msg.contains("function in does not support ordering on type map"))
-      case _ => fail("In should not work on map type")
+      case TypeCheckResult.DataTypeMismatch(errorSubClass, messageParameters) =>
+        assert(errorSubClass == "INVALID_ORDERING_TYPE")
+        assert(messageParameters === Map(
+          "functionName" -> "`in`", "dataType" -> "\"MAP<INT, INT>\""))
     }
   }
 
@@ -392,7 +404,7 @@ class PredicateSuite extends SparkFunSuite with ExpressionEvalHelper {
   }
 
   test("BinaryComparison: lessThan") {
-    for (i <- 0 until smallValues.length) {
+    for (i <- smallValues.indices) {
       checkEvaluation(LessThan(smallValues(i), largeValues(i)), true)
       checkEvaluation(LessThan(equalValues1(i), equalValues2(i)), false)
       checkEvaluation(LessThan(largeValues(i), smallValues(i)), false)
@@ -400,7 +412,7 @@ class PredicateSuite extends SparkFunSuite with ExpressionEvalHelper {
   }
 
   test("BinaryComparison: LessThanOrEqual") {
-    for (i <- 0 until smallValues.length) {
+    for (i <- smallValues.indices) {
       checkEvaluation(LessThanOrEqual(smallValues(i), largeValues(i)), true)
       checkEvaluation(LessThanOrEqual(equalValues1(i), equalValues2(i)), true)
       checkEvaluation(LessThanOrEqual(largeValues(i), smallValues(i)), false)
@@ -408,7 +420,7 @@ class PredicateSuite extends SparkFunSuite with ExpressionEvalHelper {
   }
 
   test("BinaryComparison: GreaterThan") {
-    for (i <- 0 until smallValues.length) {
+    for (i <- smallValues.indices) {
       checkEvaluation(GreaterThan(smallValues(i), largeValues(i)), false)
       checkEvaluation(GreaterThan(equalValues1(i), equalValues2(i)), false)
       checkEvaluation(GreaterThan(largeValues(i), smallValues(i)), true)
@@ -416,7 +428,7 @@ class PredicateSuite extends SparkFunSuite with ExpressionEvalHelper {
   }
 
   test("BinaryComparison: GreaterThanOrEqual") {
-    for (i <- 0 until smallValues.length) {
+    for (i <- smallValues.indices) {
       checkEvaluation(GreaterThanOrEqual(smallValues(i), largeValues(i)), false)
       checkEvaluation(GreaterThanOrEqual(equalValues1(i), equalValues2(i)), true)
       checkEvaluation(GreaterThanOrEqual(largeValues(i), smallValues(i)), true)
@@ -424,7 +436,7 @@ class PredicateSuite extends SparkFunSuite with ExpressionEvalHelper {
   }
 
   test("BinaryComparison: EqualTo") {
-    for (i <- 0 until smallValues.length) {
+    for (i <- smallValues.indices) {
       checkEvaluation(EqualTo(smallValues(i), largeValues(i)), false)
       checkEvaluation(EqualTo(equalValues1(i), equalValues2(i)), true)
       checkEvaluation(EqualTo(largeValues(i), smallValues(i)), false)
@@ -432,7 +444,7 @@ class PredicateSuite extends SparkFunSuite with ExpressionEvalHelper {
   }
 
   test("BinaryComparison: EqualNullSafe") {
-    for (i <- 0 until smallValues.length) {
+    for (i <- smallValues.indices) {
       checkEvaluation(EqualNullSafe(smallValues(i), largeValues(i)), false)
       checkEvaluation(EqualNullSafe(equalValues1(i), equalValues2(i)), true)
       checkEvaluation(EqualNullSafe(largeValues(i), smallValues(i)), false)
@@ -528,8 +540,13 @@ class PredicateSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(IsUnknown(Literal.create(null, BooleanType)), true, row0)
     checkEvaluation(IsNotUnknown(Literal.create(null, BooleanType)), false, row0)
     IsUnknown(Literal.create(null, IntegerType)).checkInputDataTypes() match {
-      case TypeCheckResult.TypeCheckFailure(msg) =>
-        assert(msg.contains("argument 1 requires boolean type"))
+      case TypeCheckResult.DataTypeMismatch(errorSubClass, messageParameters) =>
+        assert(errorSubClass === "UNEXPECTED_INPUT_TYPE")
+        assert(messageParameters === Map(
+          "paramIndex" -> ordinalNumber(0),
+          "requiredType" -> "\"BOOLEAN\"",
+          "inputSql" -> "\"NULL\"",
+          "inputType" -> "\"INT\""))
     }
   }
 
@@ -553,6 +570,62 @@ class PredicateSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(GreaterThan(Literal(Float.NaN), Literal(Float.PositiveInfinity)), true)
     checkEvaluation(GreaterThan(Literal(Float.NaN), Literal(Float.NaN)), false)
     checkEvaluation(GreaterThan(Literal(0.0F), Literal(-0.0F)), false)
+  }
+
+  test("SPARK-60150: comparisons exempt from normalization agree with normalized values") {
+    // PushPredicateThroughNonJoin pushes these comparisons below an Aggregate without
+    // normalizing a float/double grouping key that is a direct operand, so each must give the
+    // same result for a value and for its normalized form: -0.0 and 0.0, and NaNs with different
+    // bit patterns. The values come from the input row rather than literals, because literal
+    // codegen emits every NaN as the canonical NaN, and pushed filters read raw input values.
+    val binary: Seq[(Expression, Expression) => Expression] = Seq(
+      EqualTo, EqualNullSafe, LessThan, LessThanOrEqual, GreaterThan, GreaterThanOrEqual,
+      (l, r) => In(l, Seq(r)))
+    val unary: Seq[Expression => Expression] = Seq(IsNull, IsNotNull, IsNaN)
+
+    def check(dataType: DataType, values: Seq[Any]): Unit = {
+      val left = BoundReference(0, dataType, nullable = true)
+      val right = BoundReference(1, dataType, nullable = true)
+      def norm(v: Any): Any = NormalizeNaNAndZero(Literal.create(v, dataType)).eval()
+      for (v <- values; w <- values; op <- binary) {
+        val e = op(left, right)
+        checkEvaluation(e, e.eval(InternalRow(norm(v), w)), InternalRow(v, w))
+        checkEvaluation(e, e.eval(InternalRow(v, norm(w))), InternalRow(v, w))
+      }
+      for (v <- values; op <- unary) {
+        val e = op(left)
+        checkEvaluation(e, e.eval(InternalRow(norm(v))), InternalRow(v))
+      }
+      // InSet, with the HashSet that OptimizeIn builds from an IN list of literals. A null in the
+      // list is left out: interpreted and generated code differ on NaN INSET (null), for raw and
+      // normalized NaNs alike.
+      for (v <- values; w <- values if w != null) {
+        val e = InSet(left, HashSet[Any](w))
+        checkEvaluation(e, e.eval(InternalRow(norm(v))), InternalRow(v))
+      }
+    }
+
+    val otherDoubleNaN = java.lang.Double.longBitsToDouble(0x7ff8000000000001L)
+    assert(java.lang.Double.doubleToRawLongBits(otherDoubleNaN) !=
+      java.lang.Double.doubleToRawLongBits(Double.NaN))
+    val doubles = Seq(-0.0d, 0.0d, Double.NaN, otherDoubleNaN, 1.0d, null)
+    check(DoubleType, doubles)
+
+    val otherFloatNaN = java.lang.Float.intBitsToFloat(0x7fc00001)
+    assert(java.lang.Float.floatToRawIntBits(otherFloatNaN) !=
+      java.lang.Float.floatToRawIntBits(Float.NaN))
+    val floats = Seq(-0.0f, 0.0f, Float.NaN, otherFloatNaN, 1.0f, null)
+    check(FloatType, floats)
+
+    // A FLOAT key compared with a DOUBLE or DECIMAL value is widened to DOUBLE, and the widened
+    // key is not normalized either.
+    val widened = Cast(BoundReference(0, FloatType, nullable = true), DoubleType)
+    val value = BoundReference(1, DoubleType, nullable = true)
+    def normFloat(v: Any): Any = NormalizeNaNAndZero(Literal.create(v, FloatType)).eval()
+    for (v <- floats; w <- doubles; op <- binary) {
+      val e = op(widened, value)
+      checkEvaluation(e, e.eval(InternalRow(normFloat(v), w)), InternalRow(v, w))
+    }
   }
 
   test("SPARK-32110: compare special double/float values in array") {
@@ -657,5 +730,97 @@ class PredicateSuite extends SparkFunSuite with ExpressionEvalHelper {
       Seq(Literal(Double.NaN), Literal(2d), Literal.create(null, DoubleType))), null)
     checkInAndInSet(In(Literal(Double.NaN),
       Seq(Literal(Double.NaN), Literal(2d), Literal.create(null, DoubleType))), true)
+  }
+
+  test("In and InSet logging limits") {
+    assert(In(Literal(1), Seq(Literal(1), Literal(2))).simpleString(1)
+      === "1 IN (1,... 1 more fields)")
+    assert(In(Literal(1), Seq(Literal(1), Literal(2))).simpleString(2) === "1 IN (1,2)")
+    assert(In(Literal(1), Seq(Literal(1))).simpleString(1) === "1 IN (1)")
+    assert(InSet(Literal(1), Set(1, 2)).simpleString(1) === "1 INSET 1, ... 1 more fields")
+    assert(InSet(Literal(1), Set(1, 2)).simpleString(2) === "1 INSET 1, 2")
+    assert(InSet(Literal(1), Set(1)).simpleString(1) === "1 INSET 1")
+  }
+
+  test("context independent foldable predicate expressions") {
+    // Create some base literals
+    val intLit = Literal(5)
+    val strLit = Literal("test")
+    val boolLit = Literal(true)
+    val nullLit = Literal.create(null, IntegerType)
+    val ts = java.sql.Timestamp.valueOf("2021-01-01 12:00:00")
+    val tsLit = Literal.create(ts, TimestampType)
+    val ts2 = java.sql.Timestamp.valueOf("2021-01-02 12:00:00")
+    val tsLit2 = Literal.create(ts2, TimestampType)
+
+    // Create predicate expressions using these literals
+    val expressions = Seq(
+      // Comparison predicates
+      EqualTo(intLit, Literal(5)),
+      EqualNullSafe(intLit, Literal(5)),
+      GreaterThan(intLit, Literal(3)),
+      LessThan(intLit, Literal(10)),
+      GreaterThanOrEqual(intLit, Literal(5)),
+      LessThanOrEqual(intLit, Literal(5)),
+
+      // Logical operators
+      And(boolLit, Literal(false)),
+      Or(boolLit, Literal(false)),
+      Not(boolLit),
+
+      // String predicates
+      StartsWith(strLit, Literal("te")),
+      EndsWith(strLit, Literal("st")),
+      Contains(strLit, Literal("es")),
+
+      // NULL predicates
+      IsNull(nullLit),
+      IsNotNull(intLit),
+
+      // Other predicates
+      In(intLit, Seq(Literal(1), Literal(5), Literal(10))),
+      InSet(intLit, Set(1, 5, 10)),
+
+      // Nested predicates
+      And(GreaterThan(intLit, Literal(3)), LessThan(intLit, Literal(10))),
+
+      // Timestamp comparisons
+      EqualTo(tsLit, tsLit2),
+      GreaterThan(tsLit,
+        Literal.create(java.sql.Timestamp.valueOf("2020-12-31 12:00:00"), TimestampType)),
+      LessThan(tsLit, tsLit2)
+    )
+
+    expressions.foreach { expr =>
+      assert(expr.foldable, s"Expression $expr should be foldable")
+      assert(expr.contextIndependentFoldable,
+        s"Expression $expr should be context independent foldable")
+    }
+  }
+
+  test("context dependent foldable predicate expressions") {
+    // Create timestamp literals
+    val ts = java.sql.Timestamp.valueOf("2021-01-01 12:00:00")
+    val tsLit = Literal.create(ts, TimestampType)
+    val ts2 = java.sql.Timestamp.valueOf("2021-01-02 12:00:00")
+    val tsLit2 = Literal.create(ts2, TimestampType)
+
+    // Create predicate expressions that involve timestamps
+    val expressions = Seq(
+      // Predicates with cast operations
+      EqualTo(Cast(tsLit, DateType), Cast(tsLit2, DateType)),
+
+      // Expressions using date/time operations
+      EqualTo(
+        DateDiff(Cast(tsLit, DateType), Cast(tsLit2, DateType)),
+        Literal(-1)
+      )
+    )
+
+    expressions.foreach { expr =>
+      assert(expr.foldable, s"Expression $expr should be foldable")
+      assert(!expr.contextIndependentFoldable,
+        s"Expression $expr should not be context independent foldable")
+    }
   }
 }

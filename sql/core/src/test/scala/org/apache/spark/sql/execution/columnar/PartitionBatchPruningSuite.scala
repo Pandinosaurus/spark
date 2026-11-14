@@ -17,18 +17,19 @@
 
 package org.apache.spark.sql.execution.columnar
 
+import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.test.SQLTestData._
 
 
-class PartitionBatchPruningSuite extends SharedSparkSession {
+class PartitionBatchPruningSuite extends SharedSparkSession with AdaptiveSparkPlanHelper {
 
   import testImplicits._
 
-  private lazy val originalColumnBatchSize = spark.conf.get(SQLConf.COLUMN_BATCH_SIZE)
+  private lazy val originalColumnBatchSize = spark.conf.get(SQLConf.COLUMN_BATCH_SIZE.key)
   private lazy val originalInMemoryPartitionPruning =
-    spark.conf.get(SQLConf.IN_MEMORY_PARTITION_PRUNING)
+    spark.conf.get(SQLConf.IN_MEMORY_PARTITION_PRUNING.key)
   private val testArrayData = (1 to 100).map { key =>
     Tuple1(Array.fill(key)(key))
   }
@@ -180,7 +181,7 @@ class PartitionBatchPruningSuite extends SharedSparkSession {
     val result = df.collect().map(_(0)).toArray
     assert(result.length === 1)
 
-    val (readPartitions, readBatches) = df.queryExecution.executedPlan.collect {
+    val (readPartitions, readBatches) = collect(df.queryExecution.executedPlan) {
         case in: InMemoryTableScanExec => (in.readPartitions.value, in.readBatches.value)
       }.head
     assert(readPartitions === 5)
@@ -201,7 +202,7 @@ class PartitionBatchPruningSuite extends SharedSparkSession {
         df.collect().map(_(0)).toArray
       }
 
-      val (readPartitions, readBatches) = df.queryExecution.executedPlan.collect {
+      val (readPartitions, readBatches) = collect(df.queryExecution.executedPlan) {
         case in: InMemoryTableScanExec => (in.readPartitions.value, in.readBatches.value)
       }.head
 
@@ -209,6 +210,64 @@ class PartitionBatchPruningSuite extends SharedSparkSession {
       assert(
         readPartitions === expectedReadPartitions,
         s"Wrong number of read partitions: $queryExecution")
+    }
+  }
+
+  test("SPARK-57735: partition pruning on cached nanosecond-timestamp column") {
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      withTempView("nanosPruning") {
+        // 100 monotonically increasing nanosecond timestamps in one ordered partition; with batch
+        // size 10 (set in beforeAll) this is 10 batches whose min/max bounds are ordered and
+        // non-overlapping. makeRDD with a single slice preserves element order (no shuffle), so a
+        // range filter can prune to just the matching batches. The timestamps differ only in the
+        // sub-microsecond component, so this also exercises nanosecond-precision bounds.
+        val rows = (1 to 100).map { k =>
+          Tuple1(s"2020-01-01 00:00:00.${"%09d".format(k)}")
+        }
+        // Boundary chosen so only the last batch (values 91..100) qualifies.
+        val boundary = "cast('2020-01-01 00:00:00.000000090' as TIMESTAMP_NTZ(9))"
+
+        // Compute the expected result BEFORE caching, so it cannot hit the cache (the CacheManager
+        // matches by logical plan, not by DataFrame identity, so evaluating an equivalent query
+        // after caching could be served from the InMemoryRelation).
+        val expected = sparkContext.makeRDD(rows, 1).toDF("s")
+          .selectExpr("cast(s as TIMESTAMP_NTZ(9)) as ts")
+          .where(s"ts > $boundary").orderBy("ts").collect().toSeq
+        assert(expected.nonEmpty && expected.size < 100,
+          "test boundary should select a strict, non-empty subset")
+
+        sparkContext.makeRDD(rows, 1).toDF("s")
+          .selectExpr("cast(s as TIMESTAMP_NTZ(9)) as ts")
+          .createOrReplaceTempView("nanosPruning")
+        spark.catalog.cacheTable("nanosPruning")
+        try {
+          // Correctness: the cached + pruned read matches the pre-cache evaluation.
+          val cached = sql(s"SELECT ts FROM nanosPruning WHERE ts > $boundary ORDER BY ts")
+          assert(cached.collect().toSeq === expected,
+            "cached + pruned result must match the uncached evaluation")
+
+          // Pruning: the same range query reads fewer batches with in-memory partition pruning on
+          // than off. (With bounds-less stats the counts would be equal because no batch can be
+          // skipped.) Comparing pruning-on vs pruning-off for the identical query avoids depending
+          // on the absolute batch/partition count, and mirrors the suite's
+          // "disable IN_MEMORY_PARTITION_PRUNING" test.
+          def readBatchesWithPruning(enabled: Boolean): Long = {
+            withSQLConf(SQLConf.IN_MEMORY_PARTITION_PRUNING.key -> enabled.toString) {
+              val df = sql(s"SELECT ts FROM nanosPruning WHERE ts > $boundary")
+              df.collect()
+              collect(df.queryExecution.executedPlan) {
+                case in: InMemoryTableScanExec => in.readBatches.value
+              }.head
+            }
+          }
+          val withoutPruning = readBatchesWithPruning(enabled = false)
+          val withPruning = readBatchesWithPruning(enabled = true)
+          assert(withPruning < withoutPruning,
+            s"expected pruning to read fewer batches: $withPruning (on) vs $withoutPruning (off)")
+        } finally {
+          spark.catalog.uncacheTable("nanosPruning")
+        }
+      }
     }
   }
 }

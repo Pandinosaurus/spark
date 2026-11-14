@@ -19,9 +19,12 @@ package org.apache.spark.security
 
 import java.io.{DataInputStream, DataOutputStream}
 import java.net.Socket
+import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets.UTF_8
+import java.security.MessageDigest
 
 import org.apache.spark.SparkConf
+import org.apache.spark.internal.config.Python.{PYTHON_UNIX_DOMAIN_SOCKET_DIR, PYTHON_UNIX_DOMAIN_SOCKET_ENABLED}
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.util.Utils
 
@@ -35,6 +38,9 @@ import org.apache.spark.util.Utils
  * There's no secrecy, so this relies on the sockets being either local or somehow encrypted.
  */
 private[spark] class SocketAuthHelper(val conf: SparkConf) {
+  val isUnixDomainSock: Boolean = conf.get(PYTHON_UNIX_DOMAIN_SOCKET_ENABLED)
+  lazy val sockDir: String =
+    conf.get(PYTHON_UNIX_DOMAIN_SOCKET_DIR).getOrElse(System.getProperty("java.io.tmpdir"))
 
   val secret = Utils.createSecret(conf)
 
@@ -47,6 +53,11 @@ private[spark] class SocketAuthHelper(val conf: SparkConf) {
    * @param s The client socket.
    * @throws IllegalArgumentException If authentication fails.
    */
+  def authClient(socket: SocketChannel): Unit = {
+    if (isUnixDomainSock) return
+    authClient(socket.socket())
+  }
+
   def authClient(s: Socket): Unit = {
     var shouldClose = true
     try {
@@ -55,7 +66,7 @@ private[spark] class SocketAuthHelper(val conf: SparkConf) {
       try {
         s.setSoTimeout(10000)
         val clientSecret = readUtf8(s)
-        if (secret == clientSecret) {
+        if (MessageDigest.isEqual(secret.getBytes(UTF_8), clientSecret.getBytes(UTF_8))) {
           writeUtf8("ok", s)
           shouldClose = false
         } else {
@@ -80,7 +91,9 @@ private[spark] class SocketAuthHelper(val conf: SparkConf) {
    * @param s The socket connected to the server.
    * @throws IllegalArgumentException If authentication fails.
    */
-  def authToServer(s: Socket): Unit = {
+  def authToServer(socket: SocketChannel): Unit = {
+    if (isUnixDomainSock) return
+    val s = socket.socket()
     var shouldClose = true
     try {
       writeUtf8(secret, s)

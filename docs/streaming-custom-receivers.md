@@ -8,9 +8,9 @@ license: |
   The ASF licenses this file to You under the Apache License, Version 2.0
   (the "License"); you may not use this file except in compliance with
   the License.  You may obtain a copy of the License at
- 
+
      http://www.apache.org/licenses/LICENSE-2.0
- 
+
   Unless required by applicable law or agreed to in writing, software
   distributed under the License is distributed on an "AS IS" BASIS,
   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -75,7 +75,7 @@ class CustomReceiver(host: String, port: Int)
 
   def onStop() {
     // There is nothing much to do as the thread calling receive()
-    // is designed to stop by itself if isStopped() returns false
+    // is designed to stop by itself when isStopped() returns true
   }
 
   /** Create a socket connection and receive data until receiver is stopped */
@@ -137,7 +137,7 @@ public class JavaCustomReceiver extends Receiver<String> {
   @Override
   public void onStop() {
     // There is nothing much to do as the thread calling receive()
-    // is designed to stop by itself if isStopped() returns false
+    // is designed to stop by itself when isStopped() returns true
   }
 
   /** Create a socket connection and receive data until receiver is stopped */
@@ -243,11 +243,13 @@ interval in the [Spark Streaming Programming Guide](streaming-programming-guide.
 
 The following table summarizes the characteristics of both types of receivers
 
-<table class="table">
+<table>
+<thead>
 <tr>
   <th>Receiver Type</th>
   <th>Characteristics</th>
 </tr>
+</thead>
 <tr>
   <td><b>Unreliable Receivers</b></td>
   <td>

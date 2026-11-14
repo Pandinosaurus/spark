@@ -30,7 +30,7 @@ import org.apache.spark.sql.functions.{col, udf}
 import org.apache.spark.sql.types.{ArrayType, StructType}
 import org.apache.spark.util.Utils
 import org.apache.spark.util.VersionUtils.majorMinorVersion
-import org.apache.spark.util.collection.OpenHashMap
+import org.apache.spark.util.collection.{OpenHashMap, OpenHashSet}
 
 /**
  * Maps a sequence of terms to their term frequencies using the hashing trick.
@@ -91,12 +91,36 @@ class HashingTF @Since("3.0.0") private[ml] (
   override def transform(dataset: Dataset[_]): DataFrame = {
     val outputSchema = transformSchema(dataset.schema)
     val n = $(numFeatures)
-    val updateFunc = if ($(binary)) (v: Double) => 1.0 else (v: Double) => v + 1.0
+    def binaryHashUDF(hashFunc: Any => Int) = udf { terms: Seq[_] =>
+      val indices = new OpenHashSet[Int]
+      terms.foreach { term =>
+        indices.add(Utils.nonNegativeMod(hashFunc(term), n))
+      }
+      val sortedIndices = indices.iterator.toArray.sorted
+      Vectors.sparse(n, sortedIndices, Array.fill(sortedIndices.length)(1.0))
+    }
 
-    val hashUDF = udf { terms: Seq[_] =>
-      val map = new OpenHashMap[Int, Double]()
-      terms.foreach { term => map.changeValue(indexOf(term), 1.0, updateFunc) }
-      Vectors.sparse(n, map.toSeq)
+    def countHashUDF(hashFunc: Any => Int) = udf { terms: Seq[_] =>
+      val map = new OpenHashMap[Int, Int]
+      terms.foreach { term =>
+        val index = Utils.nonNegativeMod(hashFunc(term), n)
+        map.changeValue(index, 1, _ + 1)
+      }
+      Vectors.sparse(n, map.iterator.map { case (index, count) =>
+        (index, count.toDouble)
+      }.toSeq)
+    }
+
+    val hashUDF = ($(binary), hashFuncVersion) match {
+      case (true, HashingTF.SPARK_2_MURMUR3_HASH) =>
+        binaryHashUDF(OldHashingTF.murmur3Hash)
+      case (false, HashingTF.SPARK_2_MURMUR3_HASH) =>
+        countHashUDF(OldHashingTF.murmur3Hash)
+      case (true, HashingTF.SPARK_3_MURMUR3_HASH) =>
+        binaryHashUDF(FeatureHasher.murmur3Hash)
+      case (false, HashingTF.SPARK_3_MURMUR3_HASH) =>
+        countHashUDF(FeatureHasher.murmur3Hash)
+      case _ => throw new IllegalArgumentException("Illegal hash function version setting.")
     }
 
     dataset.withColumn($(outputCol), hashUDF(col($(inputCol))),
@@ -105,7 +129,7 @@ class HashingTF @Since("3.0.0") private[ml] (
 
   @Since("1.4.0")
   override def transformSchema(schema: StructType): StructType = {
-    val inputType = schema($(inputCol)).dataType
+    val inputType = SchemaUtils.getSchemaFieldType(schema, $(inputCol))
     require(inputType.isInstanceOf[ArrayType],
       s"The input column must be ${ArrayType.simpleString}, but got ${inputType.catalogString}.")
     val attrGroup = new AttributeGroup($(outputCol), $(numFeatures))
@@ -154,7 +178,7 @@ object HashingTF extends DefaultParamsReadable[HashingTF] {
     private val className = classOf[HashingTF].getName
 
     override def load(path: String): HashingTF = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
 
       // We support loading old `HashingTF` saved by previous Spark versions.
       // Previous `HashingTF` uses `mllib.feature.HashingTF.murmur3Hash`, but new `HashingTF` uses

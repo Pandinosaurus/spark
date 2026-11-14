@@ -19,10 +19,11 @@ package org.apache.spark.status.api.v1
 import java.io.OutputStream
 import java.util.{List => JList}
 import java.util.zip.ZipOutputStream
-import javax.ws.rs.{NotFoundException => _, _}
-import javax.ws.rs.core.{MediaType, Response, StreamingOutput}
 
 import scala.util.control.NonFatal
+
+import jakarta.ws.rs.{NotFoundException => _, _}
+import jakarta.ws.rs.core.{MediaType, Response, StreamingOutput}
 
 import org.apache.spark.{JobExecutionStatus, SparkContext}
 import org.apache.spark.status.api.v1
@@ -55,15 +56,8 @@ private[v1] class AbstractApplicationResource extends BaseAppResource {
   @GET
   @Path("executors/{executorId}/threads")
   def threadDump(@PathParam("executorId") execId: String): Array[ThreadStackTrace] = withUI { ui =>
-    if (execId != SparkContext.DRIVER_IDENTIFIER && !execId.forall(Character.isDigit)) {
-      throw new BadParameterException(
-        s"Invalid executorId: neither '${SparkContext.DRIVER_IDENTIFIER}' nor number.")
-    }
-
-    val safeSparkContext = ui.sc.getOrElse {
-      throw new ServiceUnavailable("Thread dumps not available through the history server.")
-    }
-
+    checkExecutorId(execId)
+    val safeSparkContext = checkAndGetSparkContext("Thread dumps")
     ui.store.asOption(ui.store.executorSummary(execId)) match {
       case Some(executorSummary) if executorSummary.isActive =>
           val safeThreadDump = safeSparkContext.getExecutorThreadDump(execId).getOrElse {
@@ -76,12 +70,39 @@ private[v1] class AbstractApplicationResource extends BaseAppResource {
   }
 
   @GET
+  @Path("threads")
+  def getTaskThreadDump(
+      @QueryParam("taskId") taskId: Long,
+      @QueryParam("executorId") execId: String): ThreadStackTrace = {
+    checkExecutorId(execId)
+    val safeSparkContext = checkAndGetSparkContext("Thread dumps")
+    safeSparkContext
+      .getTaskThreadDump(taskId, execId)
+      .getOrElse {
+        throw new NotFoundException(
+          s"Task '$taskId' is not running on Executor '$execId' right now")
+      }
+  }
+
+  @GET
   @Path("allexecutors")
   def allExecutorList(): Seq[ExecutorSummary] = withUI(_.store.executorList(false))
 
   @GET
   @Path("allmiscellaneousprocess")
   def allProcessList(): Seq[ProcessSummary] = withUI(_.store.miscellaneousProcessList(false))
+
+  @GET
+  @Path("holdstatus")
+  def holdStatus(): ApplicationHoldStatus = {
+    val safeSparkContext = checkAndGetSparkContext("Hold status")
+    val held = safeSparkContext.executorsHeld
+    new ApplicationHoldStatus(
+      supported = safeSparkContext.executorHoldSupported,
+      held = held,
+      // The executors that have not exited yet are still draining their running tasks.
+      draining = if (held) safeSparkContext.getExecutorIds().size else 0)
+  }
 
   @Path("stages")
   def stages(): Class[StagesResource] = classOf[StagesResource]
@@ -111,6 +132,7 @@ private[v1] class AbstractApplicationResource extends BaseAppResource {
       Utils.redact(ui.conf, envInfo.sparkProperties).sortBy(_._1),
       Utils.redact(ui.conf, envInfo.hadoopProperties).sortBy(_._1),
       Utils.redact(ui.conf, envInfo.systemProperties).sortBy(_._1),
+      Utils.redact(ui.conf, envInfo.metricsProperties).sortBy(_._1),
       envInfo.classpathEntries.sortBy(_._1),
       resourceProfileInfo)
   }
@@ -171,6 +193,22 @@ private[v1] class AbstractApplicationResource extends BaseAppResource {
     classOf[OneApplicationAttemptResource]
   }
 
+  private def checkExecutorId(execId: String): Unit = {
+    if (!SparkContext.isDriver(execId) && !execId.forall(Character.isDigit)) {
+      throw new BadParameterException(
+        s"Invalid executorId: neither '${SparkContext.DRIVER_IDENTIFIER}' nor number.")
+    }
+  }
+
+  /**
+   * Returns the live `SparkContext` for live-only endpoints. `feature` is the subject of the
+   * error message, e.g. "Thread dumps" -> "Thread dumps not available through the history server."
+   */
+  private def checkAndGetSparkContext(feature: String): SparkContext = withUI { ui =>
+    ui.sc.getOrElse {
+      throw new ServiceUnavailable(s"$feature not available through the history server.")
+    }
+  }
 }
 
 private[v1] class OneApplicationResource extends AbstractApplicationResource {

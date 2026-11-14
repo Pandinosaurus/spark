@@ -18,9 +18,12 @@
 package org.apache.spark.sql.catalyst
 
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.types._
+import org.apache.spark.sql.catalyst.types.ops.TypeOps
 import org.apache.spark.sql.catalyst.util.{ArrayData, MapData}
 import org.apache.spark.sql.types._
-import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
+import org.apache.spark.unsafe.types.{BinaryView, CalendarInterval, TimestampNanosVal, UTF8String}
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * An abstract class for row used internally in Spark SQL, which only contains the columns as
@@ -61,6 +64,18 @@ abstract class InternalRow extends SpecializedGetters with Serializable {
   def setInterval(i: Int, value: CalendarInterval): Unit = update(i, value)
 
   /**
+   * Sets a nanosecond NTZ timestamp. On [[org.apache.spark.sql.catalyst.expressions.UnsafeRow]],
+   * use this instead of [[setNullAt]] for null so the variable-length offset is preserved.
+   */
+  def setTimestampNTZNanos(i: Int, value: TimestampNanosVal): Unit = update(i, value)
+
+  /**
+   * Sets a nanosecond LTZ timestamp. On [[org.apache.spark.sql.catalyst.expressions.UnsafeRow]],
+   * use this instead of [[setNullAt]] for null so the variable-length offset is preserved.
+   */
+  def setTimestampLTZNanos(i: Int, value: TimestampNanosVal): Unit = update(i, value)
+
+  /**
    * Make a copy of the current [[InternalRow]] object.
    */
   def copy(): InternalRow
@@ -91,7 +106,7 @@ abstract class InternalRow extends SpecializedGetters with Serializable {
       values(i) = get(i, fieldTypes(i))
       i += 1
     }
-    values
+    values.toImmutableArraySeq
   }
 
   def toSeq(schema: StructType): Seq[Any] = toSeq(schema.map(_.dataType))
@@ -116,6 +131,7 @@ object InternalRow {
    */
   def copyValue(value: Any): Any = value match {
     case v: UTF8String => v.copy()
+    case v: BinaryView => v.copy()
     case v: InternalRow => v.copy()
     case v: ArrayData => v.copy()
     case v: MapData => v.copy()
@@ -129,24 +145,29 @@ object InternalRow {
    */
   def getAccessor(dt: DataType, nullable: Boolean = true): (SpecializedGetters, Int) => Any = {
     val getValueNullSafe: (SpecializedGetters, Int) => Any = dt match {
-      case BooleanType => (input, ordinal) => input.getBoolean(ordinal)
-      case ByteType => (input, ordinal) => input.getByte(ordinal)
-      case ShortType => (input, ordinal) => input.getShort(ordinal)
-      case IntegerType | DateType | _: YearMonthIntervalType =>
-        (input, ordinal) => input.getInt(ordinal)
-      case LongType | TimestampType | TimestampNTZType | _: DayTimeIntervalType =>
-        (input, ordinal) => input.getLong(ordinal)
-      case FloatType => (input, ordinal) => input.getFloat(ordinal)
-      case DoubleType => (input, ordinal) => input.getDouble(ordinal)
-      case StringType => (input, ordinal) => input.getUTF8String(ordinal)
-      case BinaryType => (input, ordinal) => input.getBinary(ordinal)
-      case CalendarIntervalType => (input, ordinal) => input.getInterval(ordinal)
-      case t: DecimalType => (input, ordinal) => input.getDecimal(ordinal, t.precision, t.scale)
-      case t: StructType => (input, ordinal) => input.getStruct(ordinal, t.size)
-      case _: ArrayType => (input, ordinal) => input.getArray(ordinal)
-      case _: MapType => (input, ordinal) => input.getMap(ordinal)
       case u: UserDefinedType[_] => getAccessor(u.sqlType, nullable)
-      case _ => (input, ordinal) => input.get(ordinal, dt)
+      case _ => PhysicalDataType(dt) match {
+        case PhysicalBooleanType => (input, ordinal) => input.getBoolean(ordinal)
+        case PhysicalByteType => (input, ordinal) => input.getByte(ordinal)
+        case PhysicalShortType => (input, ordinal) => input.getShort(ordinal)
+        case PhysicalIntegerType => (input, ordinal) => input.getInt(ordinal)
+        case PhysicalLongType => (input, ordinal) => input.getLong(ordinal)
+        case PhysicalFloatType => (input, ordinal) => input.getFloat(ordinal)
+        case PhysicalDoubleType => (input, ordinal) => input.getDouble(ordinal)
+        case _: PhysicalStringType => (input, ordinal) => input.getUTF8String(ordinal)
+        case PhysicalBinaryType => (input, ordinal) => input.getBinary(ordinal)
+        case PhysicalCalendarIntervalType => (input, ordinal) => input.getInterval(ordinal)
+        case PhysicalTimestampNTZNanosType => (input, ordinal) =>
+          input.getTimestampNTZNanos(ordinal)
+        case PhysicalTimestampLTZNanosType => (input, ordinal) =>
+          input.getTimestampLTZNanos(ordinal)
+        case t: PhysicalDecimalType => (input, ordinal) =>
+          input.getDecimal(ordinal, t.precision, t.scale)
+        case t: PhysicalStructType => (input, ordinal) => input.getStruct(ordinal, t.fields.length)
+        case _: PhysicalArrayType => (input, ordinal) => input.getArray(ordinal)
+        case _: PhysicalMapType => (input, ordinal) => input.getMap(ordinal)
+        case _ => (input, ordinal) => input.get(ordinal, dt)
+      }
     }
 
     if (nullable) {
@@ -165,7 +186,11 @@ object InternalRow {
   /**
    * Returns a writer for an `InternalRow` with given data type.
    */
-  def getWriter(ordinal: Int, dt: DataType): (InternalRow, Any) => Unit = dt match {
+  def getWriter(ordinal: Int, dt: DataType): (InternalRow, Any) => Unit =
+    TypeOps(dt).map(_.getRowWriter(ordinal)).getOrElse(getWriterDefault(ordinal, dt))
+
+  private def getWriterDefault(
+      ordinal: Int, dt: DataType): (InternalRow, Any) => Unit = dt match {
     case BooleanType => (input, v) => input.setBoolean(ordinal, v.asInstanceOf[Boolean])
     case ByteType => (input, v) => input.setByte(ordinal, v.asInstanceOf[Byte])
     case ShortType => (input, v) => input.setShort(ordinal, v.asInstanceOf[Short])
@@ -182,6 +207,8 @@ object InternalRow {
     case udt: UserDefinedType[_] => getWriter(ordinal, udt.sqlType)
     case NullType => (input, _) => input.setNullAt(ordinal)
     case StringType => (input, v) => input.update(ordinal, v.asInstanceOf[UTF8String].copy())
+    case _: GeometryType | _: GeographyType =>
+      (input, v) => input.update(ordinal, v.asInstanceOf[BinaryView].copy())
     case _: StructType => (input, v) => input.update(ordinal, v.asInstanceOf[InternalRow].copy())
     case _: ArrayType => (input, v) => input.update(ordinal, v.asInstanceOf[ArrayData].copy())
     case _: MapType => (input, v) => input.update(ordinal, v.asInstanceOf[MapData].copy())

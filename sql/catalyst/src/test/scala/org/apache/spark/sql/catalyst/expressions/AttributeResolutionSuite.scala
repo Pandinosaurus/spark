@@ -65,11 +65,16 @@ class AttributeResolutionSuite extends SparkFunSuite {
       AttributeReference("a", IntegerType)(qualifier = Seq("ns1", "t1")),
       AttributeReference("a", IntegerType)(qualifier = Seq("ns1", "ns2", "t2")))
 
-    val ex = intercept[AnalysisException] {
-      attrs.resolve(Seq("a"), resolver)
-    }
-    assert(ex.getMessage.contains(
-      "Reference 'a' is ambiguous, could be: ns1.t1.a, ns1.ns2.t2.a."))
+    checkError(
+      exception = intercept[AnalysisException] {
+        attrs.resolve(Seq("a"), resolver)
+      },
+      condition = "AMBIGUOUS_REFERENCE",
+      parameters = Map(
+        "name" -> "`a`",
+        "referenceNames" -> "[`ns1`.`ns2`.`t2`.`a`, `ns1`.`t1`.`a`]"
+      )
+    )
   }
 
   test("attribute resolution ambiguity at the qualifier level") {
@@ -77,11 +82,16 @@ class AttributeResolutionSuite extends SparkFunSuite {
       AttributeReference("a", IntegerType)(qualifier = Seq("ns1", "t")),
       AttributeReference("a", IntegerType)(qualifier = Seq("ns2", "ns1", "t")))
 
-    val ex = intercept[AnalysisException] {
-      attrs.resolve(Seq("ns1", "t", "a"), resolver)
-    }
-    assert(ex.getMessage.contains(
-      "Reference 'ns1.t.a' is ambiguous, could be: ns1.t.a, ns2.ns1.t.a."))
+    checkError(
+      exception = intercept[AnalysisException] {
+        attrs.resolve(Seq("ns1", "t", "a"), resolver)
+      },
+      condition = "AMBIGUOUS_REFERENCE",
+      parameters = Map(
+        "name" -> "`ns1`.`t`.`a`",
+        "referenceNames" -> "[`ns1`.`t`.`a`, `ns2`.`ns1`.`t`.`a`]"
+      )
+    )
   }
 
   test("attribute resolution with nested fields") {
@@ -94,10 +104,12 @@ class AttributeResolutionSuite extends SparkFunSuite {
       case _ => fail()
     }
 
-    val ex = intercept[AnalysisException] {
-      attrs.resolve(Seq("ns1", "t", "a", "cc"), resolver)
-    }
-    assert(ex.getMessage.contains("No such struct field cc in aa, bb"))
+    checkError(
+      exception = intercept[AnalysisException] {
+        attrs.resolve(Seq("ns1", "t", "a", "cc"), resolver)
+      },
+      condition = "FIELD_NOT_FOUND",
+      parameters = Map("fieldName" -> "`cc`", "fields" -> "`aa`, `bb`"))
   }
 
   test("attribute resolution with case insensitive resolver") {
@@ -115,6 +127,44 @@ class AttributeResolutionSuite extends SparkFunSuite {
     attrs.resolve(Seq("ns1", "t", "a"), caseSensitiveResolution) match {
       case Some(attr) => assert(attr.semanticEquals(attrs(0)))
       case _ => fail()
+    }
+  }
+
+  test("SPARK-57725: resolution does not fail when an attribute has a null name") {
+    // An AttributeReference can carry a null name (e.g. from a StructField built with a null name
+    // via the DataFrame API). Such an attribute is unaddressable by any column reference -- name
+    // parts are never null -- so it must simply be skipped by the case-insensitive name maps
+    // rather than causing a NullPointerException in groupBy(_.name.toLowerCase(...)).
+    val a = AttributeReference("a", IntegerType)()
+    val nullNamed = AttributeReference(null, IntegerType)()
+
+    // Plain (no qualifier) -> exercises the `direct` map.
+    val attrs = Seq(a, nullNamed)
+    attrs.resolve(Seq("a"), resolver) match {
+      case Some(attr) => assert(attr.semanticEquals(a))
+      case _ => fail()
+    }
+    assert(attrs.resolve(Seq("b"), resolver).isEmpty)
+
+    // 2-part qualifier -> exercises the `qualified` map.
+    val qa = AttributeReference("a", IntegerType)(qualifier = Seq("ns1", "t1"))
+    val qNullNamed = AttributeReference(null, IntegerType)(qualifier = Seq("ns1", "t1"))
+    val qattrs = Seq(qa, qNullNamed)
+    qattrs.resolve(Seq("t1", "a"), resolver) match {
+      case Some(attr) => assert(attr.semanticEquals(qa))
+      case _ => fail()
+    }
+
+    // 3-part qualifier -> forces the `qualified3Part` (3-part lookup) and `qualified4Part`
+    // (4-part lookup) maps, so their population is also exercised with a null-named sibling.
+    val q3a = AttributeReference("a", IntegerType)(qualifier = Seq("cat", "db", "tbl"))
+    val q3NullNamed = AttributeReference(null, IntegerType)(qualifier = Seq("cat", "db", "tbl"))
+    val q3attrs = Seq(q3a, q3NullNamed)
+    Seq(Seq("db", "tbl", "a"), Seq("cat", "db", "tbl", "a")).foreach { nameParts =>
+      q3attrs.resolve(nameParts, resolver) match {
+        case Some(attr) => assert(attr.semanticEquals(q3a))
+        case _ => fail()
+      }
     }
   }
 

@@ -18,13 +18,12 @@
 package org.apache.spark.util
 
 import java.{lang => jl}
-import java.io.ObjectInputStream
-import java.util.ArrayList
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 import org.apache.spark.{InternalAccumulator, SparkContext, TaskContext}
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.scheduler.AccumulableInfo
 import org.apache.spark.util.AccumulatorContext.internOption
 
@@ -44,6 +43,8 @@ private[spark] case class AccumulatorMetadata(
 abstract class AccumulatorV2[IN, OUT] extends Serializable {
   private[spark] var metadata: AccumulatorMetadata = _
   private[this] var atDriverSide = true
+
+  def excludeFromHeartbeat: Boolean = false
 
   private[spark] def register(
       sc: SparkContext,
@@ -102,14 +103,22 @@ abstract class AccumulatorV2[IN, OUT] extends Serializable {
     metadata.countFailedValues
   }
 
+  private def isInternal = name.exists(_.startsWith(InternalAccumulator.METRICS_PREFIX))
+
   /**
    * Creates an [[AccumulableInfo]] representation of this [[AccumulatorV2]] with the provided
    * values.
    */
   private[spark] def toInfo(update: Option[Any], value: Option[Any]): AccumulableInfo = {
-    val isInternal = name.exists(_.startsWith(InternalAccumulator.METRICS_PREFIX))
     AccumulableInfo(id, name, internOption(update), internOption(value), isInternal,
       countFailedValues)
+  }
+
+  /**
+   * Creates an [[AccumulableInfo]] representation of this [[AccumulatorV2]] as an update.
+   */
+  private[spark] def toInfoUpdate: AccumulableInfo = {
+    AccumulableInfo(id, name, internOption(Some(value)), None, isInternal, countFailedValues)
   }
 
   final private[spark] def isAtDriverSide: Boolean = atDriverSide
@@ -187,9 +196,16 @@ abstract class AccumulatorV2[IN, OUT] extends Serializable {
     }
   }
 
-  // Called by Java when deserializing an object
-  private def readObject(in: ObjectInputStream): Unit = Utils.tryOrIOException {
-    in.defaultReadObject()
+  // Called by Java once this object is fully deserialized -- after every class in the hierarchy has
+  // had its fields read, including a subclass's. This must not move to `readObject`, which runs at
+  // this class's slot while a subclass's fields are still unset: `registerAccumulator` publishes
+  // `this` where other threads can reach it, and the executor heartbeater calls `isZero` on every
+  // registered accumulator. Each subclass would then have to tolerate its own state being null,
+  // which is the hazard SPARK-20977 worked around in `CollectionAccumulator`.
+  // `final` for the same reason as `writeReplace` above: unlike `readObject`, which is private and
+  // therefore invoked once per class in the hierarchy, `readResolve` is inherited, so a subclass
+  // defining one would silently replace this and stop registering the accumulator entirely.
+  final protected def readResolve(): Any = Utils.tryOrIOException {
     if (atDriverSide) {
       atDriverSide = false
 
@@ -203,6 +219,7 @@ abstract class AccumulatorV2[IN, OUT] extends Serializable {
     } else {
       atDriverSide = true
     }
+    this
   }
 
   override def toString: String = {
@@ -270,16 +287,26 @@ private[spark] object AccumulatorContext extends Logging {
    * Returns the [[AccumulatorV2]] registered with the given ID, if any.
    */
   def get(id: Long): Option[AccumulatorV2[_, _]] = {
+    Option(getOrNull(id))
+  }
+
+  /**
+   * Same as [[get]] but returns null instead of None when the accumulator is not registered or has
+   * been garbage collected. Used on the driver's per-task accumulator update path to avoid
+   * allocating an Option for every lookup.
+   */
+  def getOrNull(id: Long): AccumulatorV2[_, _] = {
     val ref = originals.get(id)
     if (ref eq null) {
-      None
+      null
     } else {
       // Since we are storing weak references, warn when the underlying data is not valid.
       val acc = ref.get
       if (acc eq null) {
-        logWarning(s"Attempted to access garbage collected accumulator $id")
+        logWarning(log"Attempted to access garbage collected accumulator " +
+          log"${MDC(ACCUMULATOR_ID, id)}")
       }
-      Option(acc)
+      acc
     }
   }
 
@@ -505,7 +532,7 @@ class CollectionAccumulator[T] extends AccumulatorV2[T, java.util.List[T]] {
   }
 
   override def value: java.util.List[T] = this.synchronized {
-    java.util.Collections.unmodifiableList(new ArrayList[T](getOrCreate))
+    java.util.List.copyOf(getOrCreate)
   }
 
   private[spark] def setValue(newValue: java.util.List[T]): Unit = this.synchronized {

@@ -1,5 +1,6 @@
 -- A test suite for scalar subquery in SELECT clause
 
+--ONLY_IF spark
 create temporary view t1 as select * from values
   ('val1a', 6S, 8, 10L, float(15.0), 20D, 20E2, timestamp '2014-04-04 00:00:00.000', date '2014-04-04'),
   ('val1b', 8S, 16, 19L, float(17.0), 25D, 26E2, timestamp '2014-05-04 01:01:00.000', date '2014-05-04'),
@@ -139,9 +140,206 @@ SELECT t1a,
     (SELECT hex(count_min_sketch(t2d, 0.5d, 0.5d, 1)) FROM t2 WHERE t2a = t1a) collect_set_t2
 FROM t1;
 
+-- SPARK-61664: Sketch aggregates and schema_of_variant_agg should not return NULL
+-- in a correlated subquery when no inner row matches
+CREATE TEMPORARY VIEW t2_sketch AS SELECT t2a,
+    hll_sketch_agg(t2d) hll_sketch,
+    theta_sketch_agg(t2d) theta_sketch,
+    kll_sketch_agg_bigint(t2d) kll_sketch,
+    tuple_sketch_agg_double(t2d, t2f) tuple_sketch,
+    approx_top_k_accumulate(t2d) top_k_state
+FROM t2 GROUP BY t2a;
+
+SELECT t1a,
+    (SELECT hll_sketch_estimate(hll_sketch_agg(t2d)) FROM t2 WHERE t2a = t1a) hll_sketch_agg,
+    (SELECT hll_sketch_estimate(hll_union_agg(hll_sketch)) FROM t2_sketch WHERE t2a = t1a)
+      hll_union_agg,
+    (SELECT count(s) FROM (SELECT hll_sketch_agg(t2d) s FROM t2 WHERE t2a = t1a)) nested_count
+FROM (SELECT DISTINCT t1a FROM t1);
+
+SELECT t1a,
+    (SELECT theta_sketch_estimate(theta_sketch_agg(t2d)) FROM t2 WHERE t2a = t1a)
+      theta_sketch_agg,
+    (SELECT theta_sketch_estimate(theta_union_agg(theta_sketch)) FROM t2_sketch WHERE t2a = t1a)
+      theta_union_agg,
+    (SELECT theta_sketch_estimate(theta_intersection_agg(theta_sketch))
+      FROM t2_sketch WHERE t2a = t1a) theta_intersection_agg
+FROM (SELECT DISTINCT t1a FROM t1);
+
+SELECT t1a,
+    (SELECT kll_sketch_get_n_bigint(kll_sketch_agg_bigint(t2d)) FROM t2 WHERE t2a = t1a)
+      kll_sketch_agg_bigint,
+    (SELECT kll_sketch_get_n_float(kll_sketch_agg_float(t2e)) FROM t2 WHERE t2a = t1a)
+      kll_sketch_agg_float,
+    (SELECT kll_sketch_get_n_double(kll_sketch_agg_double(t2f)) FROM t2 WHERE t2a = t1a)
+      kll_sketch_agg_double,
+    (SELECT kll_sketch_get_n_bigint(kll_merge_agg_bigint(kll_sketch))
+      FROM t2_sketch WHERE t2a = t1a) kll_merge_agg_bigint
+FROM (SELECT DISTINCT t1a FROM t1);
+
+SELECT t1a,
+    (SELECT tuple_sketch_estimate_double(tuple_sketch_agg_double(t2d, t2f)) FROM t2 WHERE t2a = t1a)
+      tuple_sketch_agg_double,
+    (SELECT tuple_sketch_estimate_double(tuple_union_agg_double(tuple_sketch))
+      FROM t2_sketch WHERE t2a = t1a) tuple_union_agg_double,
+    (SELECT tuple_sketch_estimate_double(tuple_intersection_agg_double(tuple_sketch))
+      FROM t2_sketch WHERE t2a = t1a) tuple_intersection_agg_double
+FROM (SELECT DISTINCT t1a FROM t1);
+
+SELECT t1a,
+    (SELECT size(approx_top_k(t2d)) FROM t2 WHERE t2a = t1a) approx_top_k,
+    (SELECT size(approx_top_k_estimate(approx_top_k_accumulate(t2d))) FROM t2 WHERE t2a = t1a)
+      approx_top_k_accumulate,
+    (SELECT size(approx_top_k_estimate(approx_top_k_combine(top_k_state)))
+      FROM t2_sketch WHERE t2a = t1a) approx_top_k_combine
+FROM (SELECT DISTINCT t1a FROM t1);
+
+SELECT t1a,
+    (SELECT schema_of_variant_agg(parse_json(CAST(t2d AS STRING))) FROM t2 WHERE t2a = t1a)
+      schema_of_variant_agg
+FROM (SELECT DISTINCT t1a FROM t1);
+
+-- RewriteDistinctAggregates over empty input
+SELECT count(DISTINCT t2a), count(DISTINCT t2b),
+    hll_sketch_estimate(hll_sketch_agg(t2d)),
+    schema_of_variant_agg(parse_json(CAST(t2d AS STRING)))
+FROM t2 WHERE t2a = 'none';
+
+-- An invalid parameter fails while the query is optimized, regardless of the data
+SELECT t1a, (SELECT hll_sketch_agg(t2d, 30) FROM t2 WHERE t2a = t1a) FROM t1 WHERE false;
+
 -- SPARK-36028: Allow Project to host outer references in scalar subqueries
 SELECT t1c, (SELECT t1c) FROM t1;
 SELECT t1c, (SELECT t1c WHERE t1c = 8) FROM t1;
 SELECT t1c, t1d, (SELECT c + d FROM (SELECT t1c AS c, t1d AS d)) FROM t1;
 SELECT t1c, (SELECT SUM(c) FROM (SELECT t1c AS c)) FROM t1;
 SELECT t1a, (SELECT SUM(t2b) FROM t2 JOIN (SELECT t1a AS a) ON t2a = a) FROM t1;
+
+-- CTE in correlated scalar subqueries
+CREATE OR REPLACE TEMPORARY VIEW t1 AS VALUES (0, 1), (1, 2) t1(c1, c2);
+CREATE OR REPLACE TEMPORARY VIEW t2 AS VALUES (0, 2), (0, 3) t2(c1, c2);
+
+-- Single row subquery
+SELECT c1, (WITH t AS (SELECT 1 AS a) SELECT a + c1 FROM t) FROM t1;
+-- Correlation in CTE.
+SELECT c1, (WITH t AS (SELECT * FROM t2 WHERE c1 = t1.c1) SELECT SUM(c2) FROM t) FROM t1;
+-- Multiple CTE definitions.
+SELECT c1, (
+    WITH t3 AS (SELECT c1 + 1 AS c1, c2 + 1 AS c2 FROM t2),
+    t4 AS (SELECT * FROM t3 WHERE t1.c1 = c1)
+    SELECT SUM(c2) FROM t4
+) FROM t1;
+-- Multiple CTE references.
+SELECT c1, (
+    WITH t AS (SELECT * FROM t2)
+    SELECT SUM(c2) FROM (SELECT c1, c2 FROM t UNION SELECT c2, c1 FROM t) r(c1, c2)
+    WHERE c1 = t1.c1
+) FROM t1;
+-- Reference CTE in both the main query and the subquery.
+WITH v AS (SELECT * FROM t2)
+SELECT * FROM t1 WHERE c1 > (
+    WITH t AS (SELECT * FROM t2)
+    SELECT COUNT(*) FROM v WHERE c1 = t1.c1 AND c1 > (SELECT SUM(c2) FROM t WHERE c1 = v.c1)
+);
+-- Single row subquery that references CTE in the main query.
+WITH t AS (SELECT 1 AS a)
+SELECT c1, (SELECT a FROM t WHERE a = c1) FROM t1;
+-- Multiple CTE references with non-deterministic CTEs.
+WITH
+v1 AS (SELECT c1, c2, rand(0) c3 FROM t1),
+v2 AS (SELECT c1, c2, rand(0) c4 FROM v1 WHERE c3 IN (SELECT c3 FROM v1))
+SELECT c1, (
+    WITH v3 AS (SELECT c1, c2, rand(0) c5 FROM t2)
+    SELECT COUNT(*) FROM (
+        SELECT * FROM v2 WHERE c1 > 0
+        UNION SELECT * FROM v2 WHERE c2 > 0
+        UNION SELECT * FROM v3 WHERE c2 > 0
+    ) WHERE c1 = v1.c1
+) FROM v1;
+
+-- Multi-value subquery error
+SELECT (SELECT a FROM (SELECT 1 AS a UNION ALL SELECT 2 AS a) t) AS b;
+
+-- SPARK-36114: Support correlated non-equality predicates
+CREATE OR REPLACE TEMP VIEW t1(c1, c2) AS (VALUES (0, 1), (1, 2));
+CREATE OR REPLACE TEMP VIEW t2(c1, c2) AS (VALUES (0, 2), (0, 3));
+
+-- Neumann example Q2
+CREATE OR REPLACE TEMP VIEW students(id, name, major, year) AS (VALUES
+    (0, 'A', 'CS', 2022),
+    (1, 'B', 'CS', 2022),
+    (2, 'C', 'Math', 2022));
+CREATE OR REPLACE TEMP VIEW exams(sid, course, curriculum, grade, date) AS (VALUES
+    (0, 'C1', 'CS', 4, 2020),
+    (0, 'C2', 'CS', 3, 2021),
+    (1, 'C1', 'CS', 2, 2020),
+    (1, 'C2', 'CS', 1, 2021));
+
+SELECT students.name, exams.course
+FROM students, exams
+WHERE students.id = exams.sid
+  AND (students.major = 'CS' OR students.major = 'Games Eng')
+  AND exams.grade >= (
+        SELECT avg(exams.grade) + 1
+        FROM exams
+        WHERE students.id = exams.sid
+           OR (exams.curriculum = students.major AND students.year > exams.date));
+
+-- Correlated non-equality predicates
+SELECT (SELECT min(c2) FROM t2 WHERE t1.c1 > t2.c1) FROM t1;
+SELECT (SELECT min(c2) FROM t2 WHERE t1.c1 >= t2.c1 AND t1.c2 < t2.c2) FROM t1;
+
+-- Correlated non-equality predicates with the COUNT bug.
+SELECT (SELECT count(*) FROM t2 WHERE t1.c1 > t2.c1) FROM t1;
+
+-- Correlated equality predicates that are not supported after SPARK-35080
+SELECT c, (
+    SELECT count(*)
+    FROM (VALUES ('ab'), ('abc'), ('bc')) t2(c)
+    WHERE t1.c = substring(t2.c, 1, 1)
+) FROM (VALUES ('a'), ('b')) t1(c);
+
+SELECT c, (
+    SELECT count(*)
+    FROM (VALUES (0, 6), (1, 5), (2, 4), (3, 3)) t1(a, b)
+    WHERE a + b = c
+) FROM (VALUES (6)) t2(c);
+
+-- SPARK-43156: scalar subquery with Literal result like `COUNT(1) is null`
+SELECT *, (SELECT count(1) is null FROM t2 WHERE t1.c1 = t2.c1) FROM t1;
+
+select (select f from (select false as f, max(c2) from t1 where t1.c1 = t1.c1)) from t2;
+
+-- SPARK-43596: handle IsNull when rewriting the domain join
+set spark.sql.optimizer.optimizeOneRowRelationSubquery.alwaysInline=false;
+WITH T AS (SELECT 1 AS a)
+SELECT (SELECT sum(1) FROM T WHERE a = col OR upper(col)= 'Y')
+FROM (SELECT null as col) as foo;
+set spark.sql.optimizer.optimizeOneRowRelationSubquery.alwaysInline=true;
+
+-- SPARK-43760: the result of the subquery can be NULL.
+select * from (
+ select t1.id c1, (
+  select t2.id c from range (1, 2) t2
+  where t1.id = t2.id  ) c2
+ from range (1, 3) t1 ) t
+where t.c2 is not null;
+
+-- SPARK-43838: Subquery on single table with having clause
+SELECT c1, c2, (SELECT count(*) cnt FROM t1 t2 WHERE t1.c1 = t2.c1 HAVING cnt = 0) FROM t1;
+
+-- Outer star expansion in scalar subquery
+SELECT (SELECT t1.* FROM VALUES(2) AS t2(col1) LIMIT 1) FROM VALUES(1) AS t1(col1);
+
+-- Outer struct star expansion in scalar subquery
+SELECT (SELECT t1.s.* FROM VALUES(2) AS t2(col1) LIMIT 1)
+FROM (SELECT named_struct('a', 1) AS s) AS t1;
+
+-- Untargeted star in subquery should NOT expand from outer scope
+SELECT (SELECT * FROM VALUES(2) AS t2(col1) LIMIT 1) FROM VALUES(1) AS t1(col1);
+
+-- Inner scope wins when star target matches both inner and outer scope
+SELECT (SELECT t1.* FROM (SELECT 3 AS col1) AS t1 LIMIT 1) FROM VALUES(1) AS t1(col1);
+
+-- Outer star expansion through a derived table wrapper
+SELECT (SELECT * FROM (SELECT t1.* FROM VALUES(2) AS t2(col1) LIMIT 1)) FROM VALUES(1) AS t1(col1);

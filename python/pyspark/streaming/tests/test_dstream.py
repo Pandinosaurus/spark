@@ -22,17 +22,12 @@ import time
 import unittest
 from functools import reduce
 from itertools import chain
-import platform
 
 from pyspark import SparkConf, SparkContext
 from pyspark.streaming import StreamingContext
 from pyspark.testing.streamingutils import PySparkStreamingTestCase
 
 
-@unittest.skipIf(
-    "pypy" in platform.python_implementation().lower(),
-    "The tests fail in PyPy3 implementation for an unknown reason.",
-)
 class BasicOperationTests(PySparkStreamingTestCase):
     def test_map(self):
         """Basic operation test for DStream.map."""
@@ -371,7 +366,7 @@ class BasicOperationTests(PySparkStreamingTestCase):
         self.ssc.start()
         try:
             self.ssc.awaitTerminationOrTimeout(10)
-        except:
+        except BaseException:
             import traceback
 
             failure = traceback.format_exc()
@@ -394,7 +389,7 @@ class BasicOperationTests(PySparkStreamingTestCase):
         self.ssc.start()
         try:
             self.ssc.awaitTerminationOrTimeout(10)
-        except:
+        except BaseException:
             import traceback
 
             failure = traceback.format_exc()
@@ -403,7 +398,7 @@ class BasicOperationTests(PySparkStreamingTestCase):
 
         self.fail("a failed func should throw an error")
 
-    def test_failed_func_with_reseting_failure(self):
+    def test_failed_func_with_resetting_failure(self):
         input = [self.sc.parallelize([d], 1) for d in range(4)]
         input_stream = self.ssc.queueStream(input)
 
@@ -420,7 +415,7 @@ class BasicOperationTests(PySparkStreamingTestCase):
         self.assertEqual(expected, self._collect(input_stream.map(failed_func), 3))
         try:
             self.ssc.awaitTerminationOrTimeout(10)
-        except:
+        except BaseException:
             import traceback
 
             failure = traceback.format_exc()
@@ -430,12 +425,7 @@ class BasicOperationTests(PySparkStreamingTestCase):
         self.fail("a failed func should throw an error")
 
 
-@unittest.skipIf(
-    "pypy" in platform.python_implementation().lower(),
-    "The tests fail in PyPy3 implementation for an unknown reason.",
-)
 class WindowFunctionTests(PySparkStreamingTestCase):
-
     timeout = 15
 
     def test_window(self):
@@ -523,12 +513,7 @@ class WindowFunctionTests(PySparkStreamingTestCase):
         self._test_func(input, func, expected)
 
 
-@unittest.skipIf(
-    "pypy" in platform.python_implementation().lower(),
-    "The tests fail in PyPy3 implementation for an unknown reason.",
-)
 class CheckpointTests(unittest.TestCase):
-
     setupCalled = False
 
     @staticmethod
@@ -573,7 +558,7 @@ class CheckpointTests(unittest.TestCase):
         self.ssc = StreamingContext.getOrCreate(self.cpd, setup)
         try:
             self.ssc.start()
-        except:
+        except BaseException:
             import traceback
 
             failure = traceback.format_exc()
@@ -657,7 +642,7 @@ class CheckpointTests(unittest.TestCase):
         self.setupCalled = False
         self.ssc = StreamingContext.getOrCreate(self.cpd, setup)
         self.assertFalse(self.setupCalled)
-        self.assertTrue(self.ssc.sparkContext == self.sc)
+        self.assertEqual(self.ssc.sparkContext, self.sc)
 
         # Verify the getActiveOrCreate() recovers from checkpoint files
         self.ssc.stop(True, True)
@@ -680,7 +665,7 @@ class CheckpointTests(unittest.TestCase):
         self.setupCalled = False
         self.ssc = StreamingContext.getActiveOrCreate(self.cpd, setup)
         self.assertFalse(self.setupCalled)
-        self.assertTrue(self.ssc.sparkContext == self.sc)
+        self.assertEqual(self.ssc.sparkContext, self.sc)
 
         # Verify that getActiveOrCreate() calls setup() in absence of checkpoint files
         self.ssc.stop(True, True)
@@ -695,12 +680,6 @@ class CheckpointTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.streaming.tests.test_dstream import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

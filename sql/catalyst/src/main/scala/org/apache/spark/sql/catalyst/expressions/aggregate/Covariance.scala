@@ -22,6 +22,7 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.trees.BinaryLike
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * Compute the covariance between two expressions.
@@ -34,10 +35,10 @@ abstract class Covariance(val left: Expression, val right: Expression, nullOnDiv
   override def dataType: DataType = DoubleType
   override def inputTypes: Seq[AbstractDataType] = Seq(DoubleType, DoubleType)
 
-  protected val n = AttributeReference("n", DoubleType, nullable = false)()
-  protected val xAvg = AttributeReference("xAvg", DoubleType, nullable = false)()
-  protected val yAvg = AttributeReference("yAvg", DoubleType, nullable = false)()
-  protected val ck = AttributeReference("ck", DoubleType, nullable = false)()
+  protected[sql] val n = AttributeReference("n", DoubleType, nullable = false)()
+  protected[sql] val xAvg = AttributeReference("xAvg", DoubleType, nullable = false)()
+  protected[sql] val yAvg = AttributeReference("yAvg", DoubleType, nullable = false)()
+  protected[sql] val ck = AttributeReference("ck", DoubleType, nullable = false)()
 
   protected def divideByZeroEvalResult: Expression = {
     if (nullOnDivideByZero) Literal.create(null, DoubleType) else Double.NaN
@@ -48,7 +49,7 @@ abstract class Covariance(val left: Expression, val right: Expression, nullOnDiv
 
   override val aggBufferAttributes: Seq[AttributeReference] = Seq(n, xAvg, yAvg, ck)
 
-  override val initialValues: Seq[Expression] = Array.fill(4)(Literal(0.0))
+  override val initialValues: Seq[Expression] = Array.fill(4)(Literal(0.0)).toImmutableArraySeq
 
   override lazy val updateExpressions: Seq[Expression] = updateExpressionsDef
 
@@ -57,12 +58,17 @@ abstract class Covariance(val left: Expression, val right: Expression, nullOnDiv
     val n1 = n.left
     val n2 = n.right
     val newN = n1 + n2
-    val dx = xAvg.right - xAvg.left
+    // See CentralMomentAgg for the rationale: when one side is an empty buffer (n1 == 0 or
+    // n2 == 0), force dx/dy to 0.0 so the `dx * dyN * n1 * n2` term vanishes cleanly instead of
+    // overflowing to Infinity and then NaN-ing out via `Infinity * 0`.
+    val isEmptyLeft = n1 === Literal(0.0)
+    val isEmptyRight = n2 === Literal(0.0)
+    val dx = If(isEmptyLeft || isEmptyRight, Literal(0.0), xAvg.right - xAvg.left)
+    val dy = If(isEmptyLeft || isEmptyRight, Literal(0.0), yAvg.right - yAvg.left)
     val dxN = If(newN === 0.0, 0.0, dx / newN)
-    val dy = yAvg.right - yAvg.left
     val dyN = If(newN === 0.0, 0.0, dy / newN)
-    val newXAvg = xAvg.left + dxN * n2
-    val newYAvg = yAvg.left + dyN * n2
+    val newXAvg = If(isEmptyLeft, xAvg.right, If(isEmptyRight, xAvg.left, xAvg.left + dxN * n2))
+    val newYAvg = If(isEmptyLeft, yAvg.right, If(isEmptyRight, yAvg.left, yAvg.left + dyN * n2))
     val newCk = ck.left + ck.right + dx * dyN * n1 * n2
 
     Seq(newN, newXAvg, newYAvg, newCk)
@@ -89,6 +95,13 @@ abstract class Covariance(val left: Expression, val right: Expression, nullOnDiv
 
 @ExpressionDescription(
   usage = "_FUNC_(expr1, expr2) - Returns the population covariance of a set of number pairs.",
+  arguments = """
+    Arguments:
+      * expr1 - The first variable of the number pairs.
+        An expression that evaluates to a numeric.
+      * expr2 - The second variable of the number pairs.
+        An expression that evaluates to a numeric.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(c1, c2) FROM VALUES (1,1), (2,2), (3,3) AS tab(c1, c2);
@@ -118,6 +131,13 @@ case class CovPopulation(
 
 @ExpressionDescription(
   usage = "_FUNC_(expr1, expr2) - Returns the sample covariance of a set of number pairs.",
+  arguments = """
+    Arguments:
+      * expr1 - The first variable of the number pairs.
+        An expression that evaluates to a numeric.
+      * expr2 - The second variable of the number pairs.
+        An expression that evaluates to a numeric.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(c1, c2) FROM VALUES (1,1), (2,2), (3,3) AS tab(c1, c2);
@@ -142,4 +162,29 @@ case class CovSample(
 
   override protected def withNewChildrenInternal(
       newLeft: Expression, newRight: Expression): CovSample = copy(left = newLeft, right = newRight)
+}
+
+/**
+ * Covariance in Pandas' fashion. This expression is dedicated only for Pandas API on Spark.
+ * Refer to numpy.cov.
+ */
+case class PandasCovar(
+    override val left: Expression,
+    override val right: Expression,
+    ddof: Int)
+  extends Covariance(left, right, true) {
+
+  def this(left: Expression, right: Expression, ddof: Expression) =
+    this(left, right, PandasAggregate.expressionToDDOF(ddof, "pandas_covar"))
+
+  override val evaluateExpression: Expression = {
+    If(n === 0.0, Literal.create(null, DoubleType),
+      If(n === ddof.toDouble, divideByZeroEvalResult, ck / (n - ddof.toDouble)))
+  }
+  override def prettyName: String = "pandas_covar"
+
+  override protected def withNewChildrenInternal(
+      newLeft: Expression,
+      newRight: Expression): PandasCovar =
+    copy(left = newLeft, right = newRight)
 }

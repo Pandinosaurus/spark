@@ -17,29 +17,30 @@
 
 package org.apache.spark.network.server;
 
+import java.security.SecureRandom;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.Random;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Preconditions;
 import io.netty.channel.Channel;
-import org.apache.commons.lang3.tuple.ImmutablePair;
-import org.apache.commons.lang3.tuple.Pair;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
+import org.apache.spark.internal.SparkLogger;
+import org.apache.spark.internal.SparkLoggerFactory;
 import org.apache.spark.network.buffer.ManagedBuffer;
 import org.apache.spark.network.client.TransportClient;
+import org.apache.spark.network.util.JavaUtils;
+import org.apache.spark.util.Pair;
 
 /**
  * StreamManager which allows registration of an Iterator&lt;ManagedBuffer&gt;, which are
  * individually fetched as chunks by the client. Each registered buffer is one chunk.
  */
 public class OneForOneStreamManager extends StreamManager {
-  private static final Logger logger = LoggerFactory.getLogger(OneForOneStreamManager.class);
+  private static final SparkLogger logger =
+    SparkLoggerFactory.getLogger(OneForOneStreamManager.class);
 
   private final AtomicLong nextStreamId;
   private final ConcurrentHashMap<Long, StreamState> streams;
@@ -51,6 +52,12 @@ public class OneForOneStreamManager extends StreamManager {
 
     // The channel associated to the stream
     final Channel associatedChannel;
+    // Indicates whether the buffers is only materialized when next() is called. Some buffers like
+    // ShuffleManagedBufferIterator, ShuffleChunkManagedBufferIterator, ManagedBufferIterator are
+    // not materialized until the iterator is traversed by calling next(). We use it to decide
+    // whether buffers should be released at connectionTerminated() in order to avoid unnecessary
+    // buffer materialization, which could be I/O based.
+    final boolean isBufferMaterializedOnNext;
 
     // Used to keep track of the index of the buffer that the user has retrieved, just to ensure
     // that the caller only requests each chunk one at a time, in order.
@@ -59,17 +66,22 @@ public class OneForOneStreamManager extends StreamManager {
     // Used to keep track of the number of chunks being transferred and not finished yet.
     final AtomicLong chunksBeingTransferred = new AtomicLong(0L);
 
-    StreamState(String appId, Iterator<ManagedBuffer> buffers, Channel channel) {
+    StreamState(
+        String appId,
+        Iterator<ManagedBuffer> buffers,
+        Channel channel,
+        boolean isBufferMaterializedOnNext) {
       this.appId = appId;
-      this.buffers = Preconditions.checkNotNull(buffers);
+      this.buffers = Objects.requireNonNull(buffers);
       this.associatedChannel = channel;
+      this.isBufferMaterializedOnNext = isBufferMaterializedOnNext;
     }
   }
 
   public OneForOneStreamManager() {
-    // For debugging purposes, start with a random stream id to help identifying different streams.
-    // This does not need to be globally unique, only unique to this class.
-    nextStreamId = new AtomicLong((long) new Random().nextInt(Integer.MAX_VALUE) * 1000);
+    // Start from a base drawn uniformly from the non-negative long range. Stream ids are handed
+    // out sequentially from this base.
+    nextStreamId = new AtomicLong(new SecureRandom().nextLong() & Long.MAX_VALUE);
     streams = new ConcurrentHashMap<>();
   }
 
@@ -115,7 +127,7 @@ public class OneForOneStreamManager extends StreamManager {
       "Stream id and chunk index should be specified.";
     long streamId = Long.valueOf(array[0]);
     int chunkIndex = Integer.valueOf(array[1]);
-    return ImmutablePair.of(streamId, chunkIndex);
+    return Pair.of(streamId, chunkIndex);
   }
 
   @Override
@@ -130,7 +142,7 @@ public class OneForOneStreamManager extends StreamManager {
 
         try {
           // Release all remaining buffers.
-          while (state.buffers.hasNext()) {
+          while (!state.isBufferMaterializedOnNext && state.buffers.hasNext()) {
             ManagedBuffer buffer = state.buffers.next();
             if (buffer != null) {
               buffer.release();
@@ -153,17 +165,30 @@ public class OneForOneStreamManager extends StreamManager {
 
   @Override
   public void checkAuthorization(TransportClient client, long streamId) {
-    if (client.getClientId() != null) {
-      StreamState state = streams.get(streamId);
-      Preconditions.checkArgument(state != null, "Unknown stream ID.");
-      if (!client.getClientId().equals(state.appId)) {
-        throw new SecurityException(String.format(
-          "Client %s not authorized to read stream %d (app %s).",
-          client.getClientId(),
-          streamId,
-          state.appId));
-      }
+    StreamState state = streams.get(streamId);
+    JavaUtils.checkArgument(state != null, "Unknown stream ID.");
+    if (client.getClientId() != null && !client.getClientId().equals(state.appId)) {
+      throw new SecurityException(String.format(
+        "Client %s not authorized to read stream %d (app %s).",
+        client.getClientId(),
+        streamId,
+        state.appId));
     }
+    // Streams are registered to (and documented as only readable from) exactly one client
+    // connection. Enforce that binding for every request.
+    if (state.associatedChannel != null && state.associatedChannel != client.getChannel()) {
+      throw new SecurityException(String.format(
+        "Channel not authorized to read stream %d: streams may only be read from the " +
+          "connection that registered them.", streamId));
+    }
+  }
+
+  @Override
+  public void checkAuthorization(TransportClient client, String streamChunkId) {
+    // StreamRequest addresses the same registered streams as ChunkFetchRequest, via a
+    // "streamId_chunkIndex" string. Authorize on the underlying stream id so that this path
+    // enforces the same per-application ownership check as the chunk-fetch path.
+    checkAuthorization(client, parseStreamChunkId(streamChunkId).getLeft());
   }
 
   @Override
@@ -205,8 +230,11 @@ public class OneForOneStreamManager extends StreamManager {
   /**
    * Registers a stream of ManagedBuffers which are served as individual chunks one at a time to
    * callers. Each ManagedBuffer will be release()'d after it is transferred on the wire. If a
-   * client connection is closed before the iterator is fully drained, then the remaining buffers
-   * will all be release()'d.
+   * client connection is closed before the iterator is fully drained, then the remaining
+   * materialized buffers will all be release()'d, but some buffers like
+   * ShuffleManagedBufferIterator, ShuffleChunkManagedBufferIterator, ManagedBufferIterator should
+   * not release, because they have not been materialized before requesting the iterator by
+   * the next method.
    *
    * If an app ID is provided, only callers who've authenticated with the given app ID will be
    * allowed to fetch from this stream.
@@ -215,10 +243,18 @@ public class OneForOneStreamManager extends StreamManager {
    * to be the only reader of the stream. Once the connection is closed, the stream will never
    * be used again, enabling cleanup by `connectionTerminated`.
    */
-  public long registerStream(String appId, Iterator<ManagedBuffer> buffers, Channel channel) {
+  public long registerStream(
+      String appId,
+      Iterator<ManagedBuffer> buffers,
+      Channel channel,
+      boolean isBufferMaterializedOnNext) {
     long myStreamId = nextStreamId.getAndIncrement();
-    streams.put(myStreamId, new StreamState(appId, buffers, channel));
+    streams.put(myStreamId, new StreamState(appId, buffers, channel, isBufferMaterializedOnNext));
     return myStreamId;
+  }
+
+  public long registerStream(String appId, Iterator<ManagedBuffer> buffers, Channel channel) {
+    return registerStream(appId, buffers, channel, false);
   }
 
   @VisibleForTesting

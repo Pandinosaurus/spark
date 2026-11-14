@@ -20,8 +20,9 @@ package org.apache.spark.sql.catalyst.plans.logical.statsEstimation
 import scala.collection.mutable.ArrayBuffer
 import scala.math.BigDecimal.RoundingMode
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeMap, Expression}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeMap, EmptyRow, Expression}
 import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.catalyst.util.CharVarcharUtils
 import org.apache.spark.sql.types.{DecimalType, _}
 
 object EstimationUtils {
@@ -82,10 +83,43 @@ object EstimationUtils {
    */
   def getAliasStats(
       expressions: Seq[Expression],
-      attributeStats: AttributeMap[ColumnStat]): Seq[(Attribute, ColumnStat)] = {
+      attributeStats: AttributeMap[ColumnStat],
+      rowCount: BigInt): Seq[(Attribute, ColumnStat)] = {
     expressions.collect {
       case alias @ Alias(attr: Attribute, _) if attributeStats.contains(attr) =>
         alias.toAttribute -> attributeStats(attr)
+      // Read-side CHAR padding wraps each CHAR column of a scan. With padding on, ANALYZE TABLE
+      // reads the table through it as well, so the statistics already describe padded values.
+      // Statistics collected otherwise (with padding off, or reported by a connector) can
+      // describe shorter values, and every non-null padded value has at least N characters.
+      // A distinct count of 0 means no non-null values, so there is nothing to pad (ANALYZE
+      // then stores the type's default size as the lengths). The distinct count is left as is.
+      // It is too high only when stored values differ just in trailing spaces, which the
+      // padding makes equal.
+      // TODO(SPARK-60830): under spark.sql.charVarchar.standardSemantics.enabled the scan wraps
+      // CHAR and VARCHAR columns in charTypeReadSideCheck and varcharTypeReadSideCheck instead,
+      // so they still lose their statistics here and in FilterEstimation.calculateSingleCondition.
+      // They need an extractor of their own, because V2ExpressionBuilder relies on
+      // ReadSidePadding never matching the checks. Under first-class CHAR types the filter unwrap
+      // also has to see through the cast to STRING.
+      case alias @ Alias(CharVarcharUtils.ReadSidePadding(attr: Attribute, n), _)
+          if attributeStats.contains(attr) =>
+        val stat = attributeStats(attr)
+        val padded = if (stat.distinctCount.contains(BigInt(0))) {
+          stat
+        } else {
+          stat.copy(avgLen = stat.avgLen.map(_.max(n)), maxLen = stat.maxLen.map(_.max(n)))
+        }
+        alias.toAttribute -> padded
+      case alias @ Alias(expr: Expression, _) if expr.foldable && expr.deterministic =>
+        val value = expr.eval(EmptyRow)
+        val size = expr.dataType.defaultSize
+        val columnStat = if (value == null) {
+          ColumnStat(Some(0), None, None, Some(rowCount), Some(size), Some(size), None, 2)
+        } else {
+          ColumnStat(Some(1), Some(value), Some(value), Some(0), Some(size), Some(size), None, 2)
+        }
+        alias.toAttribute -> columnStat
     }
   }
 
@@ -97,7 +131,7 @@ object EstimationUtils {
     8 + attributes.map { attr =>
       if (attrStats.get(attr).map(_.avgLen.isDefined).getOrElse(false)) {
         attr.dataType match {
-          case StringType =>
+          case _: StringType =>
             // UTF8String: base + offset + numBytes
             attrStats(attr).avgLen.get + 8 + 4
           case _ =>
@@ -116,6 +150,15 @@ object EstimationUtils {
     // Output size can't be zero, or sizeInBytes of BinaryNode will also be zero
     // (simple computation of statistics returns product of children).
     if (outputRowCount > 0) outputRowCount * getSizePerRow(attributes, attrStats) else 1
+  }
+
+  /**
+   * Whether a column of this type can be estimated with an equi-height histogram: the types
+   * whose values [[toDouble]] converts. A DSv2 connector can report a histogram for any type.
+   */
+  def canEstimateWithHistogram(dataType: DataType): Boolean = dataType match {
+    case _: NumericType | DateType | TimestampType | BooleanType => true
+    case _ => false
   }
 
   /**
@@ -327,7 +370,7 @@ object EstimationUtils {
               lo = right.lo,
               hi = right.hi,
               leftNdv = left.ndv * leftRatio,
-              rightNdv = right.ndv,
+              rightNdv = right.ndv.toDouble,
               leftNumRows = leftHeight * leftRatio,
               rightNumRows = rightHeight
             )
@@ -340,7 +383,7 @@ object EstimationUtils {
             OverlappedRange(
               lo = left.lo,
               hi = left.hi,
-              leftNdv = left.ndv,
+              leftNdv = left.ndv.toDouble,
               rightNdv = right.ndv * rightRatio,
               leftNumRows = leftHeight,
               rightNumRows = rightHeight * rightRatio

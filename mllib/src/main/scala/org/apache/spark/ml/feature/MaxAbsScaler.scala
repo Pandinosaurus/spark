@@ -17,11 +17,13 @@
 
 package org.apache.spark.ml.feature
 
+import java.io.{DataInputStream, DataOutputStream}
+
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.annotation.Since
 import org.apache.spark.ml.{Estimator, Model}
-import org.apache.spark.ml.linalg.{Vector, Vectors, VectorUDT}
+import org.apache.spark.ml.linalg.{SQLDataTypes, Vector, Vectors}
 import org.apache.spark.ml.param.{ParamMap, Params}
 import org.apache.spark.ml.param.shared.{HasInputCol, HasOutputCol}
 import org.apache.spark.ml.stat.Summarizer
@@ -37,10 +39,10 @@ private[feature] trait MaxAbsScalerParams extends Params with HasInputCol with H
 
    /** Validates and transforms the input schema. */
   protected def validateAndTransformSchema(schema: StructType): StructType = {
-    SchemaUtils.checkColumnType(schema, $(inputCol), new VectorUDT)
+    SchemaUtils.checkColumnType(schema, $(inputCol), SQLDataTypes.VectorType)
     require(!schema.fieldNames.contains($(outputCol)),
       s"Output column ${$(outputCol)} already exists.")
-    val outputFields = schema.fields :+ StructField($(outputCol), new VectorUDT, false)
+    val outputFields = schema.fields :+ StructField($(outputCol), SQLDataTypes.VectorType, false)
     StructType(outputFields)
   }
 }
@@ -107,6 +109,17 @@ class MaxAbsScalerModel private[ml] (
 
   import MaxAbsScalerModel._
 
+  // For ml connect only
+  private[ml] def this() = this("", Vectors.empty)
+
+  private[spark] override def estimatedSize: Long = {
+    var size = estimateMatadataSize
+    if (maxAbs != null) {
+      size += maxAbs.getSizeInBytes
+    }
+    size
+  }
+
   /** @group setParam */
   @Since("2.0.0")
   def setInputCol(value: String): this.type = set(inputCol, value)
@@ -155,17 +168,27 @@ class MaxAbsScalerModel private[ml] (
 
 @Since("2.0.0")
 object MaxAbsScalerModel extends MLReadable[MaxAbsScalerModel] {
+  private[ml] case class Data(maxAbs: Vector)
+
+  private[ml] def serializeData(data: Data, dos: DataOutputStream): Unit = {
+    import ReadWriteUtils._
+    serializeVector(data.maxAbs, dos)
+  }
+
+  private[ml] def deserializeData(dis: DataInputStream): Data = {
+    import ReadWriteUtils._
+    val maxAbs = deserializeVector(dis)
+    Data(maxAbs)
+  }
 
   private[MaxAbsScalerModel]
   class MaxAbsScalerModelWriter(instance: MaxAbsScalerModel) extends MLWriter {
 
-    private case class Data(maxAbs: Vector)
-
     override protected def saveImpl(path: String): Unit = {
-      DefaultParamsWriter.saveMetadata(instance, path, sc)
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
       val data = new Data(instance.maxAbs)
       val dataPath = new Path(path, "data").toString
-      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
+      ReadWriteUtils.saveObject[Data](dataPath, data, sparkSession, serializeData)
     }
   }
 
@@ -174,12 +197,10 @@ object MaxAbsScalerModel extends MLReadable[MaxAbsScalerModel] {
     private val className = classOf[MaxAbsScalerModel].getName
 
     override def load(path: String): MaxAbsScalerModel = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val dataPath = new Path(path, "data").toString
-      val Row(maxAbs: Vector) = sparkSession.read.parquet(dataPath)
-        .select("maxAbs")
-        .head()
-      val model = new MaxAbsScalerModel(metadata.uid, maxAbs)
+      val data = ReadWriteUtils.loadObject[Data](dataPath, sparkSession, deserializeData)
+      val model = new MaxAbsScalerModel(metadata.uid, data.maxAbs)
       metadata.getAndSetParams(model)
       model
     }

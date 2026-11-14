@@ -17,8 +17,9 @@
 
 package org.apache.spark.sql.catalyst
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.util.BoundedPriorityQueue
 
 
@@ -71,8 +72,11 @@ object QueryPlanningTracker {
   }
 
   /**
-   * A thread local variable to implicitly pass the tracker around. This assumes the query planner
-   * is single-threaded, and avoids passing the same tracker context in every function call.
+   * A thread local variable to implicitly pass the tracker around, avoiding passing the same
+   * tracker context in every function call. The same tracker may be shared across threads -- e.g.
+   * AQE plans scalar / IN / DPP subqueries on separate threads, all recording into the query's
+   * tracker -- so the recording path ([[QueryPlanningTracker.recordRuleInvocation]] and the
+   * reporting accessors) is synchronized.
    */
   private val localTracker = new ThreadLocal[QueryPlanningTracker]() {
     override def initialValue: QueryPlanningTracker = null
@@ -81,7 +85,7 @@ object QueryPlanningTracker {
   /** Returns the current tracker in scope, based on the thread local variable. */
   def get: Option[QueryPlanningTracker] = Option(localTracker.get())
 
-  /** Sets the current tracker for the execution of function f. We assume f is single-threaded. */
+  /** Sets the current tracker for the execution of function f. */
   def withTracker[T](tracker: QueryPlanningTracker)(f: => T): T = {
     val originalTracker = localTracker.get()
     localTracker.set(tracker)
@@ -89,8 +93,42 @@ object QueryPlanningTracker {
   }
 }
 
+/**
+ * Callbacks after planning phase completion.
+ */
+abstract class QueryPlanningTrackerCallback {
+  /**
+   * Called when query fails analysis
+   *
+   * @param tracker      tracker that triggered the callback.
+   * @param parsedPlan   The plan prior to analysis
+   *                     see @org.apache.spark.sql.catalyst.analysis.Analyzer
+   */
+  def analysisFailed(tracker: QueryPlanningTracker, parsedPlan: LogicalPlan): Unit = {
+    // Noop by default for backward compatibility
+  }
+  /**
+   * Called when query has been analyzed.
+   *
+   * @param tracker tracker that triggered the callback.
+   * @param analyzedPlan The plan after analysis,
+   *                     see @org.apache.spark.sql.catalyst.analysis.Analyzer
+   */
+  def analyzed(tracker: QueryPlanningTracker, analyzedPlan: LogicalPlan): Unit
 
-class QueryPlanningTracker {
+  /**
+   * Called when query is ready for execution.
+   * This is after analysis for eager commands and after planning for other queries.
+   * @param tracker tracker that triggered the callback.
+   */
+  def readyForExecution(tracker: QueryPlanningTracker): Unit
+}
+
+/**
+ * @param trackerCallback Callback to be notified of planning phase completion.
+ */
+class QueryPlanningTracker(
+    trackerCallback: Option[QueryPlanningTrackerCallback] = None) {
 
   import QueryPlanningTracker._
 
@@ -100,6 +138,8 @@ class QueryPlanningTracker {
 
   // From a phase to its start time and end time, in ms.
   private val phasesMap = new java.util.HashMap[String, PhaseSummary]
+
+  private var readyForExecution = false
 
   /**
    * Measure the start and end time of a phase. Note that if this function is called multiple
@@ -121,13 +161,53 @@ class QueryPlanningTracker {
   }
 
   /**
+   * Set when the query has been parsed but failed to be analyzed.
+   * Can be called multiple times upon plan change.
+   *
+   * @param parsedPlan The plan prior analysis
+   *                   see @org.apache.spark.sql.catalyst.analysis.Analyzer
+   */
+  private[sql] def setAnalysisFailed(parsedPlan: LogicalPlan): Unit = {
+    trackerCallback.foreach(_.analysisFailed(this, parsedPlan))
+  }
+
+  /**
+   * Set when the query has been analysed.
+   * Can be called multiple times upon plan change.
+   * @param analyzedPlan The plan after analysis,
+   *                     see @org.apache.spark.sql.catalyst.analysis.Analyzer
+   */
+  private[sql] def setAnalyzed(analyzedPlan: LogicalPlan): Unit = {
+    trackerCallback.foreach(_.analyzed(this, analyzedPlan))
+  }
+
+  /**
+   * Set when the query is ready for execution. This is after analysis for
+   * eager commands and after planning for other queries.
+   * see @link org.apache.spark.sql.execution.CommandExecutionMode
+   * When called multiple times, ignores subsequent call.
+   */
+  private[sql] def setReadyForExecution(): Unit = {
+    if (!readyForExecution) {
+      readyForExecution = true
+      trackerCallback.foreach(_.readyForExecution(this))
+    }
+  }
+
+  /**
    * Record a specific invocation of a rule.
+   *
+   * `synchronized` because the same tracker can be written from multiple threads: AQE plans
+   * scalar / IN / DPP subqueries on separate threads, all recording into the query's tracker.
+   * Recording is one `HashMap` put against ms-scale planning, so the lock is uncontended on the
+   * single-threaded analyzer / optimizer path and contended only by the rare concurrent
+   * subquery-planning threads.
    *
    * @param rule name of the rule
    * @param timeNs time taken to run this invocation
    * @param effective whether the invocation has resulted in a plan change
    */
-  def recordRuleInvocation(rule: String, timeNs: Long, effective: Boolean): Unit = {
+  def recordRuleInvocation(rule: String, timeNs: Long, effective: Boolean): Unit = synchronized {
     var s = rulesMap.get(rule)
     if (s eq null) {
       s = new RuleSummary
@@ -141,7 +221,9 @@ class QueryPlanningTracker {
 
   // ------------ reporting functions below ------------
 
-  def rules: Map[String, RuleSummary] = rulesMap.asScala.toMap
+  // `rules` and `topRulesByTime` are `synchronized` to read a consistent snapshot of `rulesMap`
+  // while concurrent subquery-planning threads may still be recording (see `recordRuleInvocation`).
+  def rules: Map[String, RuleSummary] = synchronized { rulesMap.asScala.toMap }
 
   def phases: Map[String, PhaseSummary] = phasesMap.asScala.toMap
 
@@ -149,7 +231,7 @@ class QueryPlanningTracker {
    * Returns the top k most expensive rules (as measured by time). If k is larger than the rules
    * seen so far, return all the rules. If there is no rule seen so far or k <= 0, return empty seq.
    */
-  def topRulesByTime(k: Int): Seq[(String, RuleSummary)] = {
+  def topRulesByTime(k: Int): Seq[(String, RuleSummary)] = synchronized {
     if (k <= 0) {
       Seq.empty
     } else {

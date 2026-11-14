@@ -24,9 +24,9 @@ import javax.security.sasl.Sasl;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
+import org.apache.spark.internal.SparkLogger;
+import org.apache.spark.internal.SparkLoggerFactory;
 import org.apache.spark.network.client.RpcResponseCallback;
 import org.apache.spark.network.client.TransportClient;
 import org.apache.spark.network.server.AbstractAuthRpcHandler;
@@ -43,7 +43,7 @@ import org.apache.spark.network.util.TransportConf;
  * which are individual RPCs.
  */
 public class SaslRpcHandler extends AbstractAuthRpcHandler {
-  private static final Logger logger = LoggerFactory.getLogger(SaslRpcHandler.class);
+  private static final SparkLogger logger = SparkLoggerFactory.getLogger(SaslRpcHandler.class);
 
   /** Transport configuration. */
   private final TransportConf conf;
@@ -55,6 +55,9 @@ public class SaslRpcHandler extends AbstractAuthRpcHandler {
   private final SecretKeyHolder secretKeyHolder;
 
   private SparkSaslServer saslServer;
+
+  /** Claimed AppID from initial connection */
+  private String claimedAppId;
 
   public SaslRpcHandler(
       TransportConf conf,
@@ -83,8 +86,7 @@ public class SaslRpcHandler extends AbstractAuthRpcHandler {
       }
 
       if (saslServer == null) {
-        // First message in the handshake, setup the necessary state.
-        client.setClientId(saslMessage.appId);
+        claimedAppId = saslMessage.appId;
         saslServer = new SparkSaslServer(saslMessage.appId, secretKeyHolder,
           conf.saslServerAlwaysEncrypt());
       }
@@ -105,6 +107,8 @@ public class SaslRpcHandler extends AbstractAuthRpcHandler {
     // method returns. This assumes that the code ensures, through other means, that no outbound
     // messages are being written to the channel while negotiation is still going on.
     if (saslServer.isComplete()) {
+      // Set app Id once the handshake is completed.
+      client.setClientId(claimedAppId);
       if (!SparkSaslServer.QOP_AUTH_CONF.equals(saslServer.getNegotiatedProperty(Sasl.QOP))) {
         logger.debug("SASL authentication successful for channel {}", client);
         complete(true);

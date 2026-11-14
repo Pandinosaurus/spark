@@ -19,8 +19,9 @@
 Estimator Transformer Param Example.
 """
 # $example on$
-from pyspark.ml.linalg import Vectors
 from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.linalg import Vectors
+
 # $example off$
 from pyspark.sql import SparkSession
 
@@ -61,7 +62,7 @@ if __name__ == "__main__":
 
     # You can combine paramMaps, which are python dictionaries.
     # Change output column name
-    paramMap2 = {lr.probabilityCol: "myProbability"}  # type: ignore
+    paramMap2 = {lr.probabilityCol: "myProbability"}
     paramMapCombined = paramMap.copy()
     paramMapCombined.update(paramMap2)  # type: ignore
 

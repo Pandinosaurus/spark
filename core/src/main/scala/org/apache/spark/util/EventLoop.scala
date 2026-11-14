@@ -22,7 +22,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.util.control.NonFatal
 
+import com.google.common.util.concurrent.Uninterruptibles
+
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys.EVENT_LOOP
 
 /**
  * An event loop to receive events from the caller and process all events in the event thread. It
@@ -52,13 +55,13 @@ private[spark] abstract class EventLoop[E](name: String) extends Logging {
               try {
                 onError(e)
               } catch {
-                case NonFatal(e) => logError("Unexpected error in " + name, e)
+                case NonFatal(e) => logError(log"Unexpected error in ${MDC(EVENT_LOOP, name)}", e)
               }
           }
         }
       } catch {
         case ie: InterruptedException => // exit even if eventQueue is not empty
-        case NonFatal(e) => logError("Unexpected error in " + name, e)
+        case NonFatal(e) => logError(log"Unexpected error in ${MDC(EVENT_LOOP, name)}", e)
       }
     }
 
@@ -76,20 +79,15 @@ private[spark] abstract class EventLoop[E](name: String) extends Logging {
   def stop(): Unit = {
     if (stopped.compareAndSet(false, true)) {
       eventThread.interrupt()
-      var onStopCalled = false
+      if (Thread.currentThread() != eventThread) {
+        // onStop must not run concurrently with onReceive, even if the caller is interrupted.
+        Uninterruptibles.joinUninterruptibly(eventThread)
+      }
       try {
-        eventThread.join()
-        // Call onStop after the event thread exits to make sure onReceive happens before onStop
-        onStopCalled = true
         onStop()
       } catch {
         case ie: InterruptedException =>
           Thread.currentThread().interrupt()
-          if (!onStopCalled) {
-            // ie is thrown from `eventThread.join()`. Otherwise, we should not call `onStop` since
-            // it's already called.
-            onStop()
-          }
       }
     } else {
       // Keep quiet to allow calling `stop` multiple times.

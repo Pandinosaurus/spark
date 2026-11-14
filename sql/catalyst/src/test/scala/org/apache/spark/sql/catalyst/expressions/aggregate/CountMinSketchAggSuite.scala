@@ -23,8 +23,9 @@ import scala.util.Random
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.TypeCheckFailure
+import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.DataTypeMismatch
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.util.TypeUtils.toSQLValue
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.sketch.CountMinSketch
@@ -110,6 +111,31 @@ class CountMinSketchAggSuite extends SparkFunSuite {
 
   testDataType[Array[Byte]](BinaryType, Seq.fill(100) { rand.nextString(1).getBytes() })
 
+  // TIME is physically a long of nanos-of-day, so it sketches exactly like an integral column.
+  testDataType[Long](TimeType(), Seq.fill(100) { rand.nextInt(10).toLong * 1000000000L })
+
+  // The full nanos-of-day is hashed: TIME(9) values that differ only below a microsecond stay
+  // distinct (a regression truncating to micros before hashing would merge them and fail here).
+  testDataType[Long](TimeType(9), {
+    val noon = 12L * 3600 * 1000000000L
+    Seq.fill(40)(noon) ++ Seq.fill(30)(noon + 1L) ++ Seq.fill(30)(noon + 2L)
+  })
+
+  test("count_min_sketch accepts TIME but rejects DATE/TIMESTAMP (no implicit coercion)") {
+    // A TIME column is accepted as the value to sketch.
+    val timeAgg = new CountMinSketchAgg(BoundReference(0, TimeType(6), nullable = true),
+      Literal(epsOfTotalCount), Literal(confidence), Literal(seed))
+    assert(timeAgg.checkInputDataTypes().isSuccess)
+
+    // CountMinSketchAgg is ExpectsInputTypes (not ImplicitCastInputTypes), so DATE/TIMESTAMP inputs
+    // are not coerced to STRING or TIME -- they are analysis errors regardless of member order.
+    Seq(DateType, TimestampType, TimestampNTZType).foreach { dt =>
+      val agg = new CountMinSketchAgg(BoundReference(0, dt, nullable = true),
+        Literal(epsOfTotalCount), Literal(confidence), Literal(seed))
+      assert(agg.checkInputDataTypes().isFailure, s"$dt should be rejected, not coerced")
+    }
+  }
+
   test("serialize and de-serialize") {
     // Check empty serialize and de-serialize
     val agg = cms(epsOfTotalCount, confidence, seed)
@@ -140,13 +166,24 @@ class CountMinSketchAggSuite extends SparkFunSuite {
       epsExpression = Literal(epsOfTotalCount),
       confidenceExpression = Literal(confidence),
       seedExpression = AttributeReference("c", IntegerType)())
-
-    Seq(wrongEps, wrongConfidence, wrongSeed).foreach { wrongAgg =>
-      assertResult(
-        TypeCheckFailure("The eps, confidence or seed provided must be a literal or foldable")) {
-        wrongAgg.checkInputDataTypes()
-      }
-    }
+    assertResult(
+      DataTypeMismatch(
+        errorSubClass = "NON_FOLDABLE_INPUT",
+        Map("inputName" -> "`eps`", "inputType" -> "\"DOUBLE\"", "inputExpr" -> "\"a\"")
+      )
+    )(wrongEps.checkInputDataTypes())
+    assertResult(
+      DataTypeMismatch(
+        errorSubClass = "NON_FOLDABLE_INPUT",
+        Map("inputName" -> "`confidence`", "inputType" -> "\"DOUBLE\"", "inputExpr" -> "\"b\"")
+      )
+    )(wrongConfidence.checkInputDataTypes())
+    assertResult(
+      DataTypeMismatch(
+        errorSubClass = "NON_FOLDABLE_INPUT",
+        Map("inputName" -> "`seed`", "inputType" -> "\"INT\"", "inputExpr" -> "\"c\"")
+      )
+    )(wrongSeed.checkInputDataTypes())
   }
 
   test("fails analysis if parameters are invalid") {
@@ -155,27 +192,52 @@ class CountMinSketchAggSuite extends SparkFunSuite {
     val wrongConfidence = cms(epsOfTotalCount, null, seed)
     val wrongSeed = cms(epsOfTotalCount, confidence, null)
 
-    Seq(wrongEps, wrongConfidence, wrongSeed).foreach { wrongAgg =>
-      assertResult(TypeCheckFailure("The eps, confidence or seed provided should not be null")) {
-        wrongAgg.checkInputDataTypes()
-      }
-    }
+    assertResult(
+      DataTypeMismatch(
+        errorSubClass = "UNEXPECTED_NULL",
+        Map("exprName" -> "eps")
+      )
+    )(wrongEps.checkInputDataTypes())
+    assertResult(
+      DataTypeMismatch(
+        errorSubClass = "UNEXPECTED_NULL",
+        Map("exprName" -> "confidence")
+      )
+    )(wrongConfidence.checkInputDataTypes())
+    assertResult(
+      DataTypeMismatch(
+        errorSubClass = "UNEXPECTED_NULL",
+        Map("exprName" -> "seed")
+      )
+    )(wrongSeed.checkInputDataTypes())
 
     // parameters are out of the valid range
     Seq(0.0, -1000.0).foreach { invalidEps =>
       val invalidAgg = cms(invalidEps, confidence, seed)
       assertResult(
-        TypeCheckFailure(s"Relative error must be positive (current value = $invalidEps)")) {
-        invalidAgg.checkInputDataTypes()
-      }
+        DataTypeMismatch(
+          errorSubClass = "VALUE_OUT_OF_RANGE",
+          messageParameters = Map(
+            "exprName" -> "eps",
+            "valueRange" -> s"(${0.toDouble}, ${Double.MaxValue}]",
+            "currentValue" -> toSQLValue(invalidEps, DoubleType)
+          )
+        )
+      )(invalidAgg.checkInputDataTypes())
     }
 
     Seq(0.0, 1.0, -2.0, 2.0).foreach { invalidConfidence =>
       val invalidAgg = cms(epsOfTotalCount, invalidConfidence, seed)
-      assertResult(TypeCheckFailure(
-        s"Confidence must be within range (0.0, 1.0) (current value = $invalidConfidence)")) {
-        invalidAgg.checkInputDataTypes()
-      }
+      assertResult(
+        DataTypeMismatch(
+          errorSubClass = "VALUE_OUT_OF_RANGE",
+          messageParameters = Map(
+            "exprName" -> "confidence",
+            "valueRange" -> s"(${0.toDouble}, ${1.toDouble}]",
+            "currentValue" -> toSQLValue(invalidConfidence, DoubleType)
+          )
+        )
+      )(invalidAgg.checkInputDataTypes())
     }
   }
 

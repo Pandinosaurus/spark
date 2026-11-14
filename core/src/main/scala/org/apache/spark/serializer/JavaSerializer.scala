@@ -18,6 +18,7 @@
 package org.apache.spark.serializer
 
 import java.io._
+import java.lang.reflect.{InvocationHandler, Method, Proxy}
 import java.nio.ByteBuffer
 
 import scala.reflect.ClassTag
@@ -60,7 +61,10 @@ private[spark] class JavaSerializationStream(
   def close(): Unit = { objOut.close() }
 }
 
-private[spark] class JavaDeserializationStream(in: InputStream, loader: ClassLoader)
+private[spark] class JavaDeserializationStream(
+    in: InputStream,
+    loader: ClassLoader,
+    filter: Option[ObjectInputFilter] = None)
     extends DeserializationStream {
 
   private val objIn = new ObjectInputStream(in) {
@@ -79,13 +83,30 @@ private[spark] class JavaDeserializationStream(in: InputStream, loader: ClassLoa
       // scalastyle:off classforname
       val resolved = ifaces.map(iface => Class.forName(iface, false, loader))
       // scalastyle:on classforname
-      java.lang.reflect.Proxy.getProxyClass(loader, resolved: _*)
+      Proxy.newProxyInstance(loader, resolved, DummyInvocationHandler).getClass
     }
 
   }
 
+  // A JEP-290 deserialization filter for callers that restrict which classes may be
+  // instantiated on read (e.g. the master recovery store). Applied per-stream so it cannot
+  // affect other JavaSerializer users. If the stream already has a filter (e.g. a JVM-wide
+  // jdk.serialFilter), merge the two instead of replacing it, so a rejection by either one
+  // rejects. The caller's filter is consulted first: merge stops at the first rejection, so
+  // this lets a caller that tracks its own rejections see all of them.
+  filter.foreach { f =>
+    objIn.setObjectInputFilter(
+      Option(objIn.getObjectInputFilter).map(ObjectInputFilter.merge(f, _)).getOrElse(f))
+  }
+
   def readObject[T: ClassTag](): T = objIn.readObject().asInstanceOf[T]
   def close(): Unit = { objIn.close() }
+}
+
+private[spark] object DummyInvocationHandler extends InvocationHandler {
+  override def invoke(proxy: Any, method: Method, args: Array[AnyRef]): AnyRef = {
+    throw new UnsupportedOperationException("Not implemented")
+  }
 }
 
 private object JavaDeserializationStream {
@@ -99,7 +120,7 @@ private object JavaDeserializationStream {
     "long" -> classOf[Long],
     "float" -> classOf[Float],
     "double" -> classOf[Double],
-    "void" -> classOf[Void])
+    "void" -> classOf[Unit])
 
 }
 
@@ -139,6 +160,10 @@ private[spark] class JavaSerializerInstance(
 
   def deserializeStream(s: InputStream, loader: ClassLoader): DeserializationStream = {
     new JavaDeserializationStream(s, loader)
+  }
+
+  def deserializeStream(s: InputStream, filter: ObjectInputFilter): DeserializationStream = {
+    new JavaDeserializationStream(s, defaultClassLoader, Some(filter))
   }
 
 }

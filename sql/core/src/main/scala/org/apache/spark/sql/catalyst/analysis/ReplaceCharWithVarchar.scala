@@ -17,30 +17,32 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
-import org.apache.spark.sql.catalyst.catalog.CatalogTable
-import org.apache.spark.sql.catalyst.plans.logical.{AddColumns, AlterColumn, CreateV2Table, LogicalPlan, ReplaceColumns, ReplaceTable}
+import org.apache.spark.sql.catalyst.plans.logical.{AddColumns, AlterColumns, CreateTable, LogicalPlan, ReplaceColumns, ReplaceTable}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.util.CharVarcharUtils
 import org.apache.spark.sql.execution.command.{AlterTableAddColumnsCommand, AlterTableChangeColumnCommand, CreateDataSourceTableCommand, CreateTableCommand}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.StructType
 
 object ReplaceCharWithVarchar extends Rule[LogicalPlan] {
+  import CreateTableHelper._
+
   override def apply(plan: LogicalPlan): LogicalPlan = {
     if (!conf.getConf(SQLConf.CHAR_AS_VARCHAR)) return plan
 
     plan.resolveOperators {
       // V2 commands
-      case cmd: CreateV2Table =>
-        cmd.copy(tableSchema = replaceCharWithVarcharInSchema(cmd.tableSchema))
+      case cmd: CreateTable =>
+        cmd.copy(columns = cmd.columns.map(replaceCharWithVarcharInColumn))
       case cmd: ReplaceTable =>
-        cmd.copy(tableSchema = replaceCharWithVarcharInSchema(cmd.tableSchema))
+        cmd.copy(columns = cmd.columns.map(replaceCharWithVarcharInColumn))
       case cmd: AddColumns =>
         cmd.copy(columnsToAdd = cmd.columnsToAdd.map { col =>
           col.copy(dataType = CharVarcharUtils.replaceCharWithVarchar(col.dataType))
         })
-      case cmd: AlterColumn =>
-        cmd.copy(dataType = cmd.dataType.map(CharVarcharUtils.replaceCharWithVarchar))
+      case cmd: AlterColumns =>
+        cmd.copy(specs = cmd.specs.map { spec =>
+          spec.copy(newDataType = spec.newDataType.map(CharVarcharUtils.replaceCharWithVarchar))
+        })
       case cmd: ReplaceColumns =>
         cmd.copy(columnsToAdd = cmd.columnsToAdd.map { col =>
           col.copy(dataType = CharVarcharUtils.replaceCharWithVarchar(col.dataType))
@@ -59,13 +61,5 @@ object ReplaceCharWithVarchar extends Rule[LogicalPlan] {
         cmd.copy(newColumn = cmd.newColumn.copy(
           dataType = CharVarcharUtils.replaceCharWithVarchar(cmd.newColumn.dataType)))
     }
-  }
-
-  private def replaceCharWithVarcharInSchema(schema: StructType): StructType = {
-    CharVarcharUtils.replaceCharWithVarchar(schema).asInstanceOf[StructType]
-  }
-
-  private def replaceCharWithVarcharInTableMeta(tbl: CatalogTable): CatalogTable = {
-    tbl.copy(schema = replaceCharWithVarcharInSchema(tbl.schema))
   }
 }

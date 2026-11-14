@@ -26,9 +26,9 @@
 function stripeSummaryTable() {
   $("#task-summary-table").find("tr:not(:hidden)").each(function (index) {
     if (index % 2 == 1) {
-      $(this).css("background-color", "#f9f9f9");
+      $(this).css("background-color", "var(--bs-tertiary-bg)");
     } else {
-      $(this).css("background-color", "#ffffff");
+      $(this).css("background-color", "var(--bs-body-bg)");
     }
   });
 }
@@ -63,6 +63,19 @@ function expandAllThreadStackTrace(toggleButton) {
 }
 /* eslint-enable no-unused-vars */
 
+// Builds the file in the browser (as the SQL plan download does) rather than linking to a data:
+// URI, which browsers truncate at the first '#'.
+function downloadThreadDump(fileName) {
+  const text = document.getElementById("thread-dump-text").textContent;
+  const url = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  link.click();
+  // Release the Blob once the browser has started the download, as exportSparkProperties does.
+  setTimeout(function () { URL.revokeObjectURL(url); }, 100);
+}
+
 function collapseAllThreadStackTrace(toggleButton) {
   $('.accordion-body').each(function() {
     $(this).remove()
@@ -82,30 +95,56 @@ function onMouseOverAndOut(threadId) {
 }
 
 function onSearchStringChange() {
-  var searchString = $('#search').val().toLowerCase();
+  const searchString = $('#search').val().toLowerCase();
   //remove the stacktrace
   collapseAllThreadStackTrace(false);
-  if (searchString.length == 0) {
-    $('tr').each(function() {
+  $('tr[id^="thread_"]').each(function() {
+    if (searchString.length === 0) {
       $(this).removeClass('d-none')
-    })
-  } else {
-    $('tr').each(function(){
-      if($(this).attr('id') && $(this).attr('id').match(/thread_[0-9]+_tr/) ) {
-        var children = $(this).children();
-        var found = false;
-        for (var i = 0; i < children.length; i++) {
-          if (children.eq(i).text().toLowerCase().indexOf(searchString) >= 0) {
-            found = true;
-          }
-        }
-        if (found) {
-          $(this).removeClass('d-none')
+    } else {
+      let found = false;
+      const children = $(this).children();
+      let i = 0;
+      while(!found && i < children.length) {
+        if (children.eq(i).text().toLowerCase().indexOf(searchString) >= 0) {
+          found = true;
         } else {
-          $(this).addClass('d-none')
+          i++;
         }
       }
-    });
-  }
+      $(this).toggleClass('d-none', !found);
+    }
+  });
 }
 /* eslint-enable no-unused-vars */
+
+// Event delegation for thread dump page (CSP-compliant)
+$(function() {
+  // toggleThreadStackTrace on row click
+  $(document).on("click", "tr.accordion-heading[data-thread-id]", function() {
+    toggleThreadStackTrace($(this).data("thread-id"), false);
+  });
+
+  // expandAll / collapseAll
+  $(document).on("click", "[data-action=expandAllThreadStackTrace]", function() {
+    expandAllThreadStackTrace(true);
+  });
+  $(document).on("click", "[data-action=collapseAllThreadStackTrace]", function() {
+    collapseAllThreadStackTrace($(this).data("toggle-button") !== false);
+  });
+
+  // downloadThreadDump
+  $(document).on("click", "[data-action=downloadThreadDump]", function() {
+    downloadThreadDump($(this).data("filename"));
+  });
+
+  // onMouseOverAndOut
+  $(document).on("mouseenter mouseleave", "tr.accordion-heading[data-thread-id]", function() {
+    onMouseOverAndOut($(this).data("thread-id"));
+  });
+
+  // onSearchStringChange
+  $(document).on("input", "[data-search-input]", function() {
+    onSearchStringChange();
+  });
+});

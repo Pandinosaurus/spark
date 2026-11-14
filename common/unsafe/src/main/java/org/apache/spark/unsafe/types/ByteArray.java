@@ -20,9 +20,8 @@ package org.apache.spark.unsafe.types;
 import java.nio.ByteOrder;
 import java.util.Arrays;
 
-import com.google.common.primitives.Ints;
-
 import org.apache.spark.unsafe.Platform;
+import org.apache.spark.network.util.JavaUtils;
 
 public final class ByteArray {
 
@@ -113,49 +112,77 @@ public final class ByteArray {
 
   public static byte[] subStringSQL(byte[] bytes, int pos, int len) {
     // This pos calculation is according to UTF8String#subStringSQL
-    if (pos > bytes.length) {
-      return EMPTY_BYTE;
-    }
     int start = 0;
-    int end;
     if (pos > 0) {
       start = pos - 1;
     } else if (pos < 0) {
       start = bytes.length + pos;
     }
-    if ((bytes.length - start) < len) {
-      end = bytes.length;
-    } else {
-      end = start + len;
-    }
+    // Compute the end offset as a `long`, since `start + len` can overflow the `int` range,
+    // then clamp it to the length of the input. `start` must stay unclamped until the end
+    // offset has been computed, because a negative `start` shortens the result. Clamping the
+    // end offset is required for correctness and not just as a bounds check: `copyOfRange`
+    // accepts an end offset past the end of the input and zero-pads the remainder, so an
+    // unclamped value silently yields a longer result instead of failing.
+    final long end = Math.min((long) start + len, bytes.length);
     start = Math.max(start, 0); // underflow
     if (start >= end) {
       return EMPTY_BYTE;
     }
-    return Arrays.copyOfRange(bytes, start, end);
+    return Arrays.copyOfRange(bytes, start, (int) end);
   }
 
+  /**
+   * Concatenate multiple byte arrays into one.
+   * If one of the inputs is null then null will be returned.
+   *
+   * @param inputs byte arrays to concatenate
+   * @return the concatenated byte array or null if one of the arguments is null
+   */
   public static byte[] concat(byte[]... inputs) {
+    return concatWS(EMPTY_BYTE, inputs);
+  }
+
+  /**
+   * Concatenate multiple byte arrays with a given delimiter.
+   * If the delimiter or one of the inputs is null then null will be returned.
+   *
+   * @param delimiter byte array to be placed between each input
+   * @param inputs    byte arrays to concatenate
+   * @return the concatenated byte array or null if one of the arguments is null
+   */
+  public static byte[] concatWS(byte[] delimiter, byte[]... inputs) {
+    if (delimiter == null) {
+      return null;
+    }
     // Compute the total length of the result
     long totalLength = 0;
     for (byte[] input : inputs) {
       if (input != null) {
-        totalLength += input.length;
+        totalLength += input.length + delimiter.length;
       } else {
         return null;
       }
     }
-
+    if (totalLength > 0) totalLength -= delimiter.length;
     // Allocate a new byte array, and copy the inputs one by one into it
-    final byte[] result = new byte[Ints.checkedCast(totalLength)];
+    final byte[] result = new byte[JavaUtils.checkedCast(totalLength)];
     int offset = 0;
-    for (byte[] input : inputs) {
+    for (int i = 0; i < inputs.length; i++) {
+      byte[] input = inputs[i];
       int len = input.length;
       Platform.copyMemory(
         input, Platform.BYTE_ARRAY_OFFSET,
         result, Platform.BYTE_ARRAY_OFFSET + offset,
         len);
       offset += len;
+      if (delimiter.length > 0 && i < inputs.length - 1) {
+        Platform.copyMemory(
+          delimiter, Platform.BYTE_ARRAY_OFFSET,
+          result, Platform.BYTE_ARRAY_OFFSET + offset,
+          delimiter.length);
+        offset += delimiter.length;
+      }
     }
     return result;
   }
@@ -163,6 +190,7 @@ public final class ByteArray {
   // Helper method for implementing `lpad` and `rpad`.
   // If the padding pattern's length is 0, return the first `len` bytes of the input byte
   // sequence if it is longer than `len` bytes, or a copy of the byte sequence, otherwise.
+  // `len` is expected to be positive; both callers return early for non-positive lengths.
   private static byte[] padWithEmptyPattern(byte[] bytes, int len) {
     len = Math.min(bytes.length, len);
     final byte[] result = new byte[len];
@@ -178,7 +206,7 @@ public final class ByteArray {
     for (int pos = firstPos; pos < beyondPos; pos += pad.length) {
       final int jMax = Math.min(pad.length, beyondPos - pos);
       for (int j = 0; j < jMax; ++j) {
-        result[pos + j] = (byte) pad[j];
+        result[pos + j] = pad[j];
       }
     }
   }
@@ -192,8 +220,9 @@ public final class ByteArray {
   // are returned. Otherwise, the remaining missing bytes are filled in with the provided pattern.
   public static byte[] lpad(byte[] bytes, int len, byte[] pad) {
     if (bytes == null || pad == null) return null;
-    // If the input length is 0, return the empty byte sequence.
-    if (len == 0) return EMPTY_BYTE;
+    // If the requested length is not positive, return the empty byte sequence. This matches
+    // `UTF8String.lpad`, which returns the empty string for any non-positive length.
+    if (len <= 0) return EMPTY_BYTE;
     // The padding pattern is empty.
     if (pad.length == 0) return padWithEmptyPattern(bytes, len);
     // The general case.
@@ -220,8 +249,9 @@ public final class ByteArray {
   // are returned. Otherwise, the remaining missing bytes are filled in with the provided pattern.
   public static byte[] rpad(byte[] bytes, int len, byte[] pad) {
     if (bytes == null || pad == null) return null;
-    // If the input length is 0, return the empty byte sequence.
-    if (len == 0) return EMPTY_BYTE;
+    // If the requested length is not positive, return the empty byte sequence. This matches
+    // `UTF8String.rpad`, which returns the empty string for any non-positive length.
+    if (len <= 0) return EMPTY_BYTE;
     // The padding pattern is empty.
     if (pad.length == 0) return padWithEmptyPattern(bytes, len);
     // The general case.

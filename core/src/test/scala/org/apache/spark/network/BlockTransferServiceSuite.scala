@@ -74,6 +74,8 @@ class BlockTransferServiceSuite extends SparkFunSuite with TimeLimits {
               override def release(): ManagedBuffer = this
 
               override def convertToNetty(): AnyRef = null
+
+              override def convertToNettyForSsl(): AnyRef = null
             }
             listener.onBlockFetchSuccess("block-id-unused", badBuffer)
           }
@@ -87,7 +89,9 @@ class BlockTransferServiceSuite extends SparkFunSuite with TimeLimits {
           blockId: BlockId,
           blockData: ManagedBuffer,
           level: StorageLevel,
-          classTag: ClassTag[_]): Future[Unit] = {
+          classTag: ClassTag[_],
+          checksum: Option[Long] = None,
+          verifySealedChecksum: Boolean = false): Future[Unit] = {
         // This method is unused in this test
         throw new UnsupportedOperationException("uploadBlock")
       }

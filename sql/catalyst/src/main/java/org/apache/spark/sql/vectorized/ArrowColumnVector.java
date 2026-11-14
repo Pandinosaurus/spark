@@ -17,21 +17,38 @@
 
 package org.apache.spark.sql.vectorized;
 
+import java.math.BigDecimal;
+import java.nio.ByteOrder;
+
+import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.vector.*;
 import org.apache.arrow.vector.complex.*;
+import org.apache.arrow.vector.holders.NullableIntervalMonthDayNanoHolder;
+import org.apache.arrow.vector.holders.NullableLargeVarCharHolder;
 import org.apache.arrow.vector.holders.NullableVarCharHolder;
 
+import org.apache.spark.SparkUnsupportedOperationException;
+import org.apache.spark.annotation.DeveloperApi;
+import org.apache.spark.sql.catalyst.util.DateTimeConstants;
+import org.apache.spark.sql.catalyst.util.DateTimeUtils;
+import org.apache.spark.sql.catalyst.util.STUtils;
 import org.apache.spark.sql.util.ArrowUtils;
 import org.apache.spark.sql.types.*;
+import org.apache.spark.unsafe.types.BinaryView;
+import org.apache.spark.unsafe.types.CalendarInterval;
+import org.apache.spark.unsafe.types.TimestampNanosVal;
 import org.apache.spark.unsafe.types.UTF8String;
 
 /**
  * A column vector backed by Apache Arrow.
  */
-public final class ArrowColumnVector extends ColumnVector {
+@DeveloperApi
+public class ArrowColumnVector extends ColumnVector {
 
-  private final ArrowVectorAccessor accessor;
-  private ArrowColumnVector[] childColumns;
+  ArrowVectorAccessor accessor;
+  ArrowColumnVector[] childColumns;
+
+  public ValueVector getValueVector() { return accessor.vector; }
 
   @Override
   public boolean hasNull() {
@@ -108,6 +125,24 @@ public final class ArrowColumnVector extends ColumnVector {
   }
 
   @Override
+  public CalendarInterval getInterval(int rowId) {
+    if (isNullAt(rowId)) return null;
+    return accessor.getInterval(rowId);
+  }
+
+  @Override
+  public TimestampNanosVal getTimestampNTZNanos(int rowId) {
+    if (isNullAt(rowId)) return null;
+    return accessor.getTimestampNanos(rowId);
+  }
+
+  @Override
+  public TimestampNanosVal getTimestampLTZNanos(int rowId) {
+    if (isNullAt(rowId)) return null;
+    return accessor.getTimestampNanos(rowId);
+  }
+
+  @Override
   public byte[] getBinary(int rowId) {
     if (isNullAt(rowId)) return null;
     return accessor.getBinary(rowId);
@@ -128,70 +163,123 @@ public final class ArrowColumnVector extends ColumnVector {
   @Override
   public ArrowColumnVector getChild(int ordinal) { return childColumns[ordinal]; }
 
+  ArrowColumnVector(DataType type) {
+     super(type);
+  }
+
+  @Override
+  public BinaryView getBinaryView(int rowId) {
+    if (isNullAt(rowId)) return null;
+
+    if (this.type instanceof GeographyType gt) {
+      int srid = getChild(0).getInt(rowId);
+      gt.assertSridAllowedForType(srid);
+      byte[] bytes = getChild(1).getBinary(rowId);
+      return (bytes == null) ? null : STUtils.stGeogFromWKB(bytes, srid);
+    } else if (this.type instanceof GeometryType gt) {
+      int srid = getChild(0).getInt(rowId);
+      gt.assertSridAllowedForType(srid);
+      byte[] bytes = getChild(1).getBinary(rowId);
+      return (bytes == null) ? null : STUtils.stGeomFromWKB(bytes, srid);
+    }
+    return super.getBinaryView(rowId);
+  }
+
   public ArrowColumnVector(ValueVector vector) {
-    super(ArrowUtils.fromArrowField(vector.getField()));
+    this(ArrowUtils.fromArrowField(vector.getField()));
+    initAccessor(vector);
+  }
 
-    if (vector instanceof BitVector) {
-      accessor = new BooleanAccessor((BitVector) vector);
-    } else if (vector instanceof TinyIntVector) {
-      accessor = new ByteAccessor((TinyIntVector) vector);
-    } else if (vector instanceof SmallIntVector) {
-      accessor = new ShortAccessor((SmallIntVector) vector);
-    } else if (vector instanceof IntVector) {
-      accessor = new IntAccessor((IntVector) vector);
-    } else if (vector instanceof BigIntVector) {
-      accessor = new LongAccessor((BigIntVector) vector);
-    } else if (vector instanceof Float4Vector) {
-      accessor = new FloatAccessor((Float4Vector) vector);
-    } else if (vector instanceof Float8Vector) {
-      accessor = new DoubleAccessor((Float8Vector) vector);
-    } else if (vector instanceof DecimalVector) {
-      accessor = new DecimalAccessor((DecimalVector) vector);
-    } else if (vector instanceof VarCharVector) {
-      accessor = new StringAccessor((VarCharVector) vector);
-    } else if (vector instanceof VarBinaryVector) {
-      accessor = new BinaryAccessor((VarBinaryVector) vector);
-    } else if (vector instanceof DateDayVector) {
-      accessor = new DateAccessor((DateDayVector) vector);
-    } else if (vector instanceof TimeStampMicroTZVector) {
-      accessor = new TimestampAccessor((TimeStampMicroTZVector) vector);
-    } else if (vector instanceof TimeStampMicroVector) {
-      accessor = new TimestampNTZAccessor((TimeStampMicroVector) vector);
-    } else if (vector instanceof MapVector) {
-      MapVector mapVector = (MapVector) vector;
-      accessor = new MapAccessor(mapVector);
-    } else if (vector instanceof ListVector) {
-      ListVector listVector = (ListVector) vector;
-      accessor = new ArrayAccessor(listVector);
-    } else if (vector instanceof StructVector) {
-      StructVector structVector = (StructVector) vector;
-      accessor = new StructAccessor(structVector);
-
-      childColumns = new ArrowColumnVector[structVector.size()];
-      for (int i = 0; i < childColumns.length; ++i) {
-        childColumns[i] = new ArrowColumnVector(structVector.getVectorById(i));
+  void initAccessor(ValueVector vector) {
+    if (vector instanceof BitVector bitVector) {
+      accessor = new BooleanAccessor(bitVector);
+    } else if (vector instanceof TinyIntVector tinyIntVector) {
+      accessor = new ByteAccessor(tinyIntVector);
+    } else if (vector instanceof SmallIntVector smallIntVector) {
+      accessor = new ShortAccessor(smallIntVector);
+    } else if (vector instanceof IntVector intVector) {
+      accessor = new IntAccessor(intVector);
+    } else if (vector instanceof BigIntVector bigIntVector) {
+      accessor = new LongAccessor(bigIntVector);
+    } else if (vector instanceof Float4Vector float4Vector) {
+      accessor = new FloatAccessor(float4Vector);
+    } else if (vector instanceof Float8Vector float8Vector) {
+      accessor = new DoubleAccessor(float8Vector);
+    } else if (vector instanceof DecimalVector decimalVector) {
+      int precision = decimalVector.getPrecision();
+      if (precision > 0 && precision <= Decimal.MAX_LONG_DIGITS()) {
+        accessor = new SmallDecimalAccessor(decimalVector, ByteOrder.nativeOrder());
+      } else {
+        accessor = new DecimalAccessor(decimalVector);
       }
-    } else if (vector instanceof NullVector) {
-      accessor = new NullAccessor((NullVector) vector);
-    } else if (vector instanceof IntervalYearVector) {
-      accessor = new IntervalYearAccessor((IntervalYearVector) vector);
-    } else if (vector instanceof DurationVector) {
-      accessor = new DurationAccessor((DurationVector) vector);
+    } else if (vector instanceof VarCharVector varCharVector) {
+      accessor = new StringAccessor(varCharVector);
+    } else if (vector instanceof LargeVarCharVector largeVarCharVector) {
+      accessor = new LargeStringAccessor(largeVarCharVector);
+    } else if (vector instanceof VarBinaryVector varBinaryVector) {
+      accessor = new BinaryAccessor(varBinaryVector);
+    } else if (vector instanceof LargeVarBinaryVector largeVarBinaryVector) {
+      accessor = new BinaryAccessor(largeVarBinaryVector);
+    } else if (vector instanceof ViewVarCharVector viewVarCharVector) {
+      accessor = new StringViewAccessor(viewVarCharVector);
+    } else if (vector instanceof ViewVarBinaryVector viewVarBinaryVector) {
+      accessor = new BinaryAccessor(viewVarBinaryVector);
+    } else if (vector instanceof DateDayVector dateDayVector) {
+      accessor = new DateAccessor(dateDayVector);
+    } else if (vector instanceof TimeStampMicroTZVector timeStampMicroTZVector) {
+      accessor = new TimestampAccessor(timeStampMicroTZVector);
+    } else if (vector instanceof TimeStampMicroVector timeStampMicroVector) {
+      accessor = new TimestampNTZAccessor(timeStampMicroVector);
+    } else if (vector instanceof TimeNanoVector timeNanoVector) {
+      accessor = new TimeNanoAccessor(timeNanoVector);
+    } else if (vector instanceof TimeStampNanoTZVector timeStampNanoTZVector) {
+      accessor = new TimestampLTZNanosAccessor(timeStampNanoTZVector, nanosPrecision(type));
+    } else if (vector instanceof TimeStampNanoVector timeStampNanoVector) {
+      accessor = new TimestampNTZNanosAccessor(timeStampNanoVector, nanosPrecision(type));
+    } else if (vector instanceof MapVector mapVector) {
+      accessor = new MapAccessor(mapVector);
+    } else if (vector instanceof ListVector listVector) {
+      accessor = new ArrayAccessor<>(listVector);
+    } else if (vector instanceof ListViewVector listViewVector) {
+      accessor = new ArrayAccessor<>(listViewVector);
+    } else if (vector instanceof StructVector structVector) {
+      if (ArrowUtils.isTimestampNanosStructField(structVector.getField())) {
+        // Lossless struct representation of a nanosecond timestamp (ArrowUtils.toArrowField with
+        // losslessInternalTypes = true): logically a scalar, so no child columns are exposed.
+        accessor = new TimestampNanosStructAccessor(structVector);
+      } else if (ArrowUtils.isCalendarIntervalStructField(structVector.getField())) {
+        // Lossless struct representation of a CalendarInterval: also logically a scalar.
+        accessor = new CalendarIntervalStructAccessor(structVector);
+      } else {
+        accessor = new StructAccessor(structVector);
+
+        childColumns = new ArrowColumnVector[structVector.size()];
+        for (int i = 0; i < childColumns.length; ++i) {
+          childColumns[i] = new ArrowColumnVector(structVector.getVectorById(i));
+        }
+      }
+    } else if (vector instanceof NullVector nullVector) {
+      accessor = new NullAccessor(nullVector);
+    } else if (vector instanceof IntervalYearVector intervalYearVector) {
+      accessor = new IntervalYearAccessor(intervalYearVector);
+    } else if (vector instanceof DurationVector durationVector) {
+      accessor = new DurationAccessor(durationVector);
+    } else if (vector instanceof IntervalMonthDayNanoVector intervalMonthDayNanoVector) {
+      accessor = new IntervalMonthDayNanoAccessor(intervalMonthDayNanoVector);
     } else {
-      throw new UnsupportedOperationException();
+      throw new SparkUnsupportedOperationException("_LEGACY_ERROR_TEMP_3160");
     }
   }
 
-  private abstract static class ArrowVectorAccessor {
+  abstract static class ArrowVectorAccessor {
 
-    private final ValueVector vector;
+    final ValueVector vector;
 
     ArrowVectorAccessor(ValueVector vector) {
       this.vector = vector;
     }
 
-    // TODO: should be final after removing ArrayAccessor workaround
-    boolean isNullAt(int rowId) {
+    final boolean isNullAt(int rowId) {
       return vector.isNull(rowId);
     }
 
@@ -204,55 +292,63 @@ public final class ArrowColumnVector extends ColumnVector {
     }
 
     boolean getBoolean(int rowId) {
-      throw new UnsupportedOperationException();
+      throw SparkUnsupportedOperationException.apply();
     }
 
     byte getByte(int rowId) {
-      throw new UnsupportedOperationException();
+      throw SparkUnsupportedOperationException.apply();
     }
 
     short getShort(int rowId) {
-      throw new UnsupportedOperationException();
+      throw SparkUnsupportedOperationException.apply();
     }
 
     int getInt(int rowId) {
-      throw new UnsupportedOperationException();
+      throw SparkUnsupportedOperationException.apply();
     }
 
     long getLong(int rowId) {
-      throw new UnsupportedOperationException();
+      throw SparkUnsupportedOperationException.apply();
     }
 
     float getFloat(int rowId) {
-      throw new UnsupportedOperationException();
+      throw SparkUnsupportedOperationException.apply();
     }
 
     double getDouble(int rowId) {
-      throw new UnsupportedOperationException();
+      throw SparkUnsupportedOperationException.apply();
+    }
+
+    CalendarInterval getInterval(int rowId) {
+      throw SparkUnsupportedOperationException.apply();
+    }
+
+    TimestampNanosVal getTimestampNanos(int rowId) {
+      throw SparkUnsupportedOperationException.apply();
     }
 
     Decimal getDecimal(int rowId, int precision, int scale) {
-      throw new UnsupportedOperationException();
+      throw SparkUnsupportedOperationException.apply();
     }
 
     UTF8String getUTF8String(int rowId) {
-      throw new UnsupportedOperationException();
+      throw SparkUnsupportedOperationException.apply();
     }
 
     byte[] getBinary(int rowId) {
-      throw new UnsupportedOperationException();
+      throw SparkUnsupportedOperationException.apply();
     }
 
     ColumnarArray getArray(int rowId) {
-      throw new UnsupportedOperationException();
+      throw SparkUnsupportedOperationException.apply();
     }
 
     ColumnarMap getMap(int rowId) {
-      throw new UnsupportedOperationException();
+      throw SparkUnsupportedOperationException.apply();
     }
   }
 
-  private static class BooleanAccessor extends ArrowVectorAccessor {
+  static class BooleanAccessor extends ArrowVectorAccessor {
 
     private final BitVector accessor;
 
@@ -267,7 +363,7 @@ public final class ArrowColumnVector extends ColumnVector {
     }
   }
 
-  private static class ByteAccessor extends ArrowVectorAccessor {
+  static class ByteAccessor extends ArrowVectorAccessor {
 
     private final TinyIntVector accessor;
 
@@ -282,7 +378,7 @@ public final class ArrowColumnVector extends ColumnVector {
     }
   }
 
-  private static class ShortAccessor extends ArrowVectorAccessor {
+  static class ShortAccessor extends ArrowVectorAccessor {
 
     private final SmallIntVector accessor;
 
@@ -297,7 +393,7 @@ public final class ArrowColumnVector extends ColumnVector {
     }
   }
 
-  private static class IntAccessor extends ArrowVectorAccessor {
+  static class IntAccessor extends ArrowVectorAccessor {
 
     private final IntVector accessor;
 
@@ -312,7 +408,7 @@ public final class ArrowColumnVector extends ColumnVector {
     }
   }
 
-  private static class LongAccessor extends ArrowVectorAccessor {
+  static class LongAccessor extends ArrowVectorAccessor {
 
     private final BigIntVector accessor;
 
@@ -327,7 +423,7 @@ public final class ArrowColumnVector extends ColumnVector {
     }
   }
 
-  private static class FloatAccessor extends ArrowVectorAccessor {
+  static class FloatAccessor extends ArrowVectorAccessor {
 
     private final Float4Vector accessor;
 
@@ -342,7 +438,7 @@ public final class ArrowColumnVector extends ColumnVector {
     }
   }
 
-  private static class DoubleAccessor extends ArrowVectorAccessor {
+  static class DoubleAccessor extends ArrowVectorAccessor {
 
     private final Float8Vector accessor;
 
@@ -357,7 +453,38 @@ public final class ArrowColumnVector extends ColumnVector {
     }
   }
 
-  private static class DecimalAccessor extends ArrowVectorAccessor {
+  static class SmallDecimalAccessor extends ArrowVectorAccessor {
+
+    private final DecimalVector accessor;
+    private final int lowWordOffset;
+    private final int highWordOffset;
+
+    SmallDecimalAccessor(DecimalVector vector, ByteOrder byteOrder) {
+      super(vector);
+      this.accessor = vector;
+      this.lowWordOffset = byteOrder == ByteOrder.LITTLE_ENDIAN ? 0 : Long.BYTES;
+      this.highWordOffset = byteOrder == ByteOrder.LITTLE_ENDIAN ? Long.BYTES : 0;
+    }
+
+    @Override
+    final Decimal getDecimal(int rowId, int precision, int scale) {
+      if (isNullAt(rowId)) return null;
+      // Arrow stores Decimal128 values in native byte order.
+      long offset = (long) rowId * DecimalVector.TYPE_WIDTH;
+      ArrowBuf data = accessor.getDataBuffer();
+      long unscaled = data.getLong(offset + lowWordOffset);
+      long high = data.getLong(offset + highWordOffset);
+      // Preserve full-width values even when they exceed the declared source precision.
+      if (high == (unscaled >> 63)) {
+        // Keep BigDecimal-backed Decimal semantics, including checked integral conversions.
+        return Decimal.apply(
+          BigDecimal.valueOf(unscaled, accessor.getScale()), precision, scale);
+      }
+      return Decimal.apply(accessor.getObject(rowId), precision, scale);
+    }
+  }
+
+  static class DecimalAccessor extends ArrowVectorAccessor {
 
     private final DecimalVector accessor;
 
@@ -373,7 +500,7 @@ public final class ArrowColumnVector extends ColumnVector {
     }
   }
 
-  private static class StringAccessor extends ArrowVectorAccessor {
+  static class StringAccessor extends ArrowVectorAccessor {
 
     private final VarCharVector accessor;
     private final NullableVarCharHolder stringResult = new NullableVarCharHolder();
@@ -396,22 +523,87 @@ public final class ArrowColumnVector extends ColumnVector {
     }
   }
 
-  private static class BinaryAccessor extends ArrowVectorAccessor {
+  static class LargeStringAccessor extends ArrowVectorAccessor {
 
-    private final VarBinaryVector accessor;
+    private final LargeVarCharVector accessor;
+    private final NullableLargeVarCharHolder stringResult = new NullableLargeVarCharHolder();
 
-    BinaryAccessor(VarBinaryVector vector) {
+    LargeStringAccessor(LargeVarCharVector vector) {
+      super(vector);
+      this.accessor = vector;
+    }
+
+    @Override
+    final UTF8String getUTF8String(int rowId) {
+      accessor.get(rowId, stringResult);
+      if (stringResult.isSet == 0) {
+        return null;
+      } else {
+        return UTF8String.fromAddress(null,
+          stringResult.buffer.memoryAddress() + stringResult.start,
+          // A single string cannot be larger than the max integer size, so the conversion is safe
+          (int)(stringResult.end - stringResult.start));
+      }
+    }
+  }
+
+  // Covers VarBinaryVector, LargeVarBinaryVector and ViewVarBinaryVector: all of them return
+  // the value as a byte array from getObject, with a null check.
+  static class BinaryAccessor extends ArrowVectorAccessor {
+
+    private final VariableWidthFieldVector accessor;
+
+    BinaryAccessor(VariableWidthFieldVector vector) {
       super(vector);
       this.accessor = vector;
     }
 
     @Override
     final byte[] getBinary(int rowId) {
-      return accessor.getObject(rowId);
+      return (byte[]) accessor.getObject(rowId);
     }
   }
 
-  private static class DateAccessor extends ArrowVectorAccessor {
+  static class StringViewAccessor extends ArrowVectorAccessor {
+
+    private final ViewVarCharVector accessor;
+
+    StringViewAccessor(ViewVarCharVector vector) {
+      super(vector);
+      this.accessor = vector;
+    }
+
+    @Override
+    final UTF8String getUTF8String(int rowId) {
+      if (accessor.isNull(rowId)) {
+        return null;
+      }
+      // Decode the 16-byte view struct directly rather than through Arrow's
+      // NullableViewVarCharHolder: the holder's int start/end fields truncate the inline-value
+      // offset (rowId * 16 + 4) once the views buffer grows past Integer.MAX_VALUE bytes, which
+      // would silently read the wrong memory. Both branches read the value with zero copy, like
+      // the non-view string accessors.
+      ArrowBuf views = accessor.getDataBuffer();
+      long viewOffset = (long) rowId * BaseVariableWidthViewVector.ELEMENT_SIZE;
+      int length = views.getInt(viewOffset);
+      if (length <= BaseVariableWidthViewVector.INLINE_SIZE) {
+        // Short values are stored inline in the views buffer, right after the length.
+        long start = viewOffset + BaseVariableWidthViewVector.LENGTH_WIDTH;
+        return UTF8String.fromAddress(null, views.memoryAddress() + start, length);
+      } else {
+        // Long values live in one of the variadic data buffers; the view struct holds the buffer
+        // index and the offset within that buffer, after the length and a 4-byte prefix.
+        long bufferIndexOffset = viewOffset + BaseVariableWidthViewVector.LENGTH_WIDTH
+          + BaseVariableWidthViewVector.PREFIX_WIDTH;
+        int bufferIndex = views.getInt(bufferIndexOffset);
+        int start = views.getInt(bufferIndexOffset + BaseVariableWidthViewVector.BUF_INDEX_WIDTH);
+        ArrowBuf dataBuffer = accessor.getDataBuffers().get(bufferIndex);
+        return UTF8String.fromAddress(null, dataBuffer.memoryAddress() + start, length);
+      }
+    }
+  }
+
+  static class DateAccessor extends ArrowVectorAccessor {
 
     private final DateDayVector accessor;
 
@@ -426,7 +618,7 @@ public final class ArrowColumnVector extends ColumnVector {
     }
   }
 
-  private static class TimestampAccessor extends ArrowVectorAccessor {
+  static class TimestampAccessor extends ArrowVectorAccessor {
 
     private final TimeStampMicroTZVector accessor;
 
@@ -441,7 +633,7 @@ public final class ArrowColumnVector extends ColumnVector {
     }
   }
 
-  private static class TimestampNTZAccessor extends ArrowVectorAccessor {
+  static class TimestampNTZAccessor extends ArrowVectorAccessor {
 
     private final TimeStampMicroVector accessor;
 
@@ -456,25 +648,138 @@ public final class ArrowColumnVector extends ColumnVector {
     }
   }
 
-  private static class ArrayAccessor extends ArrowVectorAccessor {
+  static class TimeNanoAccessor extends ArrowVectorAccessor {
 
-    private final ListVector accessor;
-    private final ArrowColumnVector arrayData;
+    private final TimeNanoVector accessor;
 
-    ArrayAccessor(ListVector vector) {
+    TimeNanoAccessor(TimeNanoVector vector) {
       super(vector);
       this.accessor = vector;
-      this.arrayData = new ArrowColumnVector(vector.getDataVector());
     }
 
     @Override
-    final boolean isNullAt(int rowId) {
-      // TODO: Workaround if vector has all non-null values, see ARROW-1948
-      if (accessor.getValueCount() > 0 && accessor.getValidityBuffer().capacity() == 0) {
-        return false;
-      } else {
-        return super.isNullAt(rowId);
-      }
+    final long getLong(int rowId) {
+      return accessor.get(rowId);
+    }
+  }
+
+  // The vector class and its field's time zone can disagree, so accept either nanos type.
+  private static int nanosPrecision(DataType type) {
+    if (type instanceof TimestampNTZNanosType t) return t.precision();
+    if (type instanceof TimestampLTZNanosType t) return t.precision();
+    return TimestampNTZNanosType.MAX_PRECISION();
+  }
+
+  // Decodes a single int64 of epoch-nanoseconds back into the (epochMicros, nanosWithinMicro)
+  // pair. floorDiv/floorMod keep nanosWithinMicro in [0, 999] for pre-epoch (negative) values too.
+  // Below p = 9 it floors to the column precision, as foreign producers may send extra digits.
+  private static TimestampNanosVal decodeEpochNanos(long nanos, int precision) {
+    if (precision < TimestampNTZNanosType.MAX_PRECISION()) {
+      return DateTimeUtils.epochNanosToTimestampNanos(nanos, precision);
+    }
+    return TimestampNanosVal.fromTrustedRowBytes(
+      Math.floorDiv(nanos, DateTimeConstants.NANOS_PER_MICROS),
+      (short) Math.floorMod(nanos, DateTimeConstants.NANOS_PER_MICROS));
+  }
+
+  static class TimestampNTZNanosAccessor extends ArrowVectorAccessor {
+
+    private final TimeStampNanoVector accessor;
+    private final int precision;
+
+    TimestampNTZNanosAccessor(TimeStampNanoVector vector, int precision) {
+      super(vector);
+      this.accessor = vector;
+      this.precision = precision;
+    }
+
+    @Override
+    final TimestampNanosVal getTimestampNanos(int rowId) {
+      return decodeEpochNanos(accessor.get(rowId), precision);
+    }
+  }
+
+  static class TimestampLTZNanosAccessor extends ArrowVectorAccessor {
+
+    private final TimeStampNanoTZVector accessor;
+    private final int precision;
+
+    TimestampLTZNanosAccessor(TimeStampNanoTZVector vector, int precision) {
+      super(vector);
+      this.accessor = vector;
+      this.precision = precision;
+    }
+
+    @Override
+    final TimestampNanosVal getTimestampNanos(int rowId) {
+      return decodeEpochNanos(accessor.get(rowId), precision);
+    }
+  }
+
+  /**
+   * Reads the lossless struct representation of a nanosecond timestamp (epochMicros: int64,
+   * nanosWithinMicro: int16), built by ArrowUtils.toArrowField with losslessInternalTypes = true.
+   * The components are stored as-is (TimestampNanosVal's own layout), so unlike the int64
+   * epoch-nanoseconds accessors above there is no decoding arithmetic and no reduced value domain.
+   */
+  static class TimestampNanosStructAccessor extends ArrowVectorAccessor {
+
+    private final BigIntVector epochMicros;
+    private final SmallIntVector nanosWithinMicro;
+
+    TimestampNanosStructAccessor(StructVector vector) {
+      super(vector);
+      this.epochMicros = (BigIntVector) vector.getChild("epochMicros");
+      this.nanosWithinMicro = (SmallIntVector) vector.getChild("nanosWithinMicro");
+    }
+
+    @Override
+    final TimestampNanosVal getTimestampNanos(int rowId) {
+      // fromParts validates nanosWithinMicro is in [0, 999]; the write side always stores a valid
+      // TimestampNanosVal, but this format may be deserialized from stored bytes, so validate
+      // rather than trusting blindly.
+      return TimestampNanosVal.fromParts(epochMicros.get(rowId), nanosWithinMicro.get(rowId));
+    }
+  }
+
+  /**
+   * Reads the lossless struct representation of a CalendarInterval (months: int32, days: int32,
+   * microseconds: int64), built by ArrowUtils.toArrowField with losslessInternalTypes = true.
+   * The components are stored as-is, so unlike IntervalMonthDayNanoAccessor there is no unit
+   * conversion and no reduced value domain.
+   */
+  static class CalendarIntervalStructAccessor extends ArrowVectorAccessor {
+
+    private final IntVector months;
+    private final IntVector days;
+    private final BigIntVector microseconds;
+
+    CalendarIntervalStructAccessor(StructVector vector) {
+      super(vector);
+      this.months = (IntVector) vector.getChild("months");
+      this.days = (IntVector) vector.getChild("days");
+      this.microseconds = (BigIntVector) vector.getChild("microseconds");
+    }
+
+    @Override
+    final CalendarInterval getInterval(int rowId) {
+      return new CalendarInterval(months.get(rowId), days.get(rowId), microseconds.get(rowId));
+    }
+  }
+
+  // Covers ListVector and ListViewVector. ListView stores an explicit per-value offset and size
+  // (rather than ListVector's contiguous offsets), but both expose a value's element range in the
+  // data vector as [getElementStartIndex, getElementEndIndex).
+  static class ArrayAccessor<T extends BaseListVector & RepeatedValueVector>
+      extends ArrowVectorAccessor {
+
+    private final T accessor;
+    private final ArrowColumnVector arrayData;
+
+    ArrayAccessor(T vector) {
+      super(vector);
+      this.accessor = vector;
+      this.arrayData = new ArrowColumnVector(vector.getDataVector());
     }
 
     @Override
@@ -493,14 +798,14 @@ public final class ArrowColumnVector extends ColumnVector {
    * bug in the code.
    *
    */
-  private static class StructAccessor extends ArrowVectorAccessor {
+  static class StructAccessor extends ArrowVectorAccessor {
 
     StructAccessor(StructVector vector) {
       super(vector);
     }
   }
 
-  private static class MapAccessor extends ArrowVectorAccessor {
+  static class MapAccessor extends ArrowVectorAccessor {
     private final MapVector accessor;
     private final ArrowColumnVector keys;
     private final ArrowColumnVector values;
@@ -522,14 +827,14 @@ public final class ArrowColumnVector extends ColumnVector {
     }
   }
 
-  private static class NullAccessor extends ArrowVectorAccessor {
+  static class NullAccessor extends ArrowVectorAccessor {
 
     NullAccessor(NullVector vector) {
       super(vector);
     }
   }
 
-  private static class IntervalYearAccessor extends ArrowVectorAccessor {
+  static class IntervalYearAccessor extends ArrowVectorAccessor {
 
     private final IntervalYearVector accessor;
 
@@ -544,7 +849,7 @@ public final class ArrowColumnVector extends ColumnVector {
     }
   }
 
-  private static class DurationAccessor extends ArrowVectorAccessor {
+  static class DurationAccessor extends ArrowVectorAccessor {
 
     private final DurationVector accessor;
 
@@ -556,6 +861,29 @@ public final class ArrowColumnVector extends ColumnVector {
     @Override
     final long getLong(int rowId) {
       return DurationVector.get(accessor.getDataBuffer(), rowId);
+    }
+  }
+
+  static class IntervalMonthDayNanoAccessor extends ArrowVectorAccessor {
+
+    private final IntervalMonthDayNanoVector accessor;
+
+    private final NullableIntervalMonthDayNanoHolder result =
+      new NullableIntervalMonthDayNanoHolder();
+
+    IntervalMonthDayNanoAccessor(IntervalMonthDayNanoVector vector) {
+      super(vector);
+      this.accessor = vector;
+    }
+
+    @Override
+    CalendarInterval getInterval(int rowId) {
+      accessor.get(rowId, result);
+      if (result.isSet == 0) {
+        return null;
+      } else {
+        return new CalendarInterval(result.months, result.days, result.nanoseconds / 1000);
+      }
     }
   }
 }

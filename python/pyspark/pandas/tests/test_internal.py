@@ -18,16 +18,16 @@
 import pandas as pd
 
 from pyspark.pandas.internal import (
-    InternalFrame,
     SPARK_DEFAULT_INDEX_NAME,
     SPARK_INDEX_NAME_FORMAT,
+    InternalFrame,
 )
 from pyspark.pandas.utils import spark_column_equals
+from pyspark.sql.types import LongType, StructField, StructType
 from pyspark.testing.pandasutils import PandasOnSparkTestCase
-from pyspark.testing.sqlutils import SQLTestUtils
 
 
-class InternalFrameTest(PandasOnSparkTestCase, SQLTestUtils):
+class InternalFrameTestsMixin:
     def test_from_pandas(self):
         pdf = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
 
@@ -106,15 +106,38 @@ class InternalFrameTest(PandasOnSparkTestCase, SQLTestUtils):
 
         self.assert_eq(internal.to_pandas_frame, pdf)
 
+    def test_attach_distributed_column(self):
+        sdf1 = self.spark.range(10)
+        self.assert_eq(
+            InternalFrame.attach_distributed_sequence_column(sdf1, "index").schema,
+            StructType(
+                [
+                    StructField("index", LongType(), False),
+                    StructField("id", LongType(), False),
+                ]
+            ),
+        )
+
+        # zero columns
+        sdf2 = self.spark.range(10).select()
+        self.assert_eq(
+            InternalFrame.attach_distributed_sequence_column(sdf2, "index").schema,
+            StructType([StructField("index", LongType(), False)]),
+        )
+
+        # empty dataframe, zero columns
+        sdf3 = self.spark.range(10).where("id < 0").select()
+        self.assert_eq(
+            InternalFrame.attach_distributed_sequence_column(sdf3, "index").schema,
+            StructType([StructField("index", LongType(), False)]),
+        )
+
+
+class InternalFrameTests(InternalFrameTestsMixin, PandasOnSparkTestCase):
+    pass
+
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.pandas.tests.test_internal import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

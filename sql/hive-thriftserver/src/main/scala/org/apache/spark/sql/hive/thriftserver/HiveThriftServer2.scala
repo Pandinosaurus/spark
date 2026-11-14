@@ -23,17 +23,19 @@ import java.util.concurrent.atomic.AtomicBoolean
 import org.apache.hadoop.hive.common.ServerUtils
 import org.apache.hadoop.hive.conf.HiveConf
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars
+import org.apache.hive.service.auth.HiveAuthFactory.AuthTypes
 import org.apache.hive.service.cli.thrift.{ThriftBinaryCLIService, ThriftHttpCLIService}
 import org.apache.hive.service.server.HiveServer2
 
 import org.apache.spark.SparkContext
-import org.apache.spark.annotation.DeveloperApi
+import org.apache.spark.annotation.{DeveloperApi, Since}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.UI.UI_ENABLED
-import org.apache.spark.sql.SQLContext
+import org.apache.spark.sql.{SparkSession, SQLContext}
 import org.apache.spark.sql.hive.HiveUtils
 import org.apache.spark.sql.hive.thriftserver.ReflectionUtils._
 import org.apache.spark.sql.hive.thriftserver.ui._
+import org.apache.spark.sql.internal.StaticSQLConf
 import org.apache.spark.status.ElementTrackingStore
 import org.apache.spark.util.{ShutdownHookManager, Utils}
 
@@ -45,26 +47,50 @@ object HiveThriftServer2 extends Logging {
   var uiTab: Option[ThriftServerTab] = None
   var listener: HiveThriftServer2Listener = _
   var eventManager: HiveThriftServer2EventManager = _
+  val systemExitOnError = new AtomicBoolean(true)
 
   /**
    * :: DeveloperApi ::
-   * Starts a new thrift server with the given context.
+   * Starts a new thrift server with the given SparkSession.
+   *
+   * @param sparkSession SparkSession to use for the server
+   * @param exitOnError Whether to exit the JVM if HiveThriftServer2 fails to initialize. When true,
+   *                    the call logs the error and exits the JVM with exit code -1. When false, the
+   *                    call throws an exception instead.
    */
+  @Since("4.0.0")
   @DeveloperApi
-  def startWithContext(sqlContext: SQLContext): HiveThriftServer2 = {
+  def startWithSparkSession(
+      sparkSession: SparkSession,
+      exitOnError: Boolean): HiveThriftServer2 = {
+    systemExitOnError.set(exitOnError)
+
     val executionHive = HiveUtils.newClientForExecution(
-      sqlContext.sparkContext.conf,
-      sqlContext.sessionState.newHadoopConf())
+      sparkSession.sparkContext.conf,
+      sparkSession.sessionState.newHadoopConf())
 
     // Cleanup the scratch dir before starting
     ServerUtils.cleanUpScratchDir(executionHive.conf)
-    val server = new HiveThriftServer2(sqlContext)
+    val server = new HiveThriftServer2(sparkSession)
 
     server.init(executionHive.conf)
     server.start()
     logInfo("HiveThriftServer2 started")
-    createListenerAndUI(server, sqlContext.sparkContext)
+    createListenerAndUI(server, sparkSession.sparkContext)
     server
+  }
+
+  /**
+   * :: DeveloperApi ::
+   * Starts a new thrift server with the given context.
+   *
+   * @param sqlContext SQLContext to use for the server
+   */
+  @deprecated("Use startWithSparkSession instead", since = "4.0.0")
+  @Since("2.0.0")
+  @DeveloperApi
+  def startWithContext(sqlContext: SQLContext): HiveThriftServer2 = {
+    startWithSparkSession(sqlContext.sparkSession, exitOnError = true)
   }
 
   private def createListenerAndUI(server: HiveThriftServer2, sc: SparkContext): Unit = {
@@ -72,11 +98,36 @@ object HiveThriftServer2 extends Logging {
     eventManager = new HiveThriftServer2EventManager(sc)
     listener = new HiveThriftServer2Listener(kvStore, sc.conf, Some(server))
     sc.listenerBus.addToStatusQueue(listener)
-    uiTab = if (sc.getConf.get(UI_ENABLED)) {
+    uiTab = if (sc.getReadOnlyConf.get(UI_ENABLED)) {
       Some(new ThriftServerTab(new HiveThriftServer2AppStatusStore(kvStore),
         ThriftServerTab.getSparkUI(sc)))
     } else {
       None
+    }
+  }
+
+  // Sessions are impersonated on the driver (metastore calls, driver-side file system access),
+  // but executor-side data access runs as the service identity (SPARK-5159), so storage ACLs
+  // are checked against the wrong principal. Refuse rather than look like we enforce something
+  // we do not. NONE/NOSASL are exempt: they establish no verified identity (the client picks
+  // any username it likes, and doAs then impersonates that unverified name for metastore
+  // calls), so there is no security boundary for this guard to protect -- and Hive's
+  // out-of-the-box config (auth NONE, doAs true) must still start. Unrecognized auth types are
+  // left alone too: HiveAuthFactory rejects them with its own "Unsupported authentication
+  // type" error, which points at the actual problem.
+  private[thriftserver] def failIfIneffectiveDoAs(
+      hiveConf: HiveConf,
+      allowIneffectiveDoAs: Boolean): Unit = {
+    val authType = hiveConf.getVar(ConfVars.HIVE_SERVER2_AUTHENTICATION)
+    val verifyingAuthTypes =
+      AuthTypes.values().filterNot(Set(AuthTypes.NONE, AuthTypes.NOSASL)).map(_.getAuthName)
+    // getVar returns the default (NONE) when unset and "" when set empty, never null.
+    val authVerifiesUser = verifyingAuthTypes.exists(_.equalsIgnoreCase(authType))
+    if (authVerifiesUser && hiveConf.getBoolVar(ConfVars.HIVE_SERVER2_ENABLE_DOAS) &&
+        !allowIneffectiveDoAs) {
+      throw HiveThriftServerErrors.ineffectiveDoAsError(
+        ConfVars.HIVE_SERVER2_ENABLE_DOAS.varname,
+        StaticSQLConf.HIVE_THRIFT_SERVER_ALLOW_INEFFECTIVE_DOAS.key)
     }
   }
 
@@ -101,7 +152,7 @@ object HiveThriftServer2 extends Logging {
     }
 
     try {
-      startWithContext(SparkSQLEnv.sqlContext)
+      startWithContext(SparkSQLEnv.sparkSession.sqlContext)
       // If application was killed before HiveThriftServer2 start successfully then SparkSubmit
       // process can not exit, so check whether if SparkContext was stopped.
       if (SparkSQLEnv.sparkContext.stopped.get()) {
@@ -121,7 +172,7 @@ object HiveThriftServer2 extends Logging {
   }
 }
 
-private[hive] class HiveThriftServer2(sqlContext: SQLContext)
+private[hive] class HiveThriftServer2(sparkSession: SparkSession)
   extends HiveServer2
   with ReflectedCompositeService {
   // state is tracked internally so that the server only attempts to shut down if it successfully
@@ -129,12 +180,16 @@ private[hive] class HiveThriftServer2(sqlContext: SQLContext)
   private val started = new AtomicBoolean(false)
 
   override def init(hiveConf: HiveConf): Unit = {
-    val sparkSqlCliService = new SparkSQLCLIService(this, sqlContext)
+    HiveThriftServer2.failIfIneffectiveDoAs(
+      hiveConf, sparkSession.conf.get(StaticSQLConf.HIVE_THRIFT_SERVER_ALLOW_INEFFECTIVE_DOAS))
+    val sparkSqlCliService = new SparkSQLCLIService(this, sparkSession)
     setSuperField(this, "cliService", sparkSqlCliService)
     addService(sparkSqlCliService)
 
     val thriftCliService = if (isHTTPTransportMode(hiveConf)) {
-      new ThriftHttpCLIService(sparkSqlCliService)
+      val sniHostCheckEnabled = sparkSession.conf.get(
+        StaticSQLConf.HIVE_THRIFT_SERVER_HTTP_SNI_HOST_CHECK_ENABLED)
+      new ThriftHttpCLIService(sparkSqlCliService, sniHostCheckEnabled)
     } else {
       new ThriftBinaryCLIService(sparkSqlCliService)
     }

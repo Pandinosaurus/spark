@@ -18,10 +18,12 @@
 package org.apache.spark.sql.catalyst.expressions.aggregate
 
 import scala.collection.immutable.{HashMap, TreeMap}
+import scala.collection.mutable
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.trees.BinaryLike
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.catalyst.util.{GenericArrayData, TypeUtils}
 import org.apache.spark.sql.types._
 
@@ -85,21 +87,48 @@ case class PivotFirst(
 
   override val dataType: DataType = ArrayType(valueDataType)
 
-  val pivotIndex: Map[Any, Int] = if (pivotColumn.dataType.isInstanceOf[AtomicType]) {
-    HashMap(pivotColumnValues.zipWithIndex: _*)
-  } else {
-    TreeMap(pivotColumnValues.zipWithIndex: _*)(
-      TypeUtils.getInterpretedOrdering(pivotColumn.dataType))
+  private val usesTreeMap: Boolean = !TypeUtils.typeWithProperEquals(pivotColumn.dataType)
+
+  private val (pivotIndex, slotOfValue, slotValues) = {
+    val slots = new Array[Int](pivotColumnValues.length)
+    val values = mutable.ArrayBuffer.empty[Any]
+    var index: Map[Any, Int] = if (usesTreeMap) {
+      TreeMap.empty[Any, Int](TypeUtils.getInterpretedOrdering(pivotColumn.dataType))
+    } else {
+      HashMap.empty[Any, Int]
+    }
+    pivotColumnValues.zipWithIndex.foreach { case (value, i) =>
+      index.get(value) match {
+        case Some(existingSlot) =>
+          slots(i) = existingSlot
+        case None =>
+          slots(i) = values.length
+          index = index.updated(value, values.length)
+          values += value
+      }
+    }
+    (index, slots, values.toSeq)
   }
 
-  val indexSize = pivotIndex.size
+  // Null-safe lookup into pivotIndex. When pivotIndex is a TreeMap, its comparison-based lookup
+  // throws NPE on null keys. Returning -1 for null is safe on the TreeMap path because null can
+  // never be a TreeMap key (insertion would also NPE), so it can never match any pivot value.
+  // Otherwise, pivotIndex is a HashMap that handles null keys safely via hash-based lookup.
+  private def findPivotIndex(key: Any): Int = key match {
+    case null if usesTreeMap => -1
+    case _ => pivotIndex.getOrElse(key, -1)
+  }
+
+  // Values that compare as equal share a slot, so this counts distinct slots; the output has one
+  // element per entry in slotOfValue.
+  val indexSize = slotValues.length
 
   private val updateRow: (InternalRow, Int, Any) => Unit = PivotFirst.updateFunction(valueDataType)
 
   override def update(mutableAggBuffer: InternalRow, inputRow: InternalRow): Unit = {
     val pivotColValue = pivotColumn.eval(inputRow)
     // We ignore rows whose pivot column value is not in the list of pivot column values.
-    val index = pivotIndex.getOrElse(pivotColValue, -1)
+    val index = findPivotIndex(pivotColValue)
     if (index >= 0) {
       val value = valueColumn.eval(inputRow)
       if (value != null) {
@@ -130,9 +159,9 @@ case class PivotFirst(
   }
 
   override def eval(input: InternalRow): Any = {
-    val result = new Array[Any](indexSize)
-    for (i <- 0 until indexSize) {
-      result(i) = input.get(mutableAggBufferOffset + i, valueDataType)
+    val result = new Array[Any](slotOfValue.length)
+    for (i <- slotOfValue.indices) {
+      result(i) = input.get(mutableAggBufferOffset + slotOfValue(i), valueDataType)
     }
     new GenericArrayData(result)
   }
@@ -145,11 +174,11 @@ case class PivotFirst(
 
 
   override val aggBufferAttributes: Seq[AttributeReference] =
-    pivotIndex.toList.sortBy(_._2).map { kv =>
-      AttributeReference(Option(kv._1).getOrElse("null").toString, valueDataType)()
+    slotValues.map { value =>
+      AttributeReference(Option(value).getOrElse("null").toString, valueDataType)()
     }
 
-  override val aggBufferSchema: StructType = StructType.fromAttributes(aggBufferAttributes)
+  override val aggBufferSchema: StructType = DataTypeUtils.fromAttributes(aggBufferAttributes)
 
   override val inputAggBufferAttributes: Seq[AttributeReference] =
     aggBufferAttributes.map(_.newInstance())

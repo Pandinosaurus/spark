@@ -20,6 +20,15 @@ import java.util.Date
 
 import org.apache.spark.sql.execution.ui.SparkPlanGraphEdge
 
+case class Metric private[spark] (name: String, value: String)
+
+case class Node private[spark] (
+    nodeId: Long,
+    nodeName: String,
+    wholeStageCodegenId: Option[Long] = None,
+    metrics: collection.Seq[Metric],
+    desc: String = null)
+
 class ExecutionData private[spark] (
     val id: Long,
     val status: String,
@@ -30,13 +39,10 @@ class ExecutionData private[spark] (
     val runningJobIds: Seq[Int],
     val successJobIds: Seq[Int],
     val failedJobIds: Seq[Int],
-    val nodes: Seq[Node],
-    val edges: Seq[SparkPlanGraphEdge])
-
-case class Node private[spark](
-    nodeId: Long,
-    nodeName: String,
-    wholeStageCodegenId: Option[Long] = None,
-    metrics: Seq[Metric])
-
-case class Metric private[spark] (name: String, value: String)
+    val nodes: collection.Seq[Node],
+    val edges: collection.Seq[SparkPlanGraphEdge],
+    val queryId: String = null,
+    val errorMessage: String = null,
+    val rootExecutionId: Long = -1,
+    val modifiedConfigs: Map[String, String] = Map.empty,
+    val totalTaskTime: Long = -1L)

@@ -23,7 +23,7 @@ import java.util.concurrent.RejectedExecutionException
 import org.apache.hive.service.ServiceException
 import org.apache.hive.service.cli.{HiveSQLException, OperationType}
 
-import org.apache.spark.SparkThrowable
+import org.apache.spark.{ErrorMessageFormat, SparkException, SparkThrowable, SparkThrowableHelper}
 
 /**
  * Object for grouping error messages from (most) exceptions thrown during
@@ -36,11 +36,13 @@ object HiveThriftServerErrors {
       " new task for execution, please retry the operation", rejected)
   }
 
-  def runningQueryError(e: Throwable): Throwable = e match {
-    case st: SparkThrowable =>
-      val errorClassPrefix = Option(st.getErrorClass).map(e => s"[$e] ").getOrElse("")
+  def runningQueryError(e: Throwable, format: ErrorMessageFormat.Value): Throwable = e match {
+    case st: SparkThrowable if format == ErrorMessageFormat.PRETTY =>
+      val errorClassPrefix = Option(st.getCondition).map(e => s"[$e] ").getOrElse("")
       new HiveSQLException(
-        s"Error running query: ${errorClassPrefix}${st.toString}", st.getSqlState, st)
+        s"Error running query: $errorClassPrefix${st.toString}", st.getSqlState, st)
+    case st: SparkThrowable with Throwable =>
+      new HiveSQLException(SparkThrowableHelper.getMessage(st, format), st.getSqlState, st)
     case _ => new HiveSQLException(s"Error running query: ${e.toString}", e)
   }
 
@@ -64,5 +66,14 @@ object HiveThriftServerErrors {
 
   def failedToStartServiceError(serviceName: String, e: Throwable): Throwable = {
     new ServiceException(s"Failed to Start $serviceName", e)
+  }
+
+  def ineffectiveDoAsError(doAsConf: String, allowIneffectiveDoAsConf: String): Throwable = {
+    new SparkException(
+      errorClass = "HIVE_THRIFT_SERVER_INEFFECTIVE_DOAS",
+      messageParameters = Map(
+        "doAsConf" -> doAsConf,
+        "allowIneffectiveDoAsConf" -> allowIneffectiveDoAsConf),
+      cause = null)
   }
 }

@@ -19,8 +19,8 @@
 The reference implementation of usage logger using the Python standard logging library.
 """
 
-from inspect import Signature
 import logging
+from inspect import Signature
 from typing import Any, Optional
 
 
@@ -37,7 +37,7 @@ def _format_signature(signature):
     )
 
 
-class PandasOnSparkUsageLogger(object):
+class PandasOnSparkUsageLogger:
     """
     The reference implementation of usage logger.
 

@@ -18,6 +18,7 @@
 package org.apache.spark.util
 
 import java.io.FileNotFoundException
+import java.util.regex.Pattern
 
 import scala.collection.mutable
 
@@ -28,12 +29,26 @@ import org.apache.hadoop.hdfs.DistributedFileSystem
 
 import org.apache.spark._
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.metrics.source.HiveCatalogMetrics
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * Utility functions to simplify and speed-up file listing.
  */
 private[spark] object HadoopFSUtils extends Logging {
+  /**
+   * The default value of the `ignoredPathSegmentRegex` option: a regex evaluated with find
+   * semantics against each individual directory and file name during file listing. It hides names
+   * that start with '_' or '.'; see `shouldFilterOutPathName` for the carve-outs that apply
+   * regardless of the regex.
+   */
+  val DEFAULT_IGNORED_PATH_SEGMENT_REGEX = "^[._]"
+
+  /** The compiled form of [[DEFAULT_IGNORED_PATH_SEGMENT_REGEX]]. */
+  val defaultIgnoredPathSegmentRegexPattern: Pattern =
+    Pattern.compile(DEFAULT_IGNORED_PATH_SEGMENT_REGEX)
+
   /**
    * Lists a collection of paths recursively. Picks the listing strategy adaptively depending
    * on the number of paths to list.
@@ -46,6 +61,10 @@ private[spark] object HadoopFSUtils extends Logging {
    * @param filter Path filter used to exclude leaf files from result
    * @param ignoreMissingFiles Ignore missing files that happen during recursive listing
    *                           (e.g., due to race conditions)
+   * @param ignoredPathSegmentRegex Regex evaluated with find semantics against each directory and
+   *                           file name below the input paths; matching names are skipped and a
+   *                           matching directory name excludes its subtree. See
+   *                           `shouldFilterOutPathName` for the carve-outs that always apply.
    * @param ignoreLocality Whether to fetch data locality info when listing leaf files. If false,
    *                       this will return `FileStatus` without `BlockLocation` info.
    * @param parallelismThreshold The threshold to enable parallelism. If the number of input paths
@@ -62,11 +81,54 @@ private[spark] object HadoopFSUtils extends Logging {
     hadoopConf: Configuration,
     filter: PathFilter,
     ignoreMissingFiles: Boolean,
+    ignoredPathSegmentRegex: Pattern,
     ignoreLocality: Boolean,
     parallelismThreshold: Int,
     parallelismMax: Int): Seq[(Path, Seq[FileStatus])] = {
     parallelListLeafFilesInternal(sc, paths, hadoopConf, filter, isRootLevel = true,
-      ignoreMissingFiles, ignoreLocality, parallelismThreshold, parallelismMax)
+      ignoreMissingFiles, ignoredPathSegmentRegex, ignoreLocality, parallelismThreshold,
+      parallelismMax)
+  }
+
+  /**
+   * Lists a collection of paths recursively with a single API invocation.
+   * Like parallelListLeafFiles, this ignores FileNotFoundException on the given root path.
+   *
+   * This is able to be called on both driver and executors.
+   *
+   * @param path a path to list
+   * @param hadoopConf Hadoop configuration
+   * @param filter Path filter used to exclude leaf files from result
+   * @param ignoredPathSegmentRegex Regex evaluated with find semantics against each directory and
+   *                           file name below `path`; matching names are skipped. See
+   *                           `shouldFilterOutPathName` for the carve-outs that always apply.
+   * @return  the set of discovered files for the path
+   */
+  def listFiles(
+      path: Path,
+      hadoopConf: Configuration,
+      filter: PathFilter,
+      ignoredPathSegmentRegex: Pattern = defaultIgnoredPathSegmentRegexPattern)
+      : Seq[(Path, Seq[FileStatus])] = {
+    logInfo(log"Listing ${MDC(PATH, path)} with listFiles API")
+    try {
+      val prefixLength = path.toString.length
+      val remoteIter = path.getFileSystem(hadoopConf).listFiles(path, true)
+      val statues = new Iterator[LocatedFileStatus]() {
+        def next(): LocatedFileStatus = remoteIter.next
+        def hasNext: Boolean = remoteIter.hasNext
+      }.filterNot(status =>
+        shouldFilterOutPath(
+          status.getPath.toString.substring(prefixLength), ignoredPathSegmentRegex))
+        .filter(f => filter.accept(f.getPath))
+        .toArray
+      Seq((path, statues.toImmutableArraySeq))
+    } catch {
+      case _: FileNotFoundException =>
+        logWarning(log"The root directory ${MDC(PATH, path)} " +
+          log"was not found. Was it deleted very recently?")
+        Seq((path, Seq.empty[FileStatus]))
+    }
   }
 
   private def parallelListLeafFilesInternal(
@@ -76,6 +138,7 @@ private[spark] object HadoopFSUtils extends Logging {
       filter: PathFilter,
       isRootLevel: Boolean,
       ignoreMissingFiles: Boolean,
+      ignoredPathSegmentRegex: Pattern,
       ignoreLocality: Boolean,
       parallelismThreshold: Int,
       parallelismMax: Int): Seq[(Path, Seq[FileStatus])] = {
@@ -89,6 +152,7 @@ private[spark] object HadoopFSUtils extends Logging {
           filter,
           Some(sc),
           ignoreMissingFiles = ignoreMissingFiles,
+          ignoredPathSegmentRegex = ignoredPathSegmentRegex,
           ignoreLocality = ignoreLocality,
           isRootPath = isRootLevel,
           parallelismThreshold = parallelismThreshold,
@@ -97,19 +161,19 @@ private[spark] object HadoopFSUtils extends Logging {
       }
     }
 
-    logInfo(s"Listing leaf files and directories in parallel under ${paths.length} paths." +
-      s" The first several paths are: ${paths.take(10).mkString(", ")}.")
+    logInfo(log"Listing leaf files and directories in parallel under" +
+      log"${MDC(NUM_PATHS, paths.length)} paths." +
+      log" The first several paths are: ${MDC(PATHS, paths.take(10).mkString(", "))}.")
     HiveCatalogMetrics.incrementParallelListingJobCount(1)
 
     val serializableConfiguration = new SerializableConfiguration(hadoopConf)
-    val serializedPaths = paths.map(_.toString)
 
     // Set the number of parallelism to prevent following file listing from generating many tasks
     // in case of large #defaultParallelism.
     val numParallelism = Math.min(paths.size, parallelismMax)
 
     val previousJobDescription = sc.getLocalProperty(SparkContext.SPARK_JOB_DESCRIPTION)
-    val statusMap = try {
+    try {
       val description = paths.size match {
         case 0 =>
           "Listing leaf files and directories 0 paths"
@@ -119,69 +183,26 @@ private[spark] object HadoopFSUtils extends Logging {
           s"Listing leaf files and directories for $s paths:<br/>${paths(0)}, ..."
       }
       sc.setJobDescription(description)
-      sc
-        .parallelize(serializedPaths, numParallelism)
-        .mapPartitions { pathStrings =>
+      sc.parallelize(paths, numParallelism)
+        .mapPartitions { pathsEachPartition =>
           val hadoopConf = serializableConfiguration.value
-          pathStrings.map(new Path(_)).toSeq.map { path =>
+          pathsEachPartition.map { path =>
             val leafFiles = listLeafFiles(
               path = path,
               hadoopConf = hadoopConf,
               filter = filter,
               contextOpt = None, // Can't execute parallel scans on workers
               ignoreMissingFiles = ignoreMissingFiles,
+              ignoredPathSegmentRegex = ignoredPathSegmentRegex,
               ignoreLocality = ignoreLocality,
               isRootPath = isRootLevel,
               parallelismThreshold = Int.MaxValue,
               parallelismMax = 0)
             (path, leafFiles)
-          }.iterator
-        }.map { case (path, statuses) =>
-            val serializableStatuses = statuses.map { status =>
-              // Turn FileStatus into SerializableFileStatus so we can send it back to the driver
-              val blockLocations = status match {
-                case f: LocatedFileStatus =>
-                  f.getBlockLocations.map { loc =>
-                    SerializableBlockLocation(
-                      loc.getNames,
-                      loc.getHosts,
-                      loc.getOffset,
-                      loc.getLength)
-                  }
-
-                case _ =>
-                  Array.empty[SerializableBlockLocation]
-              }
-
-              SerializableFileStatus(
-                status.getPath.toString,
-                status.getLen,
-                status.isDirectory,
-                status.getReplication,
-                status.getBlockSize,
-                status.getModificationTime,
-                status.getAccessTime,
-                blockLocations)
-            }
-            (path.toString, serializableStatuses)
-        }.collect()
+          }
+        }.collect().toImmutableArraySeq
     } finally {
       sc.setJobDescription(previousJobDescription)
-    }
-
-    // turn SerializableFileStatus back to Status
-    statusMap.map { case (path, serializableStatuses) =>
-      val statuses = serializableStatuses.map { f =>
-        val blockLocations = f.blockLocations.map { loc =>
-          new BlockLocation(loc.names, loc.hosts, loc.offset, loc.length)
-        }
-        new LocatedFileStatus(
-          new FileStatus(
-            f.length, f.isDir, f.blockReplication, f.blockSize, f.modificationTime,
-            new Path(f.path)),
-          blockLocations)
-      }
-      (new Path(path), statuses)
     }
   }
 
@@ -200,6 +221,7 @@ private[spark] object HadoopFSUtils extends Logging {
       filter: PathFilter,
       contextOpt: Option[SparkContext],
       ignoreMissingFiles: Boolean,
+      ignoredPathSegmentRegex: Pattern,
       ignoreLocality: Boolean,
       isRootPath: Boolean,
       parallelismThreshold: Int,
@@ -220,7 +242,7 @@ private[spark] object HadoopFSUtils extends Logging {
           val remoteIter = fs.listLocatedStatus(path)
           new Iterator[LocatedFileStatus]() {
             def next(): LocatedFileStatus = remoteIter.next
-            def hasNext(): Boolean = remoteIter.hasNext
+            def hasNext: Boolean = remoteIter.hasNext
           }.toArray
         case _ => fs.listStatus(path)
       }
@@ -245,24 +267,34 @@ private[spark] object HadoopFSUtils extends Logging {
       // InMemoryFileIndex construction. However, it's still a net improvement to detect and
       // fail-fast on the non-root cases. For more info see the SPARK-27676 review discussion.
       case _: FileNotFoundException if isRootPath || ignoreMissingFiles =>
-        logWarning(s"The directory $path was not found. Was it deleted very recently?")
+        logWarning(log"The directory ${MDC(PATH, path)} " +
+          log"was not found. Was it deleted very recently?")
         Array.empty[FileStatus]
+      case u: UnsupportedOperationException =>
+        throw new SparkUnsupportedOperationException(
+          errorClass = "FAILED_READ_FILE.UNSUPPORTED_FILE_SYSTEM",
+          messageParameters = Map(
+            "path" -> path.toString,
+            "fileSystemClass" -> fs.getClass.getName,
+            "method" -> u.getStackTrace.head.getMethodName))
     }
 
     val filteredStatuses =
-      statuses.filterNot(status => shouldFilterOutPathName(status.getPath.getName))
+      statuses.filterNot(status =>
+        shouldFilterOutPathName(status.getPath.getName, ignoredPathSegmentRegex))
 
     val allLeafStatuses = {
       val (dirs, topLevelFiles) = filteredStatuses.partition(_.isDirectory)
-      val nestedFiles: Seq[FileStatus] = contextOpt match {
-        case Some(context) if dirs.size > parallelismThreshold =>
+      val filteredNestedFiles: Seq[FileStatus] = contextOpt match {
+        case Some(context) if dirs.length > parallelismThreshold =>
           parallelListLeafFilesInternal(
             context,
-            dirs.map(_.getPath),
+            dirs.map(_.getPath).toImmutableArraySeq,
             hadoopConf = hadoopConf,
             filter = filter,
             isRootLevel = false,
             ignoreMissingFiles = ignoreMissingFiles,
+            ignoredPathSegmentRegex = ignoredPathSegmentRegex,
             ignoreLocality = ignoreLocality,
             parallelismThreshold = parallelismThreshold,
             parallelismMax = parallelismMax
@@ -275,14 +307,19 @@ private[spark] object HadoopFSUtils extends Logging {
               filter = filter,
               contextOpt = contextOpt,
               ignoreMissingFiles = ignoreMissingFiles,
+              ignoredPathSegmentRegex = ignoredPathSegmentRegex,
               ignoreLocality = ignoreLocality,
               isRootPath = false,
               parallelismThreshold = parallelismThreshold,
               parallelismMax = parallelismMax)
-          }
+          }.toImmutableArraySeq
       }
-      val allFiles = topLevelFiles ++ nestedFiles
-      if (filter != null) allFiles.filter(f => filter.accept(f.getPath)) else allFiles
+      val filteredTopLevelFiles = if (filter != null) {
+        topLevelFiles.filter(f => filter.accept(f.getPath))
+      } else {
+        topLevelFiles
+      }
+      filteredTopLevelFiles ++ filteredNestedFiles
     }
 
     val missingFiles = mutable.ArrayBuffer.empty[String]
@@ -313,7 +350,8 @@ private[spark] object HadoopFSUtils extends Logging {
             }
           }
           val lfs = new LocatedFileStatus(f.getLen, f.isDirectory, f.getReplication, f.getBlockSize,
-            f.getModificationTime, 0, null, null, null, null, f.getPath, locations)
+            f.getModificationTime, 0, null, null, null, null, f.getPath,
+            f.hasAcl, f.isEncrypted, f.isErasureCoded, locations)
           if (f.isSymlink) {
             lfs.setSymlink(f.getSymlink)
           }
@@ -328,43 +366,43 @@ private[spark] object HadoopFSUtils extends Logging {
     }
 
     if (missingFiles.nonEmpty) {
-      logWarning(
-        s"the following files were missing during file scan:\n  ${missingFiles.mkString("\n  ")}")
+      logWarning(log"the following files were missing during file scan:\n  " +
+        log"${MDC(PATHS, missingFiles.mkString("\n  "))}")
     }
 
-    resolvedLeafStatuses
+    resolvedLeafStatuses.toImmutableArraySeq
   }
   // scalastyle:on argcount
 
-  /** A serializable variant of HDFS's BlockLocation. This is required by Hadoop 2.7. */
-  private case class SerializableBlockLocation(
-    names: Array[String],
-    hosts: Array[String],
-    offset: Long,
-    length: Long)
-
-  /** A serializable variant of HDFS's FileStatus. This is required by Hadoop 2.7. */
-  private case class SerializableFileStatus(
-    path: String,
-    length: Long,
-    isDir: Boolean,
-    blockReplication: Short,
-    blockSize: Long,
-    modificationTime: Long,
-    accessTime: Long,
-    blockLocations: Array[SerializableBlockLocation])
-
-  /** Checks if we should filter out this path name. */
-  def shouldFilterOutPathName(pathName: String): Boolean = {
-    // We filter follow paths:
-    // 1. everything that starts with _ and ., except _common_metadata and _metadata
-    // because Parquet needs to find those metadata files from leaf files returned by this method.
+  /**
+   * Checks if we should filter out this path name, i.e. whether `ignoredPathSegmentRegex` finds a
+   * match in it. Regardless of the regex, names starting with `_common_metadata` or `_metadata`
+   * are never filtered, names ending with `._COPYING_` are always filtered, and '_'-prefixed
+   * names containing '=' (partition directories) are never filtered.
+   */
+  def shouldFilterOutPathName(
+      pathName: String,
+      ignoredPathSegmentRegex: Pattern = defaultIgnoredPathSegmentRegexPattern): Boolean = {
+    // Parquet summary files must stay visible to listing regardless of the filter, because
+    // Parquet needs to find those metadata files from leaf files returned by this method.
     // We should refactor this logic to not mix metadata files with data files.
-    // 2. everything that ends with `._COPYING_`, because this is a intermediate state of file. we
-    // should skip this file in case of double reading.
-    val exclude = (pathName.startsWith("_") && !pathName.contains("=")) ||
-      pathName.startsWith(".") || pathName.endsWith("._COPYING_")
-    val include = pathName.startsWith("_common_metadata") || pathName.startsWith("_metadata")
-    exclude && !include
+    if (pathName.startsWith("_common_metadata") || pathName.startsWith("_metadata")) return false
+    // In-flight copy files (hadoop fs -put) are always skipped to avoid double reads.
+    if (pathName.endsWith("._COPYING_")) return true
+    // '_'-prefixed names containing '=' are partition directories, never hidden.
+    if (pathName.startsWith("_") && pathName.contains("=")) return false
+    ignoredPathSegmentRegex.matcher(pathName).find()
+  }
+
+  /**
+   * Checks if we should filter out this path, i.e. whether any of its individual directory or
+   * file name components below the listed base path is filtered by `ignoredPathSegmentRegex`
+   * according to [[shouldFilterOutPathName]].
+   */
+  def shouldFilterOutPath(
+      path: String,
+      ignoredPathSegmentRegex: Pattern = defaultIgnoredPathSegmentRegexPattern): Boolean = {
+    path.split("/").exists(name =>
+      name.nonEmpty && shouldFilterOutPathName(name, ignoredPathSegmentRegex))
   }
 }

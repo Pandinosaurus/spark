@@ -18,15 +18,19 @@
 package org.apache.spark.sql.execution.datasources
 
 import scala.collection.mutable
+import scala.util.control.NonFatal
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs._
 import org.apache.hadoop.mapred.{FileInputFormat, JobConf}
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys.{COUNT, ELAPSED_TIME}
 import org.apache.spark.metrics.source.HiveCatalogMetrics
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.execution.streaming.FileStreamSink
+import org.apache.spark.sql.catalyst.FileSourceOptions
+import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
+import org.apache.spark.sql.execution.streaming.sinks.FileStreamSink
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.HadoopFSUtils
 
@@ -99,7 +103,8 @@ class InMemoryFileIndex(
   }
 
   override def equals(other: Any): Boolean = other match {
-    case hdfs: InMemoryFileIndex => rootPaths.toSet == hdfs.rootPaths.toSet
+    case hdfs: InMemoryFileIndex if rootPaths.size == hdfs.rootPaths.size =>
+      rootPaths.sorted == hdfs.rootPaths.sorted
     case _ => false
   }
 
@@ -116,26 +121,33 @@ class InMemoryFileIndex(
     val startTime = System.nanoTime()
     val output = mutable.LinkedHashSet[FileStatus]()
     val pathsToFetch = mutable.ArrayBuffer[Path]()
+    // The file status cache is keyed by path only, so cached entries must always hold the
+    // default-filtered listing. Bypass the cache when a non-default ignoredPathSegmentRegex is in
+    // effect, to neither serve nor store listings produced with a different filter.
+    val useFileStatusCache =
+      ignoredPathSegmentRegex == HadoopFSUtils.DEFAULT_IGNORED_PATH_SEGMENT_REGEX
     for (path <- paths) {
-      fileStatusCache.getLeafFiles(path) match {
+      val cachedFiles = if (useFileStatusCache) fileStatusCache.getLeafFiles(path) else None
+      cachedFiles match {
         case Some(files) =>
           HiveCatalogMetrics.incrementFileCacheHits(files.length)
           output ++= files
         case None =>
           pathsToFetch += path
       }
-      () // for some reasons scalac 2.12 needs this; return type doesn't matter
     }
     val filter = FileInputFormat.getInputPathFilter(new JobConf(hadoopConf, this.getClass))
     val discovered = InMemoryFileIndex.bulkListLeafFiles(
-      pathsToFetch.toSeq, hadoopConf, filter, sparkSession)
+      pathsToFetch.toSeq, hadoopConf, filter, sparkSession, parameters)
     discovered.foreach { case (path, leafFiles) =>
       HiveCatalogMetrics.incrementFilesDiscovered(leafFiles.size)
-      fileStatusCache.putLeafFiles(path, leafFiles.toArray)
+      if (useFileStatusCache) {
+        fileStatusCache.putLeafFiles(path, leafFiles.toArray)
+      }
       output ++= leafFiles
     }
-    logInfo(s"It took ${(System.nanoTime() - startTime) / (1000 * 1000)} ms to list leaf files" +
-      s" for ${paths.length} paths.")
+    logInfo(log"It took ${MDC(ELAPSED_TIME, (System.nanoTime() - startTime) / (1000 * 1000))} ms" +
+      log" to list leaf files for ${MDC(COUNT, paths.length)} paths.")
     output
   }
 }
@@ -146,22 +158,45 @@ object InMemoryFileIndex extends Logging {
       paths: Seq[Path],
       hadoopConf: Configuration,
       filter: PathFilter,
-      sparkSession: SparkSession): Seq[(Path, Seq[FileStatus])] = {
-    HadoopFSUtils.parallelListLeafFiles(
-      sc = sparkSession.sparkContext,
-      paths = paths,
-      hadoopConf = hadoopConf,
-      filter = new PathFilterWrapper(filter),
-      ignoreMissingFiles = sparkSession.sessionState.conf.ignoreMissingFiles,
-      ignoreLocality = sparkSession.sessionState.conf.ignoreDataLocality,
-      parallelismThreshold = sparkSession.sessionState.conf.parallelPartitionDiscoveryThreshold,
-      parallelismMax = sparkSession.sessionState.conf.parallelPartitionDiscoveryParallelism)
+      sparkSession: SparkSession,
+      parameters: Map[String, String] = Map.empty): Seq[(Path, Seq[FileStatus])] = {
+    val fileSystemList =
+      sparkSession.sessionState.conf.useListFilesFileSystemList.split(",").map(_.trim)
+    val fileSourceOptions = new FileSourceOptions(CaseInsensitiveMap(parameters))
+    val ignoreMissingFiles = fileSourceOptions.ignoreMissingFiles
+    val ignoredPathSegmentRegex = fileSourceOptions.ignoredPathSegmentRegexPattern
+    val useListFiles = try {
+      val scheme = paths.head.getFileSystem(hadoopConf).getScheme
+      paths.size == 1 && fileSystemList.contains(scheme)
+    } catch {
+      case NonFatal(_) => false
+    }
+    if (useListFiles) {
+      HadoopFSUtils.listFiles(
+        path = paths.head,
+        hadoopConf = hadoopConf,
+        filter = new PathFilterWrapper(filter),
+        ignoredPathSegmentRegex = ignoredPathSegmentRegex)
+    } else {
+      HadoopFSUtils.parallelListLeafFiles(
+        sc = sparkSession.sparkContext,
+        paths = paths,
+        hadoopConf = hadoopConf,
+        filter = new PathFilterWrapper(filter),
+        ignoreMissingFiles = ignoreMissingFiles,
+        ignoredPathSegmentRegex = ignoredPathSegmentRegex,
+        ignoreLocality = sparkSession.sessionState.conf.ignoreDataLocality,
+        parallelismThreshold = sparkSession.sessionState.conf.parallelPartitionDiscoveryThreshold,
+        parallelismMax = sparkSession.sessionState.conf.parallelPartitionDiscoveryParallelism)
+    }
   }
 
 }
 
+// Delegates to the input-path filter only (with a null guard). The hidden-file filtering is owned
+// by HadoopFSUtils.listFiles / parallelListLeafFiles via their `ignoredPathSegmentRegex` argument,
+// which already evaluates the regex against every directory and file name, so re-applying it here
+// would be redundant.
 private class PathFilterWrapper(val filter: PathFilter) extends PathFilter with Serializable {
-  override def accept(path: Path): Boolean = {
-    (filter == null || filter.accept(path)) && !HadoopFSUtils.shouldFilterOutPathName(path.getName)
-  }
+  override def accept(path: Path): Boolean = filter == null || filter.accept(path)
 }

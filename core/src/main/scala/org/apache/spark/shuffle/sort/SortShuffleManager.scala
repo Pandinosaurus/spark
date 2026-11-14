@@ -19,7 +19,7 @@ package org.apache.spark.shuffle.sort
 
 import java.util.concurrent.ConcurrentHashMap
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark._
 import org.apache.spark.internal.Logging
@@ -70,15 +70,10 @@ import org.apache.spark.util.collection.OpenHashSet
  *
  * For more details on these optimizations, see SPARK-7081.
  */
-private[spark] class SortShuffleManager(conf: SparkConf) extends ShuffleManager with Logging {
+private[spark] class SortShuffleManager(conf: SparkConf)
+  extends BlockingShuffleManager with Logging {
 
   import SortShuffleManager._
-
-  if (!conf.getBoolean("spark.shuffle.spill", true)) {
-    logWarning(
-      "spark.shuffle.spill was set to false, but this configuration is ignored as of Spark 1.6+." +
-        " Shuffle will continue to spill to disk when necessary.")
-  }
 
   /**
    * A mapping from shuffle ids to the task ids of mappers producing output for those shuffles.
@@ -87,7 +82,8 @@ private[spark] class SortShuffleManager(conf: SparkConf) extends ShuffleManager 
 
   private lazy val shuffleExecutorComponents = loadShuffleExecutorComponents(conf)
 
-  override val shuffleBlockResolver = new IndexShuffleBlockResolver(conf)
+  override val shuffleBlockResolver =
+    new IndexShuffleBlockResolver(conf, taskIdMapsForShuffle = taskIdMapsForShuffle)
 
   /**
    * Obtains a [[ShuffleHandle]] to pass to tasks.
@@ -131,7 +127,7 @@ private[spark] class SortShuffleManager(conf: SparkConf) extends ShuffleManager 
       metrics: ShuffleReadMetricsReporter): ShuffleReader[K, C] = {
     val baseShuffleHandle = handle.asInstanceOf[BaseShuffleHandle[K, _, C]]
     val (blocksByAddress, canEnableBatchFetch) =
-      if (baseShuffleHandle.dependency.shuffleMergeEnabled) {
+      if (baseShuffleHandle.dependency.isShuffleMergeFinalizedMarked) {
         val res = SparkEnv.get.mapOutputTracker.getPushBasedShuffleMapSizesByExecutorId(
           handle.shuffleId, startMapIndex, endMapIndex, startPartition, endPartition)
         (res.iter, res.enableBatchFetch)
@@ -176,15 +172,17 @@ private[spark] class SortShuffleManager(conf: SparkConf) extends ShuffleManager 
           metrics,
           shuffleExecutorComponents)
       case other: BaseShuffleHandle[K @unchecked, V @unchecked, _] =>
-        new SortShuffleWriter(other, mapId, context, shuffleExecutorComponents)
+        new SortShuffleWriter(other, mapId, context, metrics, shuffleExecutorComponents)
     }
   }
 
   /** Remove a shuffle's metadata from the ShuffleManager. */
   override def unregisterShuffle(shuffleId: Int): Boolean = {
     Option(taskIdMapsForShuffle.remove(shuffleId)).foreach { mapTaskIds =>
-      mapTaskIds.iterator.foreach { mapTaskId =>
-        shuffleBlockResolver.removeDataByMap(shuffleId, mapTaskId)
+      mapTaskIds.synchronized {
+        mapTaskIds.iterator.foreach { mapTaskId =>
+          shuffleBlockResolver.removeDataByMap(shuffleId, mapTaskId)
+        }
       }
     }
     true

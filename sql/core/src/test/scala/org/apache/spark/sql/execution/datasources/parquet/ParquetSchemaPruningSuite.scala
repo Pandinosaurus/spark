@@ -24,6 +24,7 @@ import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.datasources.SchemaPruningSuite
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 import org.apache.spark.sql.execution.datasources.v2.parquet.ParquetScan
+import org.apache.spark.sql.functions.{col, udf}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.tags.ExtendedSQLTest
 
@@ -31,6 +32,8 @@ abstract class ParquetSchemaPruningSuite extends SchemaPruningSuite with Adaptiv
   override protected val dataSourceName: String = "parquet"
   override protected val vectorizedReaderEnabledKey: String =
     SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key
+  override protected val vectorizedReaderNestedEnabledKey: String =
+    SQLConf.PARQUET_VECTORIZED_READER_NESTED_COLUMN_ENABLED.key
 
 }
 
@@ -40,6 +43,23 @@ class ParquetV1SchemaPruningSuite extends ParquetSchemaPruningSuite {
     super
       .sparkConf
       .set(SQLConf.USE_V1_SOURCE_LIST, "parquet")
+
+  test("SPARK-59171: SchemaPruning is idempotent with metadata and a filtered variant") {
+    withTempPath { path =>
+      spark.range(10)
+        .selectExpr("parse_json(cast(id as string)) as v")
+        .write.parquet(path.getCanonicalPath)
+
+      val alwaysTrue = udf(() => true).asNondeterministic()
+      val query = spark.read.parquet(path.getCanonicalPath)
+        .where("v::int = 3")
+        .select(col("_metadata.file_path"))
+        .filter(alwaysTrue())
+        .distinct()
+
+      assert(query.collect().nonEmpty)
+    }
+  }
 }
 
 @ExtendedSQLTest

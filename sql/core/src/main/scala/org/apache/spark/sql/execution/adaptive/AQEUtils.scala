@@ -17,11 +17,33 @@
 
 package org.apache.spark.sql.execution.adaptive
 
-import org.apache.spark.sql.catalyst.plans.physical.{Distribution, HashClusteredDistribution, HashPartitioning, UnspecifiedDistribution}
-import org.apache.spark.sql.execution.{CollectMetricsExec, FilterExec, ProjectExec, SortExec, SparkPlan}
+import scala.collection.mutable
+
+import org.apache.spark.sql.catalyst.plans.physical.{ClusteredDistribution, Distribution, HashPartitioning, UnspecifiedDistribution}
+import org.apache.spark.sql.execution.{CollectMetricsExec, DeserializeToObjectExec, FilterExec, ProjectExec, SortExec, SparkPlan}
 import org.apache.spark.sql.execution.exchange.{REPARTITION_BY_COL, REPARTITION_BY_NUM, ShuffleExchangeExec}
 
 object AQEUtils {
+
+  /**
+   * Canonical shuffle forms occurring more than once in the current plan, its shuffle query
+   * stages, and visible subquery plans. Stages contribute their pre-optimization canonical form.
+   * Adaptive subquery plans are opaque to this walk, so their internal exchanges are not counted.
+   */
+  private[adaptive] def duplicatedShuffleForms(plan: SparkPlan): Set[SparkPlan] = {
+    val counts = mutable.HashMap.empty[SparkPlan, Int]
+    def count(canonical: SparkPlan): Unit = {
+      counts.update(canonical, counts.getOrElse(canonical, 0) + 1)
+    }
+    def visit(p: SparkPlan): Unit = p.foreach {
+      case exchange: ShuffleExchangeExec => count(exchange.canonicalized)
+      case stage: ShuffleQueryStageExec => count(stage.canonicalized)
+      case _ =>
+    }
+    visit(plan)
+    plan.subqueriesAll.foreach(visit)
+    counts.collect { case (exchange, copies) if copies > 1 => exchange }.toSet
+  }
 
   // Analyze the given plan and calculate the required distribution of this plan w.r.t. the
   // user-specified repartition.
@@ -30,21 +52,22 @@ object AQEUtils {
     // Project/Filter/LocalSort/CollectMetrics.
     // Note: we only care about `HashPartitioning` as `EnsureRequirements` can only optimize out
     // user-specified repartition with `HashPartitioning`.
-    case ShuffleExchangeExec(h: HashPartitioning, _, shuffleOrigin)
+    case ShuffleExchangeExec(h: HashPartitioning, _, shuffleOrigin, _, _)
         if shuffleOrigin == REPARTITION_BY_COL || shuffleOrigin == REPARTITION_BY_NUM =>
       val numPartitions = if (shuffleOrigin == REPARTITION_BY_NUM) {
         Some(h.numPartitions)
       } else {
         None
       }
-      Some(HashClusteredDistribution(h.expressions, numPartitions))
+      Some(ClusteredDistribution(h.expressions, requiredNumPartitions = numPartitions))
     case f: FilterExec => getRequiredDistribution(f.child)
     case s: SortExec if !s.global => getRequiredDistribution(s.child)
     case c: CollectMetricsExec => getRequiredDistribution(c.child)
+    case d: DeserializeToObjectExec => getRequiredDistribution(d.child)
     case p: ProjectExec =>
       getRequiredDistribution(p.child).flatMap {
-        case h: HashClusteredDistribution =>
-          if (h.expressions.forall(e => p.projectList.exists(_.semanticEquals(e)))) {
+        case h: ClusteredDistribution =>
+          if (h.allClusterKeysAmong(p.projectList)) {
             Some(h)
           } else {
             // It's possible that the user-specified repartition is effective but the output

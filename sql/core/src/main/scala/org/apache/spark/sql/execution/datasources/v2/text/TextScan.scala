@@ -16,16 +16,17 @@
  */
 package org.apache.spark.sql.execution.datasources.v2.text
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.connector.read.PartitionReaderFactory
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.datasources.PartitioningAwareFileIndex
 import org.apache.spark.sql.execution.datasources.text.TextOptions
-import org.apache.spark.sql.execution.datasources.v2.TextBasedFileScan
+import org.apache.spark.sql.execution.datasources.v2.{RuntimePartitionPruningFileScan, TextBasedFileScan}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.util.SerializableConfiguration
@@ -39,10 +40,16 @@ case class TextScan(
     options: CaseInsensitiveStringMap,
     partitionFilters: Seq[Expression] = Seq.empty,
     dataFilters: Seq[Expression] = Seq.empty)
-  extends TextBasedFileScan(sparkSession, options) {
+  extends TextBasedFileScan(sparkSession, options) with RuntimePartitionPruningFileScan {
 
   private val optionsAsScala = options.asScala.toMap
   private lazy val textOptions: TextOptions = new TextOptions(optionsAsScala)
+
+  private def verifyReadSchema(schema: StructType): Unit = {
+    if (schema.size > 1) {
+      throw QueryCompilationErrors.textDataSourceWithMultiColumnsError(schema)
+    }
+  }
 
   override def isSplitable(path: Path): Boolean = {
     super.isSplitable(path) && !textOptions.wholeText
@@ -58,17 +65,11 @@ case class TextScan(
   }
 
   override def createReaderFactory(): PartitionReaderFactory = {
-    assert(
-      readDataSchema.length <= 1,
-      "Text data source only produces a single data column named \"value\".")
-    val hadoopConf = {
-      val caseSensitiveMap = options.asCaseSensitiveMap.asScala.toMap
-      // Hadoop Configurations are case sensitive.
-      sparkSession.sessionState.newHadoopConfWithOptions(caseSensitiveMap)
-    }
-    val broadcastedConf = sparkSession.sparkContext.broadcast(
-      new SerializableConfiguration(hadoopConf))
-    TextPartitionReaderFactory(sparkSession.sessionState.conf, broadcastedConf, readDataSchema,
+    verifyReadSchema(readDataSchema)
+    val hadoopConf = newReadHadoopConf()
+    val broadcastedConf =
+      SerializableConfiguration.broadcast(sparkSession.sparkContext, hadoopConf)
+    TextPartitionReaderFactory(conf, broadcastedConf, readDataSchema,
       readPartitionSchema, textOptions)
   }
 

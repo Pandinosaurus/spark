@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution.datasources
 
 import java.io.{File, FileNotFoundException}
 import java.net.URI
+import java.time.LocalDateTime
 
 import scala.collection.mutable
 import scala.concurrent.duration._
@@ -29,15 +30,16 @@ import org.apache.hadoop.fs.viewfs.ViewFileSystem
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito.{mock, when}
 
-import org.apache.spark.SparkException
+import org.apache.spark.{SparkException, SparkRuntimeException}
 import org.apache.spark.metrics.source.HiveCatalogMetrics
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{AnalysisException, Row, SparkSession}
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.util._
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
 import org.apache.spark.sql.test.SharedSparkSession
-import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructType}
-import org.apache.spark.util.KnownSizeEstimation
+import org.apache.spark.sql.types.{ByteType, DateType, DecimalType, IntegerType, ShortType, StringType, StructField, StructType, TimestampNTZType, TimestampType, TimeType}
+import org.apache.spark.util.{HadoopFSUtils, KnownSizeEstimation}
 
 class FileIndexSuite extends SharedSparkSession {
 
@@ -112,7 +114,7 @@ class FileIndexSuite extends SharedSparkSession {
       }
 
       withSQLConf(SQLConf.CASE_SENSITIVE.key -> "true") {
-        val msg = intercept[AssertionError] {
+        val msg = intercept[SparkRuntimeException] {
           val fileIndex = new InMemoryFileIndex(spark, Seq(path), Map.empty, None)
           fileIndex.partitionSpec()
         }.getMessage
@@ -133,10 +135,13 @@ class FileIndexSuite extends SharedSparkSession {
       val schema = StructType(Seq(StructField("a", IntegerType, false)))
       withSQLConf(SQLConf.VALIDATE_PARTITION_COLUMNS.key -> "true") {
         val fileIndex = new InMemoryFileIndex(spark, Seq(path), Map.empty, Some(schema))
-        val msg = intercept[RuntimeException] {
-          fileIndex.partitionSpec()
-        }.getMessage
-        assert(msg == "Failed to cast value `foo` to `IntegerType` for partition column `a`")
+        checkError(
+          exception = intercept[SparkRuntimeException] {
+            fileIndex.partitionSpec()
+          },
+          condition = "INVALID_PARTITION_VALUE",
+          parameters = Map("value" -> "'foo'", "dataType" -> "\"INT\"", "columnName" -> "`a`")
+        )
       }
 
       withSQLConf(SQLConf.VALIDATE_PARTITION_COLUMNS.key -> "false") {
@@ -144,6 +149,126 @@ class FileIndexSuite extends SharedSparkSession {
         val partitionValues = fileIndex.partitionSpec().partitions.map(_.values)
         assert(partitionValues.length == 1 && partitionValues(0).numFields == 1 &&
           partitionValues(0).isNullAt(0))
+      }
+    }
+  }
+
+  test("SPARK-60797: validate decimal partition values regardless of ANSI mode") {
+    // These values overflow the declared precision and are not a number, respectively.
+    for (value <- Seq("1234.5", "foo"); ansiEnabled <- Seq("true", "false")) {
+      withTempDir { dir =>
+        val partitionDirectory = new File(dir, s"a=$value")
+        partitionDirectory.mkdir()
+        stringToFile(new File(partitionDirectory, "text.txt"), "text")
+        val path = new Path(dir.getCanonicalPath)
+        val schema = StructType(Seq(StructField("a", DecimalType(5, 2), false)))
+        withSQLConf(
+          SQLConf.ANSI_ENABLED.key -> ansiEnabled,
+          SQLConf.VALIDATE_PARTITION_COLUMNS.key -> "true") {
+          val fileIndex = new InMemoryFileIndex(spark, Seq(path), Map.empty, Some(schema))
+          checkError(
+            exception = intercept[SparkRuntimeException] {
+              fileIndex.partitionSpec()
+            },
+            condition = "INVALID_PARTITION_VALUE",
+            parameters = Map(
+              "value" -> s"'$value'",
+              "dataType" -> "\"DECIMAL(5,2)\"",
+              "columnName" -> "`a`"))
+        }
+        withSQLConf(
+          SQLConf.ANSI_ENABLED.key -> ansiEnabled,
+          SQLConf.VALIDATE_PARTITION_COLUMNS.key -> "false") {
+          val fileIndex = new InMemoryFileIndex(spark, Seq(path), Map.empty, Some(schema))
+          val partitionValues = fileIndex.partitionSpec().partitions.map(_.values)
+          assert(partitionValues.length == 1 && partitionValues(0).isNullAt(0))
+        }
+      }
+    }
+  }
+
+  test("SPARK-60818: validate partition values out of the range of TINYINT and SMALLINT") {
+    for ((dataType, value) <- Seq(ByteType -> "300", ShortType -> "70000")) {
+      withTempDir { dir =>
+        val partitionDirectory = new File(dir, s"a=$value")
+        partitionDirectory.mkdir()
+        stringToFile(new File(partitionDirectory, "text.txt"), "text")
+        val path = new Path(dir.getCanonicalPath)
+        val schema = StructType(Seq(StructField("a", dataType, false)))
+        withSQLConf(SQLConf.VALIDATE_PARTITION_COLUMNS.key -> "true") {
+          val fileIndex = new InMemoryFileIndex(spark, Seq(path), Map.empty, Some(schema))
+          checkError(
+            exception = intercept[SparkRuntimeException] {
+              fileIndex.partitionSpec()
+            },
+            condition = "INVALID_PARTITION_VALUE",
+            parameters = Map(
+              "value" -> s"'$value'",
+              "dataType" -> s"\"${dataType.sql}\"",
+              "columnName" -> "`a`"))
+        }
+        withSQLConf(SQLConf.VALIDATE_PARTITION_COLUMNS.key -> "false") {
+          val fileIndex = new InMemoryFileIndex(spark, Seq(path), Map.empty, Some(schema))
+          val partitionValues = fileIndex.partitionSpec().partitions.map(_.values)
+          assert(partitionValues.length == 1 && partitionValues(0).isNullAt(0))
+        }
+      }
+    }
+  }
+
+  test("SPARK-60825: validate datetime partition values regardless of ANSI mode") {
+    // A TIMESTAMP_NTZ value with a valid date and an invalid time must not become the start of
+    // that day.
+    val cases = Seq(
+      DateType -> "foo",
+      TimeType(6) -> "foo",
+      TimestampType -> "foo",
+      TimestampNTZType -> "2020-01-01 25%3A00%3A00")
+    for ((dataType, value) <- cases; ansiEnabled <- Seq("true", "false")) {
+      withTempDir { dir =>
+        val partitionDirectory = new File(dir, s"a=$value")
+        partitionDirectory.mkdir()
+        stringToFile(new File(partitionDirectory, "text.txt"), "text")
+        val path = new Path(dir.getCanonicalPath)
+        val schema = StructType(Seq(StructField("a", dataType, false)))
+        withSQLConf(
+          SQLConf.ANSI_ENABLED.key -> ansiEnabled,
+          SQLConf.VALIDATE_PARTITION_COLUMNS.key -> "true") {
+          val fileIndex = new InMemoryFileIndex(spark, Seq(path), Map.empty, Some(schema))
+          checkError(
+            exception = intercept[SparkRuntimeException] {
+              fileIndex.partitionSpec()
+            },
+            condition = "INVALID_PARTITION_VALUE",
+            parameters = Map(
+              "value" -> s"'$value'",
+              "dataType" -> s"\"${dataType.sql}\"",
+              "columnName" -> "`a`"))
+        }
+        withSQLConf(
+          SQLConf.ANSI_ENABLED.key -> ansiEnabled,
+          SQLConf.VALIDATE_PARTITION_COLUMNS.key -> "false") {
+          val fileIndex = new InMemoryFileIndex(spark, Seq(path), Map.empty, Some(schema))
+          val partitionValues = fileIndex.partitionSpec().partitions.map(_.values)
+          assert(partitionValues.length == 1 && partitionValues(0).isNullAt(0))
+        }
+      }
+    }
+
+    // A date without a time is a valid timestamp.
+    withTempDir { dir =>
+      val partitionDirectory = new File(dir, "a=2020-01-01")
+      partitionDirectory.mkdir()
+      stringToFile(new File(partitionDirectory, "text.txt"), "text")
+      val path = new Path(dir.getCanonicalPath)
+      val schema = StructType(Seq(StructField("a", TimestampNTZType, false)))
+      val midnight = DateTimeUtils.localDateTimeToMicros(LocalDateTime.of(2020, 1, 1, 0, 0))
+      for (ansiEnabled <- Seq("true", "false")) {
+        withSQLConf(SQLConf.ANSI_ENABLED.key -> ansiEnabled) {
+          val fileIndex = new InMemoryFileIndex(spark, Seq(path), Map.empty, Some(schema))
+          val partitionValues = fileIndex.partitionSpec().partitions.map(_.values)
+          assert(partitionValues.length == 1 && partitionValues(0).getLong(0) == midnight)
+        }
       }
     }
   }
@@ -164,11 +289,11 @@ class FileIndexSuite extends SharedSparkSession {
 
       val catalog1 = new InMemoryFileIndex(
         spark, Seq(unqualifiedDirPath), Map.empty, None)
-      assert(catalog1.allFiles.map(_.getPath) === Seq(qualifiedFilePath))
+      assert(catalog1.allFiles().map(_.getPath) === Seq(qualifiedFilePath))
 
       val catalog2 = new InMemoryFileIndex(
         spark, Seq(unqualifiedFilePath), Map.empty, None)
-      assert(catalog2.allFiles.map(_.getPath) === Seq(qualifiedFilePath))
+      assert(catalog2.allFiles().map(_.getPath) === Seq(qualifiedFilePath))
 
     }
   }
@@ -191,20 +316,28 @@ class FileIndexSuite extends SharedSparkSession {
         classOf[SubdirectoryDeletionRaceFileSystem],
         classOf[FileDeletionRaceFileSystem]
       );
-      ignoreMissingFiles <- Seq(true, false);
+      (ignoreMissingFiles, sqlConf, options) <- Seq(
+        (true, "true", Map.empty[String, String]),
+        // Explicitly set sqlConf to false, but data source options should take precedence
+        (true, "false", Map("ignoreMissingFiles" -> "true")),
+        (false, "false", Map.empty[String, String]),
+        // Explicitly set sqlConf to true, but data source options should take precedence
+        (false, "true", Map("ignoreMissingFiles" -> "false"))
+      );
       parDiscoveryThreshold <- Seq(0, 100)
     ) {
       withClue(s"raceCondition=$raceCondition, ignoreMissingFiles=$ignoreMissingFiles, " +
-        s"parDiscoveryThreshold=$parDiscoveryThreshold"
+        s"parDiscoveryThreshold=$parDiscoveryThreshold, sqlConf=$sqlConf, options=$options"
       ) {
         withSQLConf(
-          SQLConf.IGNORE_MISSING_FILES.key -> ignoreMissingFiles.toString,
+          SQLConf.IGNORE_DATA_LOCALITY.key -> "false",
+          SQLConf.IGNORE_MISSING_FILES.key -> sqlConf,
           SQLConf.PARALLEL_PARTITION_DISCOVERY_THRESHOLD.key -> parDiscoveryThreshold.toString,
           "fs.mockFs.impl" -> raceCondition.getName,
           "fs.mockFs.impl.disable.cache" -> "true"
         ) {
           def makeCatalog(): InMemoryFileIndex = new InMemoryFileIndex(
-            spark, Seq(rootDirPath), Map.empty, None)
+            spark, Seq(rootDirPath), options, None)
           if (ignoreMissingFiles) {
             // We're ignoring missing files, so catalog construction should succeed
             val catalog = makeCatalog()
@@ -275,6 +408,22 @@ class FileIndexSuite extends SharedSparkSession {
     }
   }
 
+  test("SPARK-45452: PartitioningAwareFileIndex uses listFiles API for large child dirs") {
+    withSQLConf(SQLConf.USE_LISTFILES_FILESYSTEM_LIST.key -> "file") {
+      for (scale <- Seq(10, 50)) {
+        withTempDir { dir =>
+          for (i <- 1 to scale) {
+            new File(dir, s"foo=$i.txt").mkdir()
+          }
+          HiveCatalogMetrics.reset()
+          assert(HiveCatalogMetrics.METRIC_PARALLEL_LISTING_JOB_COUNT.getCount() == 0)
+          new InMemoryFileIndex(spark, Seq(new Path(dir.getCanonicalPath)), Map.empty, None)
+          assert(HiveCatalogMetrics.METRIC_PARALLEL_LISTING_JOB_COUNT.getCount() == 0)
+        }
+      }
+    }
+  }
+
   test("PartitioningAwareFileIndex listing parallelized with large, deeply nested child dirs") {
     for ((scale, expectedNumPar) <- Seq((10, 0), (50, 4))) {
       withTempDir { dir =>
@@ -293,6 +442,31 @@ class FileIndexSuite extends SharedSparkSession {
         assert(HiveCatalogMetrics.METRIC_PARALLEL_LISTING_JOB_COUNT.getCount() == 0)
         new InMemoryFileIndex(spark, Seq(new Path(dir.getCanonicalPath)), Map.empty, None)
         assert(HiveCatalogMetrics.METRIC_PARALLEL_LISTING_JOB_COUNT.getCount() == expectedNumPar)
+      }
+    }
+  }
+
+  test("SPARK-45452: PartitioningAwareFileIndex listing parallelized with large, deeply nested " +
+      "child dirs") {
+    withSQLConf(SQLConf.USE_LISTFILES_FILESYSTEM_LIST.key -> "file") {
+      for (scale <- Seq(10, 50)) {
+        withTempDir { dir =>
+          for (i <- 1 to 2) {
+            val subdirA = new File(dir, s"a=$i")
+            subdirA.mkdir()
+            for (j <- 1 to 2) {
+              val subdirB = new File(subdirA, s"b=$j")
+              subdirB.mkdir()
+              for (k <- 1 to scale) {
+                new File(subdirB, s"foo=$k.txt").mkdir()
+              }
+            }
+          }
+          HiveCatalogMetrics.reset()
+          assert(HiveCatalogMetrics.METRIC_PARALLEL_LISTING_JOB_COUNT.getCount() == 0)
+          new InMemoryFileIndex(spark, Seq(new Path(dir.getCanonicalPath)), Map.empty, None)
+          assert(HiveCatalogMetrics.METRIC_PARALLEL_LISTING_JOB_COUNT.getCount() == 0)
+        }
       }
     }
   }
@@ -433,7 +607,9 @@ class FileIndexSuite extends SharedSparkSession {
 
   test("SPARK-25062 - InMemoryFileIndex stores BlockLocation objects no matter what subclass " +
     "the FS returns") {
-    withSQLConf("fs.file.impl" -> classOf[SpecialBlockLocationFileSystem].getName) {
+    withSQLConf(
+        SQLConf.IGNORE_DATA_LOCALITY.key -> "false",
+        "fs.file.impl" -> classOf[SpecialBlockLocationFileSystem].getName) {
       withTempDir { dir =>
         val file = new File(dir, "text.txt")
         stringToFile(file, "text")
@@ -452,7 +628,7 @@ class FileIndexSuite extends SharedSparkSession {
       val partitionDirectory = new File(dir, "a=foo")
       partitionDirectory.mkdir()
       for (i <- 1 to 8) {
-        val file = new File(partitionDirectory, i + ".txt")
+        val file = new File(partitionDirectory, s"$i.txt")
         stringToFile(file, "text")
       }
       val path = new Path(dir.getCanonicalPath)
@@ -488,12 +664,74 @@ class FileIndexSuite extends SharedSparkSession {
             new Path("file")), Array(new BlockLocation()))
       )
     when(dfs.listLocatedStatus(path)).thenReturn(new RemoteIterator[LocatedFileStatus] {
-      val iter = statuses.toIterator
+      val iter = statuses.iterator
       override def hasNext: Boolean = iter.hasNext
-      override def next(): LocatedFileStatus = iter.next
+      override def next(): LocatedFileStatus = iter.next()
     })
-    val fileIndex = new TestInMemoryFileIndex(spark, path)
-    assert(fileIndex.leafFileStatuses.toSeq == statuses)
+    withSQLConf(SQLConf.IGNORE_DATA_LOCALITY.key -> "false") {
+      val fileIndex = new TestInMemoryFileIndex(spark, path)
+      assert(fileIndex.leafFileStatuses.toSeq == statuses)
+    }
+  }
+
+  test("SPARK-48649: Ignore invalid partitions") {
+    // Table:
+    // id   part_col
+    //  1          1
+    //  2          2
+    val df = spark.range(1, 3, 1, 2).toDF("id")
+      .withColumn("part_col", col("id"))
+
+    withTempPath { directoryPath =>
+      df.write
+        .mode("overwrite")
+        .format("parquet")
+        .partitionBy("part_col")
+        .save(directoryPath.getCanonicalPath)
+
+      // Rename one of the folders.
+      new File(directoryPath, "part_col=1").renameTo(new File(directoryPath, "undefined"))
+
+      // By default, we expect the invalid path assertion to trigger.
+      val ex = intercept[SparkRuntimeException] {
+        spark.read
+          .format("parquet")
+          .load(directoryPath.getCanonicalPath)
+          .collect()
+      }
+      assert(ex.getMessage.contains("Conflicting directory structures detected"))
+
+      // With the config enabled, we should only read the valid partition.
+      withSQLConf(SQLConf.IGNORE_INVALID_PARTITION_PATHS.key -> "true") {
+        assert(
+          spark.read
+            .format("parquet")
+            .load(directoryPath.getCanonicalPath)
+            .collect() === Seq(Row(2, 2)))
+      }
+
+      // Data source option override takes precedence.
+      withSQLConf(SQLConf.IGNORE_INVALID_PARTITION_PATHS.key -> "true") {
+        val ex = intercept[SparkRuntimeException] {
+          spark.read
+            .format("parquet")
+            .option(FileIndexOptions.IGNORE_INVALID_PARTITION_PATHS, "false")
+            .load(directoryPath.getCanonicalPath)
+            .collect()
+        }
+        assert(ex.getMessage.contains("Conflicting directory structures detected"))
+      }
+
+      // Data source option override takes precedence.
+      withSQLConf(SQLConf.IGNORE_INVALID_PARTITION_PATHS.key -> "false") {
+        assert(
+          spark.read
+            .format("parquet")
+            .option(FileIndexOptions.IGNORE_INVALID_PARTITION_PATHS, "true")
+            .load(directoryPath.getCanonicalPath)
+            .collect() === Seq(Row(2, 2)))
+      }
+    }
   }
 
   test("expire FileStatusCache if TTL is configured") {
@@ -518,6 +756,252 @@ class FileIndexSuite extends SharedSparkSession {
       }
     } finally {
       SQLConf.get.setConf(StaticSQLConf.METADATA_CACHE_TTL_SECONDS, previousValue)
+    }
+  }
+
+  test("SPARK-38182: Fix NoSuchElementException if pushed filter does not contain any " +
+    "references") {
+    withTable("t") {
+      withSQLConf(SQLConf.OPTIMIZER_EXCLUDED_RULES.key ->
+        "org.apache.spark.sql.catalyst.optimizer.BooleanSimplification") {
+
+        sql("CREATE TABLE t (c1 int) USING PARQUET")
+        assert(sql("SELECT * FROM t WHERE c1 = 1 AND 2 > 1").count() == 0)
+      }
+    }
+  }
+
+  test("SPARK-40667: validate FileIndex Options") {
+    assert(FileIndexOptions.getAllOptions.size == 9)
+    // Please add validation on any new FileIndex options here
+    assert(FileIndexOptions.isValidOption("ignoreMissingFiles"))
+    assert(FileIndexOptions.isValidOption("ignoredPathSegmentRegex"))
+    assert(FileIndexOptions.isValidOption("ignoreInvalidPartitionPaths"))
+    assert(FileIndexOptions.isValidOption("timeZone"))
+    assert(FileIndexOptions.isValidOption("recursiveFileLookup"))
+    assert(FileIndexOptions.isValidOption("basePath"))
+    assert(FileIndexOptions.isValidOption("modifiedbefore"))
+    assert(FileIndexOptions.isValidOption("modifiedafter"))
+    assert(FileIndexOptions.isValidOption("pathglobfilter"))
+  }
+
+  test("recursiveFileLookup with a user-specified partition spec is rejected") {
+    withTempDir { dir =>
+      val partitionSchema = StructType(Seq(StructField("year", IntegerType, nullable = true)))
+      val partitionSpec = PartitionSpec(
+        partitionSchema,
+        Seq(PartitionPath(InternalRow(2024), new Path(dir.getCanonicalPath))))
+      val fileIndex = new InMemoryFileIndex(
+        spark,
+        rootPathsSpecified = Seq(new Path(dir.getCanonicalPath)),
+        parameters = Map("recursiveFileLookup" -> "true"),
+        userSpecifiedSchema = None,
+        userSpecifiedPartitionSpec = Some(partitionSpec))
+      checkError(
+        exception = intercept[AnalysisException] {
+          fileIndex.listFiles(Nil, Nil)
+        },
+        condition = "RECURSIVE_FILE_LOOKUP_NOT_SUPPORTED_FOR_PARTITIONED_DATA_SOURCE",
+        parameters = Map.empty[String, String]
+      )
+    }
+  }
+
+  test("SPARK-52339: Correctly compare root paths") {
+    withTempDir { dir =>
+      val file1 = new File(dir, "text1.txt")
+      stringToFile(file1, "text1")
+      val file2 = new File(dir, "text2.txt")
+      stringToFile(file2, "text2")
+      val path1 = new Path(file1.getCanonicalPath)
+      val path2 = new Path(file2.getCanonicalPath)
+
+      val schema = StructType(Seq(StructField("a", StringType, false)))
+
+      // Verify that the order of paths doesn't matter
+      val fileIndex1a = new InMemoryFileIndex(spark, Seq(path1, path2), Map.empty, Some(schema))
+      val fileIndex1b = new InMemoryFileIndex(spark, Seq(path2, path1), Map.empty, Some(schema))
+      assert(fileIndex1a == fileIndex1b)
+
+      // Verify that a different number of paths does matter
+      val fileIndex2a = new InMemoryFileIndex(spark, Seq(path1, path1), Map.empty, Some(schema))
+      val fileIndex2b = new InMemoryFileIndex(spark, Seq(path1, path1, path1),
+        Map.empty, Some(schema))
+      assert(fileIndex2a != fileIndex2b)
+    }
+  }
+
+  test("InMemoryFileIndex: ignoredPathSegmentRegex option surfaces hidden files in allFiles()") {
+    withTempDir { dir =>
+      stringToFile(new File(dir, "data.txt"), "data")
+      stringToFile(new File(dir, "_hidden"), "hidden")
+      stringToFile(new File(dir, ".dot"), "dot")
+      stringToFile(new File(dir, "x._COPYING_"), "copying")
+      val path = new Path(dir.getCanonicalPath)
+
+      // Default: hidden files are filtered out, only the regular file is listed.
+      val defaultIndex = new InMemoryFileIndex(spark, Seq(path), Map.empty, None)
+      assert(defaultIndex.allFiles().map(_.getPath.getName).toSet === Set("data.txt"))
+
+      // With a never-matching regex, the hidden file and dot file surface, but the copying
+      // file stays hidden: the '._COPYING_' carve-out is not overridable.
+      val hiddenIndex = new InMemoryFileIndex(
+        spark, Seq(path), Map("ignoredPathSegmentRegex" -> "(?!)"), None)
+      assert(hiddenIndex.allFiles().map(_.getPath.getName).toSet ===
+        Set("data.txt", "_hidden", ".dot"))
+      assert(!hiddenIndex.allFiles().map(_.getPath.getName).contains("x._COPYING_"))
+    }
+  }
+
+  test("InMemoryFileIndex: ignoredPathSegmentRegex option controls partition dirs with hidden " +
+    "data files") {
+    withTempDir { dir =>
+      // 'part=1' holds a single hidden ('_'-prefixed) file: filtered out by default (so no
+      // partition is discovered), but surfaced and counted as data with a never-matching regex.
+      val partitionDir = new File(dir, "part=1")
+      assert(partitionDir.mkdir())
+      stringToFile(new File(partitionDir, "_data.txt"), "data")
+      val path = new Path(dir.getCanonicalPath)
+
+      // Default: the hidden data file is filtered out, so no files / partitions.
+      val defaultIndex = new InMemoryFileIndex(spark, Seq(path), Map.empty, None)
+      assert(defaultIndex.allFiles().isEmpty)
+      assert(defaultIndex.partitionSpec().partitions.isEmpty)
+
+      // With the option set, '_data.txt' is a data file (covers isDataPath) and 'part=1' is a
+      // partition directory.
+      val hiddenIndex = new InMemoryFileIndex(
+        spark, Seq(path), Map("ignoredPathSegmentRegex" -> "(?!)"), None)
+      assert(hiddenIndex.allFiles().map(_.getPath.getName).toSet === Set("_data.txt"))
+      val partitionValues = hiddenIndex.partitionSpec().partitions.map(_.values)
+      assert(partitionValues.length == 1)
+      assert(partitionValues(0).numFields == 1)
+      assert(partitionValues(0).getInt(0) == 1)
+      assert(hiddenIndex.partitionSpec().partitionColumns.fieldNames.toSeq === Seq("part"))
+    }
+  }
+
+  test("InMemoryFileIndex: ignoredPathSegmentRegex with a hidden dir next to partition dirs") {
+    withTempDir { dir =>
+      // A hidden directory holding files next to 'part=1' becomes a leaf data dir when the
+      // regex never matches, so partition discovery sees conflicting base paths.
+      val partitionDir = new File(dir, "part=1")
+      assert(partitionDir.mkdir())
+      stringToFile(new File(partitionDir, "data.txt"), "data")
+      val strayDir = new File(dir, "_stray")
+      assert(strayDir.mkdir())
+      stringToFile(new File(strayDir, "extra.txt"), "extra")
+      val path = new Path(dir.getCanonicalPath)
+
+      // Default: the hidden directory is filtered out and only the partition data is listed.
+      val defaultIndex = new InMemoryFileIndex(spark, Seq(path), Map.empty, None)
+      assert(defaultIndex.allFiles().map(_.getPath.getName).toSet === Set("data.txt"))
+      assert(defaultIndex.partitionSpec().partitionColumns.fieldNames.toSeq === Seq("part"))
+
+      // Never-matching regex: '_stray' is treated as a leaf data dir and discovered as its own
+      // base path, so partition discovery fails with conflicting directory structures.
+      val hiddenIndex = new InMemoryFileIndex(
+        spark, Seq(path), Map("ignoredPathSegmentRegex" -> "(?!)"), None)
+      val ex = intercept[SparkRuntimeException] {
+        hiddenIndex.partitionSpec()
+      }
+      assert(ex.getMessage.contains("Conflicting directory structures detected"))
+
+      // Never-matching regex + ignoreInvalidPartitionPaths=true: the invalid '_stray' base path
+      // is ignored, 'part' is still discovered, and both files surface.
+      val recoveredIndex = new InMemoryFileIndex(
+        spark,
+        Seq(path),
+        Map("ignoredPathSegmentRegex" -> "(?!)", "ignoreInvalidPartitionPaths" -> "true"),
+        None)
+      assert(recoveredIndex.partitionSpec().partitionColumns.fieldNames.toSeq === Seq("part"))
+      assert(recoveredIndex.allFiles().map(_.getPath.getName).toSet ===
+        Set("data.txt", "extra.txt"))
+    }
+  }
+
+  test("InMemoryFileIndex: ignoredPathSegmentRegex with a _SUCCESS marker next to partition dirs") {
+    withTempDir { dir =>
+      // Unlike the hidden directory above, a hidden file at the table root surfaces in the
+      // listing under a never-matching regex but does not break partition discovery:
+      // parsePartition stops at the base path, so 'part' is still inferred.
+      val partitionDir = new File(dir, "part=1")
+      assert(partitionDir.mkdir())
+      stringToFile(new File(partitionDir, "data.txt"), "data")
+      assert(new File(dir, "_SUCCESS").createNewFile())
+      val path = new Path(dir.getCanonicalPath)
+
+      val hiddenIndex = new InMemoryFileIndex(
+        spark, Seq(path), Map("ignoredPathSegmentRegex" -> "(?!)"), None)
+      assert(hiddenIndex.allFiles().map(_.getPath.getName).toSet === Set("data.txt", "_SUCCESS"))
+      assert(hiddenIndex.partitionSpec().partitionColumns.fieldNames.toSeq === Seq("part"))
+    }
+  }
+
+  test("InMemoryFileIndex: ignoredPathSegmentRegex option overrides the SQL conf") {
+    withTempDir { dir =>
+      stringToFile(new File(dir, "data.txt"), "data")
+      stringToFile(new File(dir, "_hidden"), "hidden")
+      val path = new Path(dir.getCanonicalPath)
+
+      val defaultRegex = HadoopFSUtils.DEFAULT_IGNORED_PATH_SEGMENT_REGEX
+
+      def hiddenListed(sqlConf: String, options: Map[String, String]): Boolean = {
+        withSQLConf(SQLConf.IGNORED_PATH_SEGMENT_REGEX.key -> sqlConf) {
+          val index = new InMemoryFileIndex(spark, Seq(path), options, None)
+          index.allFiles().map(_.getPath.getName).contains("_hidden")
+        }
+      }
+
+      // conf=default, option=never-matching -> option wins, hidden file listed.
+      assert(hiddenListed(defaultRegex, Map("ignoredPathSegmentRegex" -> "(?!)")))
+      // conf=never-matching, option=default -> option wins, hidden file not listed.
+      assert(!hiddenListed("(?!)", Map("ignoredPathSegmentRegex" -> defaultRegex)))
+      // conf=never-matching, no option -> conf takes effect, hidden file listed.
+      assert(hiddenListed("(?!)", Map.empty))
+      // conf=default, no option -> default, hidden file not listed.
+      assert(!hiddenListed(defaultRegex, Map.empty))
+    }
+  }
+
+  test("InMemoryFileIndex: non-default ignoredPathSegmentRegex bypasses the FileStatusCache") {
+    withTempDir { dir =>
+      stringToFile(new File(dir, "data.txt"), "data")
+      stringToFile(new File(dir, "_hidden.txt"), "hidden")
+      val path = new Path(dir.getCanonicalPath)
+      val fileStatusCache = FileStatusCache.getOrCreate(spark)
+
+      // Populate the cache with the default-filtered listing.
+      val defaultIndex = new InMemoryFileIndex(spark, Seq(path), Map.empty, None, fileStatusCache)
+      assert(defaultIndex.allFiles().map(_.getPath.getName).toSet === Set("data.txt"))
+
+      // A non-default filter over the same path and cache must not serve the cached
+      // default-filtered listing: the hidden file surfaces.
+      val hiddenIndex = new InMemoryFileIndex(
+        spark, Seq(path), Map("ignoredPathSegmentRegex" -> "(?!)"), None, fileStatusCache)
+      assert(hiddenIndex.allFiles().map(_.getPath.getName).toSet ===
+        Set("data.txt", "_hidden.txt"))
+    }
+  }
+
+  test("InMemoryFileIndex: metadata summary files are never data paths regardless of " +
+    "ignoredPathSegmentRegex") {
+    withTempDir { dir =>
+      stringToFile(new File(dir, "data.txt"), "data")
+      stringToFile(new File(dir, "_metadata"), "metadata")
+      stringToFile(new File(dir, ".dot"), "dot")
+      val path = new Path(dir.getCanonicalPath)
+
+      // Custom regex matching only dot files: '_metadata' still surfaces in the listing (the
+      // shouldFilterOutPathName carve-out is not overridable), while '.dot' stays hidden.
+      val index = new InMemoryFileIndex(
+        spark, Seq(path), Map("ignoredPathSegmentRegex" -> "^[.]"), None)
+      assert(index.allFiles().map(_.getPath.getName).toSet === Set("data.txt", "_metadata"))
+
+      // Although listed, the summary file must never be scanned as data, even when the regex
+      // does not classify it as hidden.
+      val dataFiles = index.listFiles(Nil, Nil).flatMap(_.files).map(_.getPath.getName)
+      assert(dataFiles.toSet === Set("data.txt"))
     }
   }
 }

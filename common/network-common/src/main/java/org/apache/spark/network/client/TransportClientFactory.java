@@ -19,18 +19,20 @@ package org.apache.spark.network.client;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicReference;
 
 import com.codahale.metrics.MetricSet;
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Preconditions;
-import com.google.common.base.Throwables;
-import com.google.common.collect.Lists;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.Channel;
@@ -39,9 +41,14 @@ import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import io.netty.handler.ssl.SslHandler;
+import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.GenericFutureListener;
 
+import org.apache.spark.internal.SparkLogger;
+import org.apache.spark.internal.SparkLoggerFactory;
+import org.apache.spark.internal.LogKeys;
+import org.apache.spark.internal.MDC;
 import org.apache.spark.network.TransportContext;
 import org.apache.spark.network.server.TransportChannelHandler;
 import org.apache.spark.network.util.*;
@@ -74,7 +81,8 @@ public class TransportClientFactory implements Closeable {
     }
   }
 
-  private static final Logger logger = LoggerFactory.getLogger(TransportClientFactory.class);
+  private static final SparkLogger logger =
+    SparkLoggerFactory.getLogger(TransportClientFactory.class);
 
   private final TransportContext context;
   private final TransportConf conf;
@@ -86,7 +94,27 @@ public class TransportClientFactory implements Closeable {
   private final int numConnectionsPerPeer;
 
   private final Class<? extends Channel> socketChannelClass;
-  private EventLoopGroup workerGroup;
+  private final IOMode ioMode;
+  // The client worker EventLoopGroup. A netty event-loop thread that dies (e.g. an uncaught error)
+  // is never replaced within a fixed-size group, permanently poisoning any channel pinned to it
+  // (SPARK-58292). When createClient sees a connection fail because the loop is dead, it replaces
+  // this group with a fresh one so subsequent connections bind to live threads; volatile so the
+  // swap is visible to concurrent createClient callers.
+  private volatile EventLoopGroup workerGroup;
+  // Superseded worker groups are not shut down eagerly: their still-live threads may be serving
+  // channels that are already open. We keep weak references and shut them down best-effort at
+  // close(); their threads are daemon, so a not-yet-collected group cannot block JVM shutdown.
+  private final List<WeakReference<EventLoopGroup>> deprecatedWorkerGroups =
+    new CopyOnWriteArrayList<>();
+  // Whether to recreate the worker group on a dead event loop (SPARK-58292); on by default.
+  private final boolean recreateWorkerGroupOnDeadEventLoop;
+  // How many times the worker group has been recreated after a dead event loop. Used only to make
+  // each recreated group's thread names distinct; mutated under the recreateWorkerGroup lock.
+  private int workerGroupRecreationCount;
+  // Set once close() has shut the worker group down, so the dead-event-loop path does not
+  // resurrect a closed factory by recreating a fresh (leaked) group. Guarded by the same lock as
+  // recreateWorkerGroup. See SPARK-58292.
+  private boolean closed = false;
   private final PooledByteBufAllocator pooledAllocator;
   private final NettyMemoryMetrics metrics;
   private final int fastFailTimeWindow;
@@ -94,14 +122,14 @@ public class TransportClientFactory implements Closeable {
   public TransportClientFactory(
       TransportContext context,
       List<TransportClientBootstrap> clientBootstraps) {
-    this.context = Preconditions.checkNotNull(context);
+    this.context = Objects.requireNonNull(context);
     this.conf = context.getConf();
-    this.clientBootstraps = Lists.newArrayList(Preconditions.checkNotNull(clientBootstraps));
+    this.clientBootstraps = new ArrayList<>(Objects.requireNonNull(clientBootstraps));
     this.connectionPool = new ConcurrentHashMap<>();
     this.numConnectionsPerPeer = conf.numConnectionsPerPeer();
     this.rand = new Random();
 
-    IOMode ioMode = IOMode.valueOf(conf.ioMode());
+    this.ioMode = IOMode.valueOf(conf.ioMode());
     this.socketChannelClass = NettyUtils.getClientChannelClass(ioMode);
     this.workerGroup = NettyUtils.createEventLoop(
         ioMode,
@@ -116,11 +144,17 @@ public class TransportClientFactory implements Closeable {
     }
     this.metrics = new NettyMemoryMetrics(
       this.pooledAllocator, conf.getModuleName() + "-client", conf);
+    this.recreateWorkerGroupOnDeadEventLoop = conf.recreateWorkerGroupOnDeadEventLoop();
     fastFailTimeWindow = (int)(conf.ioRetryWaitTimeMs() * 0.95);
   }
 
   public MetricSet getAllMetrics() {
     return metrics;
+  }
+
+  @VisibleForTesting
+  EventLoopGroup getWorkerGroup() {
+    return workerGroup;
   }
 
   /**
@@ -155,12 +189,8 @@ public class TransportClientFactory implements Closeable {
       InetSocketAddress.createUnresolved(remoteHost, remotePort);
 
     // Create the ClientPool if we don't have it yet.
-    ClientPool clientPool = connectionPool.get(unresolvedAddress);
-    if (clientPool == null) {
-      connectionPool.putIfAbsent(unresolvedAddress, new ClientPool(numConnectionsPerPeer));
-      clientPool = connectionPool.get(unresolvedAddress);
-    }
-
+    ClientPool clientPool = connectionPool.computeIfAbsent(unresolvedAddress,
+        key -> new ClientPool(numConnectionsPerPeer));
     int clientIndex = rand.nextInt(numConnectionsPerPeer);
     TransportClient cachedClient = clientPool.clients[clientIndex];
 
@@ -170,8 +200,10 @@ public class TransportClientFactory implements Closeable {
       // this code was able to update things.
       TransportChannelHandler handler = cachedClient.getChannel().pipeline()
         .get(TransportChannelHandler.class);
-      synchronized (handler) {
-        handler.getResponseHandler().updateTimeOfLastRequest();
+      if (handler != null) {
+        synchronized (handler) {
+          handler.getResponseHandler().updateTimeOfLastRequest();
+        }
       }
 
       if (cachedClient.isActive()) {
@@ -189,7 +221,9 @@ public class TransportClientFactory implements Closeable {
     final String resolvMsg = resolvedAddress.isUnresolved() ? "failed" : "succeed";
     if (hostResolveTimeMs > 2000) {
       logger.warn("DNS resolution {} for {} took {} ms",
-          resolvMsg, resolvedAddress, hostResolveTimeMs);
+        MDC.of(LogKeys.STATUS, resolvMsg),
+        MDC.of(LogKeys.HOST_PORT, resolvedAddress),
+        MDC.of(LogKeys.TIME, hostResolveTimeMs));
     } else {
       logger.trace("DNS resolution {} for {} took {} ms",
           resolvMsg, resolvedAddress, hostResolveTimeMs);
@@ -203,7 +237,8 @@ public class TransportClientFactory implements Closeable {
           logger.trace("Returning cached connection to {}: {}", resolvedAddress, cachedClient);
           return cachedClient;
         } else {
-          logger.info("Found inactive connection to {}, creating a new one.", resolvedAddress);
+          logger.info("Found inactive connection to {}, creating a new one.",
+            MDC.of(LogKeys.HOST_PORT, resolvedAddress));
         }
       }
       // If this connection should fast fail when last connection failed in last fast fail time
@@ -249,12 +284,16 @@ public class TransportClientFactory implements Closeable {
     logger.debug("Creating new connection to {}", address);
 
     Bootstrap bootstrap = new Bootstrap();
-    bootstrap.group(workerGroup)
+    int connCreateTimeout = conf.connectionCreationTimeoutMs();
+    // Capture the group this connection uses, so that on a dead-event-loop failure we replace
+    // exactly this group (and not one a concurrent caller already swapped in).
+    final EventLoopGroup connectGroup = workerGroup;
+    bootstrap.group(connectGroup)
       .channel(socketChannelClass)
       // Disable Nagle's Algorithm since we don't want packets to wait
       .option(ChannelOption.TCP_NODELAY, true)
       .option(ChannelOption.SO_KEEPALIVE, true)
-      .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, conf.connectionCreationTimeoutMs())
+      .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, connCreateTimeout)
       .option(ChannelOption.ALLOCATOR, pooledAllocator);
 
     if (conf.receiveBuf() > 0) {
@@ -271,7 +310,7 @@ public class TransportClientFactory implements Closeable {
     bootstrap.handler(new ChannelInitializer<SocketChannel>() {
       @Override
       public void initChannel(SocketChannel ch) {
-        TransportChannelHandler clientHandler = context.initializePipeline(ch);
+        TransportChannelHandler clientHandler = context.initializePipeline(ch, true);
         clientRef.set(clientHandler.getClient());
         channelRef.set(ch);
       }
@@ -280,12 +319,52 @@ public class TransportClientFactory implements Closeable {
     // Connect to the remote server
     long preConnect = System.nanoTime();
     ChannelFuture cf = bootstrap.connect(address);
-    if (!cf.await(conf.connectionCreationTimeoutMs())) {
-      throw new IOException(
-        String.format("Connecting to %s timed out (%s ms)",
-          address, conf.connectionCreationTimeoutMs()));
-    } else if (cf.cause() != null) {
-      throw new IOException(String.format("Failed to connect to %s", address), cf.cause());
+
+    try {
+      if (connCreateTimeout <= 0) {
+        cf.await();
+        assert cf.isDone();
+        if (cf.isCancelled()) {
+          throw new IOException(String.format("Connecting to %s cancelled", address));
+        } else if (!cf.isSuccess()) {
+          throw new IOException(String.format("Failed to connect to %s", address), cf.cause());
+        }
+      } else if (!cf.await(connCreateTimeout)) {
+        throw new IOException(
+          String.format("Connecting to %s timed out (%s ms)",
+            address, connCreateTimeout));
+      } else if (cf.cause() != null) {
+        throw new IOException(String.format("Failed to connect to %s", address), cf.cause());
+      }
+    } catch (IOException e) {
+      // If the connection failed because the channel could not be registered on its netty event
+      // loop (the loop's thread has died and netty rejects new tasks with "event executor
+      // terminated"), the worker group is permanently degraded: that dead loop is never replaced
+      // and keeps being handed out by the round-robin chooser. Replace the group so retries bind
+      // to fresh live threads, then rethrow so the caller (e.g. RetryingBlockTransferor) retries.
+      recreateWorkerGroupIfEventLoopDead(connectGroup, cf.cause());
+      throw e;
+    }
+    if (context.sslEncryptionEnabled()) {
+      final SslHandler sslHandler = cf.channel().pipeline().get(SslHandler.class);
+      Future<Channel> future = sslHandler.handshakeFuture().addListener(
+        new GenericFutureListener<Future<Channel>>() {
+          @Override
+          public void operationComplete(final Future<Channel> handshakeFuture) {
+            if (handshakeFuture.isSuccess()) {
+              logger.debug("{} successfully completed TLS handshake to ", address);
+            } else {
+              logger.info("failed to complete TLS handshake to {}", handshakeFuture.cause(),
+                MDC.of(LogKeys.HOST_PORT, address));
+              cf.channel().close();
+            }
+          }
+      });
+      if (!future.await(conf.connectionTimeoutMs())) {
+        cf.channel().close();
+        throw new IOException(
+          String.format("Failed to connect to %s within connection timeout", address));
+      }
     }
 
     TransportClient client = clientRef.get();
@@ -301,16 +380,80 @@ public class TransportClientFactory implements Closeable {
       }
     } catch (Exception e) { // catch non-RuntimeExceptions too as bootstrap may be written in Scala
       long bootstrapTimeMs = (System.nanoTime() - preBootstrap) / 1000000;
-      logger.error("Exception while bootstrapping client after " + bootstrapTimeMs + " ms", e);
+      logger.error("Exception while bootstrapping client after {} ms", e,
+        MDC.of(LogKeys.BOOTSTRAP_TIME, bootstrapTimeMs));
       client.close();
-      throw Throwables.propagate(e);
+      if (e instanceof RuntimeException re) throw re;
+      throw new RuntimeException(e);
     }
     long postBootstrap = System.nanoTime();
 
     logger.info("Successfully created connection to {} after {} ms ({} ms spent in bootstraps)",
-      address, (postBootstrap - preConnect) / 1000000, (postBootstrap - preBootstrap) / 1000000);
+      MDC.of(LogKeys.HOST_PORT, address),
+      MDC.of(LogKeys.ELAPSED_TIME, (postBootstrap - preConnect) / 1000000),
+      MDC.of(LogKeys.BOOTSTRAP_TIME, (postBootstrap - preBootstrap) / 1000000));
 
     return client;
+  }
+
+  /**
+   * If the given connection-failure cause was a rejection by a dead netty event loop (its worker
+   * thread terminated and netty rejects new registrations with a
+   * {@link RejectedExecutionException}), replace the worker group so subsequent connections bind to
+   * fresh, live threads. A dead loop is never replaced within a fixed-size group and keeps being
+   * selected by the round-robin chooser, so without this the degradation is permanent. See
+   * SPARK-58292.
+   */
+  private void recreateWorkerGroupIfEventLoopDead(EventLoopGroup connectGroup, Throwable cause) {
+    if (!recreateWorkerGroupOnDeadEventLoop) {
+      return;
+    }
+    boolean eventLoopDead = false;
+    for (Throwable t = cause; t != null; t = t.getCause()) {
+      // Match ONLY the terminated-loop rejection, not a transient task-queue-full rejection.
+      // netty's SingleThreadEventExecutor.reject() throws exactly this message when isShutdown();
+      // the queue-full handler path throws a RejectedExecutionException with no message.
+      if (t instanceof RejectedExecutionException
+          && "event executor terminated".equals(t.getMessage())) {
+        eventLoopDead = true;
+        break;
+      }
+    }
+    if (eventLoopDead) {
+      recreateWorkerGroup(connectGroup);
+    }
+  }
+
+  /**
+   * Replace the worker group with a fresh one, if it is still the group the failed connection used
+   * ({@code connectGroup}). The superseded group is not shut down here: its still-live threads may
+   * be serving channels that are already open. We keep a weak reference and shut it down
+   * best-effort at {@link #close()}; its threads are daemon, so a not-yet-collected group cannot
+   * block JVM shutdown. Synchronized and identity-guarded so concurrent callers that all hit the
+   * same dead group replace it exactly once rather than spawning many groups.
+   */
+  private synchronized void recreateWorkerGroup(EventLoopGroup connectGroup) {
+    // The factory is closed (or closing): its worker group was shut down by close(), so a
+    // createClient() racing or following close() must not recreate a fresh group and resurrect a
+    // closed factory (which would leak threads that close() will never reap again).
+    if (closed) {
+      return;
+    }
+    // A concurrent caller that hit the same dead group already swapped it out; nothing to do.
+    if (workerGroup != connectGroup) {
+      return;
+    }
+    // Use a distinct thread-name prefix so the recreated group is self-identifying in thread
+    // dumps and logs. Netty's DefaultThreadFactory also appends an incrementing pool id, so the
+    // names would not collide even with the same prefix, but tagging it "-recreated-<n>" makes the
+    // dead-event-loop recovery obvious to anyone inspecting the process, and the <n> distinguishes
+    // successive recreations if a loop dies more than once.
+    workerGroupRecreationCount++;
+    workerGroup = NettyUtils.createEventLoop(ioMode, conf.clientThreads(),
+        conf.getModuleName() + "-client-recreated-" + workerGroupRecreationCount);
+    deprecatedWorkerGroups.add(new WeakReference<>(connectGroup));
+    logger.warn("Detected a dead netty client event loop; replaced the worker group. The " +
+      "previous group is retained until its open channels drain (SPARK-58292).");
   }
 
   /** Close all connections in the connection pool, and shutdown the worker thread pool. */
@@ -328,8 +471,24 @@ public class TransportClientFactory implements Closeable {
     }
     connectionPool.clear();
 
+    // Mark closed under the recreateWorkerGroup lock before shutting the group down, so a
+    // concurrent createClient() hitting the dead-event-loop path cannot recreate a fresh group
+    // after we have decided to close (which would leak threads). See SPARK-58292.
+    synchronized (this) {
+      closed = true;
+    }
+
     if (workerGroup != null && !workerGroup.isShuttingDown()) {
       workerGroup.shutdownGracefully();
     }
+
+    // Shut down any worker groups superseded after a dead-event-loop recreation, if not yet GC'd.
+    for (WeakReference<EventLoopGroup> ref : deprecatedWorkerGroups) {
+      EventLoopGroup group = ref.get();
+      if (group != null && !group.isShuttingDown()) {
+        group.shutdownGracefully();
+      }
+    }
+    deprecatedWorkerGroups.clear();
   }
 }

@@ -87,6 +87,10 @@ class LDASuite extends MLTest with DefaultReadWriteTest {
     assert(lda.getTopicDistributionCol === "topicDistribution")
   }
 
+  test("LDA validate input dataset") {
+    testInvalidVectors(new LDA().fit(_))
+  }
+
   test("set parameters") {
     val lda = new LDA()
       .setFeaturesCol("test_feature")
@@ -230,6 +234,24 @@ class LDASuite extends MLTest with DefaultReadWriteTest {
     assert(ll <= 0.0 && ll != Double.NegativeInfinity)
     val lp = model.logPrior
     assert(lp <= 0.0 && lp != Double.NegativeInfinity)
+  }
+
+  test("LocalLDAModel estimated size") {
+    val lda = new LDA().setK(2).setSeed(1).setOptimizer("online").setMaxIter(1)
+    val model = lda.fit(LDASuite.generateLDAData(spark, 3, 2, 3))
+    val maxSize = 1024 * 16
+    assert(
+      model.estimatedSize < maxSize,
+      s"Estimation (${model.estimatedSize}) should be less than $maxSize")
+  }
+
+  test("DistributedLDAModel estimated size") {
+    val lda = new LDA().setK(2).setSeed(1).setOptimizer("em").setMaxIter(1)
+    val model = lda.fit(LDASuite.generateLDAData(spark, 3, 2, 3))
+    val maxSize = 1024 * 16
+    assert(
+      model.estimatedSize < maxSize,
+      s"Estimation (${model.estimatedSize}) should be less than $maxSize")
   }
 
   test("read/write LocalLDAModel") {

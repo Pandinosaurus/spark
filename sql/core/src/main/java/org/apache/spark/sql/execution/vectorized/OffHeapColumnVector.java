@@ -23,6 +23,7 @@ import com.google.common.annotations.VisibleForTesting;
 
 import org.apache.spark.sql.types.*;
 import org.apache.spark.unsafe.Platform;
+import org.apache.spark.unsafe.types.BinaryView;
 import org.apache.spark.unsafe.types.UTF8String;
 
 /**
@@ -32,6 +33,15 @@ public final class OffHeapColumnVector extends WritableColumnVector {
 
   private static final boolean bigEndianPlatform =
     ByteOrder.nativeOrder().equals(ByteOrder.BIG_ENDIAN);
+
+  // Below this count, byte-fill methods (putBytes / putBooleans / putNulls / putNotNulls)
+  // write bytes in an inline loop. At or above this count, they call Platform.setMemory
+  // which lowers to a native memset. The JNI fixed cost of setMemory dominates for very
+  // short fills; on the benchmarked hardware (Apple M4 Max + OpenJDK 21) the crossover
+  // sits between 64 and 512, so 128 is a conservative choice that avoids regression at
+  // small counts (common for random null patterns where RLE runs are short) while
+  // retaining the bulk of the asymptotic gain.
+  private static final int SET_MEMORY_THRESHOLD = 128;
 
   /**
    * Allocates columns to store elements of each field of the schema off heap.
@@ -84,9 +94,7 @@ public final class OffHeapColumnVector extends WritableColumnVector {
     return data;
   }
 
-  @Override
-  public void close() {
-    super.close();
+  protected void releaseMemory() {
     Platform.freeMemory(nulls);
     Platform.freeMemory(data);
     Platform.freeMemory(lengthData);
@@ -95,6 +103,16 @@ public final class OffHeapColumnVector extends WritableColumnVector {
     data = 0;
     lengthData = 0;
     offsetData = 0;
+  }
+
+  @Override
+  public void close() {
+    super.close();
+  }
+
+  @Override
+  public boolean isFree() {
+    return nulls == 0 && data == 0 && lengthData == 0 && offsetData == 0;
   }
 
   //
@@ -108,15 +126,21 @@ public final class OffHeapColumnVector extends WritableColumnVector {
 
   @Override
   public void putNull(int rowId) {
+    if (isAllNull()) return; // Skip writing nulls to all-null vector.
     Platform.putByte(null, nulls + rowId, (byte) 1);
     ++numNulls;
   }
 
   @Override
   public void putNulls(int rowId, int count) {
-    long offset = nulls + rowId;
-    for (int i = 0; i < count; ++i, ++offset) {
-      Platform.putByte(null, offset, (byte) 1);
+    if (isAllNull()) return; // Skip writing nulls to all-null vector.
+    if (count < SET_MEMORY_THRESHOLD) {
+      long offset = nulls + rowId;
+      for (int i = 0; i < count; ++i, ++offset) {
+        Platform.putByte(null, offset, (byte) 1);
+      }
+    } else {
+      Platform.setMemory(nulls + rowId, (byte) 1, count);
     }
     numNulls += count;
   }
@@ -124,15 +148,19 @@ public final class OffHeapColumnVector extends WritableColumnVector {
   @Override
   public void putNotNulls(int rowId, int count) {
     if (!hasNull()) return;
-    long offset = nulls + rowId;
-    for (int i = 0; i < count; ++i, ++offset) {
-      Platform.putByte(null, offset, (byte) 0);
+    if (count < SET_MEMORY_THRESHOLD) {
+      long offset = nulls + rowId;
+      for (int i = 0; i < count; ++i, ++offset) {
+        Platform.putByte(null, offset, (byte) 0);
+      }
+    } else {
+      Platform.setMemory(nulls + rowId, (byte) 0, count);
     }
   }
 
   @Override
   public boolean isNullAt(int rowId) {
-    return Platform.getByte(null, nulls + rowId) == 1;
+    return isAllNull() || Platform.getByte(null, nulls + rowId) == 1;
   }
 
   //
@@ -146,10 +174,25 @@ public final class OffHeapColumnVector extends WritableColumnVector {
 
   @Override
   public void putBooleans(int rowId, int count, boolean value) {
-    byte v = (byte)((value) ? 1 : 0);
-    for (int i = 0; i < count; ++i) {
-      Platform.putByte(null, data + rowId + i, v);
+    byte v = (byte) (value ? 1 : 0);
+    if (count < SET_MEMORY_THRESHOLD) {
+      for (int i = 0; i < count; ++i) {
+        Platform.putByte(null, data + rowId + i, v);
+      }
+    } else {
+      Platform.setMemory(data + rowId, v, count);
     }
+  }
+
+  @Override
+  public void putBooleans(int rowId, byte src) {
+    assert rowId + 8 <= capacity :
+      "putBooleans requires 8 slots available at rowId=" + rowId + ", capacity=" + capacity;
+    long expanded = expandBoolByteToLong(src);
+    if (bigEndianPlatform) {
+      expanded = Long.reverseBytes(expanded);
+    }
+    Platform.putLong(null, data + rowId, expanded);
   }
 
   @Override
@@ -177,14 +220,34 @@ public final class OffHeapColumnVector extends WritableColumnVector {
 
   @Override
   public void putBytes(int rowId, int count, byte value) {
-    for (int i = 0; i < count; ++i) {
-      Platform.putByte(null, data + rowId + i, value);
+    if (count < SET_MEMORY_THRESHOLD) {
+      for (int i = 0; i < count; ++i) {
+        Platform.putByte(null, data + rowId + i, value);
+      }
+    } else {
+      Platform.setMemory(data + rowId, value, count);
     }
   }
 
   @Override
   public void putBytes(int rowId, int count, byte[] src, int srcIndex) {
     Platform.copyMemory(src, Platform.BYTE_ARRAY_OFFSET + srcIndex, null, data + rowId, count);
+  }
+
+  @Override
+  public void putBytes(int rowId, int count, ByteBuffer src, int srcIndex) {
+    if (src.hasArray()) {
+      Platform.copyMemory(src.array(), Platform.BYTE_ARRAY_OFFSET + src.arrayOffset() + srcIndex,
+        null, data + rowId, count);
+    } else if (src.isDirect()) {
+      long srcAddr = Platform.getDirectBufferAddress(src) + srcIndex;
+      Platform.copyMemory(null, srcAddr, null, data + rowId, count);
+    } else {
+      // Fallback for non-heap, non-direct buffers (e.g., read-only wrappers).
+      byte[] tmp = new byte[count];
+      src.get(srcIndex, tmp, 0, count);
+      Platform.copyMemory(tmp, Platform.BYTE_ARRAY_OFFSET, null, data + rowId, count);
+    }
   }
 
   @Override
@@ -198,15 +261,32 @@ public final class OffHeapColumnVector extends WritableColumnVector {
 
   @Override
   public byte[] getBytes(int rowId, int count) {
-    assert(dictionary == null);
     byte[] array = new byte[count];
-    Platform.copyMemory(null, data + rowId, array, Platform.BYTE_ARRAY_OFFSET, count);
+    if (dictionary == null) {
+      Platform.copyMemory(null, data + rowId, array, Platform.BYTE_ARRAY_OFFSET, count);
+    } else {
+      for (int i = 0; i < count; i++) {
+        if (!isNullAt(rowId + i)) {
+          array[i] = (byte) dictionary.decodeToInt(dictionaryIds.getDictId(rowId + i));
+        }
+      }
+    }
     return array;
   }
 
   @Override
   protected UTF8String getBytesAsUTF8String(int rowId, int count) {
     return UTF8String.fromAddress(null, data + rowId, count);
+  }
+
+  @Override
+  protected BinaryView getBytesAsBinaryView(int rowId, int count) {
+    return BinaryView.fromAddress(null, data + rowId, count);
+  }
+
+  @Override
+  public ByteBuffer getByteBuffer(int rowId, int count) {
+    return ByteBuffer.wrap(getBytes(rowId, count));
   }
 
   //
@@ -239,6 +319,22 @@ public final class OffHeapColumnVector extends WritableColumnVector {
   }
 
   @Override
+  public void putShortsFromIntsLittleEndian(int rowId, int count, byte[] src, int srcIndex) {
+    int srcOffset = srcIndex + Platform.BYTE_ARRAY_OFFSET;
+    long dstOffset = data + rowId * 2L;
+    if (bigEndianPlatform) {
+      for (int i = 0; i < count; ++i, srcOffset += 4, dstOffset += 2) {
+        Platform.putShort(null, dstOffset,
+          (short) Integer.reverseBytes(Platform.getInt(src, srcOffset)));
+      }
+    } else {
+      for (int i = 0; i < count; ++i, srcOffset += 4, dstOffset += 2) {
+        Platform.putShort(null, dstOffset, Platform.getShort(src, srcOffset));
+      }
+    }
+  }
+
+  @Override
   public short getShort(int rowId) {
     if (dictionary == null) {
       return Platform.getShort(null, data + 2L * rowId);
@@ -249,9 +345,16 @@ public final class OffHeapColumnVector extends WritableColumnVector {
 
   @Override
   public short[] getShorts(int rowId, int count) {
-    assert(dictionary == null);
     short[] array = new short[count];
-    Platform.copyMemory(null, data + rowId * 2L, array, Platform.SHORT_ARRAY_OFFSET, count * 2L);
+    if (dictionary == null) {
+      Platform.copyMemory(null, data + rowId * 2L, array, Platform.SHORT_ARRAY_OFFSET, count * 2L);
+    } else {
+      for (int i = 0; i < count; i++) {
+        if (!isNullAt(rowId + i)) {
+          array[i] = (short) dictionary.decodeToInt(dictionaryIds.getDictId(rowId + i));
+        }
+      }
+    }
     return array;
   }
 
@@ -310,9 +413,16 @@ public final class OffHeapColumnVector extends WritableColumnVector {
 
   @Override
   public int[] getInts(int rowId, int count) {
-    assert(dictionary == null);
     int[] array = new int[count];
-    Platform.copyMemory(null, data + rowId * 4L, array, Platform.INT_ARRAY_OFFSET, count * 4L);
+    if (dictionary == null) {
+      Platform.copyMemory(null, data + rowId * 4L, array, Platform.INT_ARRAY_OFFSET, count * 4L);
+    } else {
+      for (int i = 0; i < count; i++) {
+        if (!isNullAt(rowId + i)) {
+          array[i] = dictionary.decodeToInt(dictionaryIds.getDictId(rowId + i));
+        }
+      }
+    }
     return array;
   }
 
@@ -321,6 +431,7 @@ public final class OffHeapColumnVector extends WritableColumnVector {
    * This should only be called when the ColumnVector is dictionaryIds.
    * We have this separate method for dictionaryIds as per SPARK-16928.
    */
+  @Override
   public int getDictId(int rowId) {
     assert(dictionary == null)
             : "A ColumnVector dictionary should not have a dictionary for itself.";
@@ -382,9 +493,16 @@ public final class OffHeapColumnVector extends WritableColumnVector {
 
   @Override
   public long[] getLongs(int rowId, int count) {
-    assert(dictionary == null);
     long[] array = new long[count];
-    Platform.copyMemory(null, data + rowId * 8L, array, Platform.LONG_ARRAY_OFFSET, count * 8L);
+    if (dictionary == null) {
+      Platform.copyMemory(null, data + rowId * 8L, array, Platform.LONG_ARRAY_OFFSET, count * 8L);
+    } else {
+      for (int i = 0; i < count; i++) {
+        if (!isNullAt(rowId + i)) {
+          array[i] = dictionary.decodeToLong(dictionaryIds.getDictId(rowId + i));
+        }
+      }
+    }
     return array;
   }
 
@@ -441,9 +559,16 @@ public final class OffHeapColumnVector extends WritableColumnVector {
 
   @Override
   public float[] getFloats(int rowId, int count) {
-    assert(dictionary == null);
     float[] array = new float[count];
-    Platform.copyMemory(null, data + rowId * 4L, array, Platform.FLOAT_ARRAY_OFFSET, count * 4L);
+    if (dictionary == null) {
+      Platform.copyMemory(null, data + rowId * 4L, array, Platform.FLOAT_ARRAY_OFFSET, count * 4L);
+    } else {
+      for (int i = 0; i < count; i++) {
+        if (!isNullAt(rowId + i)) {
+          array[i] = dictionary.decodeToFloat(dictionaryIds.getDictId(rowId + i));
+        }
+      }
+    }
     return array;
   }
 
@@ -501,9 +626,17 @@ public final class OffHeapColumnVector extends WritableColumnVector {
 
   @Override
   public double[] getDoubles(int rowId, int count) {
-    assert(dictionary == null);
     double[] array = new double[count];
-    Platform.copyMemory(null, data + rowId * 8L, array, Platform.DOUBLE_ARRAY_OFFSET, count * 8L);
+    if (dictionary == null) {
+      Platform.copyMemory(null, data + rowId * 8L, array, Platform.DOUBLE_ARRAY_OFFSET,
+        count * 8L);
+    } else {
+      for (int i = 0; i < count; i++) {
+        if (!isNullAt(rowId + i)) {
+          array[i] = dictionary.decodeToDouble(dictionaryIds.getDictId(rowId + i));
+        }
+      }
+    }
     return array;
   }
 
@@ -539,6 +672,8 @@ public final class OffHeapColumnVector extends WritableColumnVector {
   // Split out the slow path.
   @Override
   protected void reserveInternal(int newCapacity) {
+    if (isAllNull()) return; // Skip allocation for all-null vector.
+
     int oldCapacity = (nulls == 0L) ? 0 : capacity;
     if (isArray() || type instanceof MapType) {
       this.lengthData =
@@ -555,7 +690,8 @@ public final class OffHeapColumnVector extends WritableColumnVector {
       this.data = Platform.reallocateMemory(data, oldCapacity * 4L, newCapacity * 4L);
     } else if (type instanceof LongType || type instanceof DoubleType ||
         DecimalType.is64BitDecimalType(type) || type instanceof TimestampType ||
-        type instanceof TimestampNTZType || type instanceof DayTimeIntervalType) {
+        type instanceof TimestampNTZType || type instanceof DayTimeIntervalType ||
+        type instanceof TimeType) {
       this.data = Platform.reallocateMemory(data, oldCapacity * 8L, newCapacity * 8L);
     } else if (childColumns != null) {
       // Nothing to store.
@@ -568,7 +704,7 @@ public final class OffHeapColumnVector extends WritableColumnVector {
   }
 
   @Override
-  protected OffHeapColumnVector reserveNewColumn(int capacity, DataType type) {
+  protected OffHeapColumnVector reserveNewInternalColumn(int capacity, DataType type) {
     return new OffHeapColumnVector(capacity, type);
   }
 }

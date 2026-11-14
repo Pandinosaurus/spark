@@ -19,22 +19,24 @@ package org.apache.spark.scheduler
 
 import java.io.NotSerializableException
 import java.nio.ByteBuffer
-import java.util.concurrent.{ConcurrentLinkedQueue, TimeUnit}
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue, TimeUnit}
 
-import scala.collection.immutable.Map
 import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet}
 import scala.math.max
 import scala.util.control.NonFatal
 
 import org.apache.spark._
+import org.apache.spark.InternalAccumulator
+import org.apache.spark.InternalAccumulator.{input, shuffleRead}
 import org.apache.spark.TaskState.TaskState
 import org.apache.spark.errors.SparkCoreErrors
-import org.apache.spark.internal.{config, Logging}
+import org.apache.spark.internal.{config, Logging, LogKeys}
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.config._
-import org.apache.spark.resource.ResourceInformation
+import org.apache.spark.resource.CpuAmount
 import org.apache.spark.scheduler.SchedulingMode._
 import org.apache.spark.util.{AccumulatorV2, Clock, LongAccumulator, SystemClock, Utils}
-import org.apache.spark.util.collection.MedianHeap
+import org.apache.spark.util.collection.{OpenHashSet, PercentileHeap}
 
 /**
  * Schedules the tasks within a single TaskSet in the TaskSchedulerImpl. This class keeps track of
@@ -61,11 +63,6 @@ private[spark] class TaskSetManager(
 
   private val conf = sched.sc.conf
 
-  // SPARK-21563 make a copy of the jars/files so they are consistent across the TaskSet
-  private val addedJars = HashMap[String, Long](sched.sc.addedJars.toSeq: _*)
-  private val addedFiles = HashMap[String, Long](sched.sc.addedFiles.toSeq: _*)
-  private val addedArchives = HashMap[String, Long](sched.sc.addedArchives.toSeq: _*)
-
   val maxResultSize = conf.get(config.MAX_RESULT_SIZE)
 
   // Serializer for closures and tasks.
@@ -73,19 +70,35 @@ private[spark] class TaskSetManager(
   val ser = env.closureSerializer.newInstance()
 
   val tasks = taskSet.tasks
+
+  // A pipelined-group member reads/writes a transient shuffle that cannot be re-read in isolation,
+  // so a single task failure must fail the whole group (which fails the job, triggering a rerun)
+  // rather than be retried per-task. For such a task set we cap attempts at 1 and count every
+  // failure, including reasons that are normally not counted (e.g. executor loss). This is the
+  // native equivalent of the prototype's per-batch "any failure counts" behavior, keyed on the
+  // pipelined dependency (via TaskSet.isPipelined) rather than a job property.
+  private val effectiveMaxTaskFailures = if (taskSet.isPipelined) 1 else maxTaskFailures
+
   private val isShuffleMapTasks = tasks(0).isInstanceOf[ShuffleMapTask]
+  // shuffleId is only available when isShuffleMapTasks=true
+  private val shuffleId = taskSet.shuffleId
   private[scheduler] val partitionToIndex = tasks.zipWithIndex
     .map { case (t, idx) => t.partitionId -> idx }.toMap
   val numTasks = tasks.length
   val copiesRunning = new Array[Int](numTasks)
 
   val speculationEnabled = conf.get(SPECULATION_ENABLED)
+  private val efficientTaskProcessMultiplier =
+    conf.get(SPECULATION_EFFICIENCY_TASK_PROCESS_RATE_MULTIPLIER)
+  private val efficientTaskDurationFactor = conf.get(SPECULATION_EFFICIENCY_TASK_DURATION_FACTOR)
+
   // Quantile of tasks at which to start speculation
   val speculationQuantile = conf.get(SPECULATION_QUANTILE)
   val speculationMultiplier = conf.get(SPECULATION_MULTIPLIER)
   val minFinishedForSpeculation = math.max((speculationQuantile * numTasks).floor.toInt, 1)
   // User provided threshold for speculation regardless of whether the quantile has been reached
   val speculationTaskDurationThresOpt = conf.get(SPECULATION_TASK_DURATION_THRESHOLD)
+  private val isSpeculationThresholdSpecified = speculationTaskDurationThresOpt.exists(_ > 0)
   // SPARK-29976: Only when the total number of tasks in the stage is less than or equal to the
   // number of slots on a single executor, would the task manager speculative run the tasks if
   // their duration is longer than the given threshold. In this way, we wouldn't speculate too
@@ -108,6 +121,13 @@ private[spark] class TaskSetManager(
 
   private val executorDecommissionKillInterval =
     conf.get(EXECUTOR_DECOMMISSION_KILL_INTERVAL).map(TimeUnit.SECONDS.toMillis)
+
+  private[scheduler] val taskProcessRateCalculator =
+    if (sched.efficientTaskCalcualtionEnabled) {
+      Some(new TaskProcessRateCalculator())
+    } else {
+      None
+    }
 
   // For each task, tracks whether a copy of the task has succeeded. A task will also be
   // marked as "succeeded" if it failed with a fetch failure, in which case it should not
@@ -133,8 +153,18 @@ private[spark] class TaskSetManager(
   private var calculatedTasks = 0
 
   private[scheduler] val taskSetExcludelistHelperOpt: Option[TaskSetExcludelist] = {
-    healthTracker.map { _ =>
-      new TaskSetExcludelist(sched.sc.listenerBus, conf, stageId, taskSet.stageAttemptId, clock)
+    if (TaskSetExcludelist.isExcludeOnFailureEnabled(conf)) {
+      Some(new TaskSetExcludelist(sched.sc.listenerBus, conf, stageId,
+        taskSet.stageAttemptId, clock))
+    } else if (healthTracker.isDefined) {
+      // If we enabled exclusion at application level but not at taskset level exclusion, we create
+      // TaskSetExcludelist in dry run mode.
+      // In this mode, TaskSetExcludeList would not exclude any executors but only store
+      // task failure information.
+      Some(new TaskSetExcludelist(sched.sc.listenerBus, conf, stageId,
+        taskSet.stageAttemptId, clock, isDryRun = true))
+    } else {
+      None
     }
   }
 
@@ -180,10 +210,16 @@ private[spark] class TaskSetManager(
   // Task index, start and finish time for each task attempt (indexed by task ID)
   private[scheduler] val taskInfos = new HashMap[Long, TaskInfo]
 
+  // Reverse index: executor ID -> set of task IDs that were launched on that executor.
+  // This includes both running and completed tasks, used to efficiently look up tasks
+  // when an executor is lost, avoiding O(N) scans over all taskInfos.
+  // Uses OpenHashSet[Long] (specialized for Long) to avoid boxing overhead.
+  private[scheduler] val executorIdToTaskIds = new HashMap[String, OpenHashSet[Long]]
+
   // Use a MedianHeap to record durations of successful tasks so we know when to launch
   // speculative tasks. This is only used when speculation is enabled, to avoid the overhead
   // of inserting into the heap when the heap won't be used.
-  val successfulTaskDurations = new MedianHeap()
+  val successfulTaskDurations = new PercentileHeap()
 
   // How frequently to reprint duplicate exceptions in full, in milliseconds
   val EXCEPTION_PRINT_INTERVAL =
@@ -247,6 +283,9 @@ private[spark] class TaskSetManager(
 
   private[scheduler] var emittedTaskSizeWarning = false
 
+  private[scheduler] val dropTaskInfoAccumulablesOnTaskCompletion =
+    conf.get(DROP_TASK_INFO_ACCUMULABLES_ON_TASK_COMPLETION)
+
   /** Add a task to all the pending-task lists that it should be on. */
   private[spark] def addPendingTask(
       index: Int,
@@ -266,8 +305,9 @@ private[spark] class TaskSetManager(
               for (e <- set) {
                 pendingTaskSetToAddTo.forExecutor.getOrElseUpdate(e, new ArrayBuffer) += index
               }
-              logInfo(s"Pending task $index has a cached location at ${e.host} " +
-                ", where there are executors " + set.mkString(","))
+              logInfo(log"Pending task ${MDC(INDEX, index)} has a cached location at " +
+                log"${MDC(HOST, e.host)}, where there are executors " +
+                log"${MDC(EXECUTOR_IDS, set.mkString(","))}")
             case None => logDebug(s"Pending task $index has a cached location at ${e.host} " +
               ", but there are no executors alive there.")
           }
@@ -432,8 +472,8 @@ private[spark] class TaskSetManager(
       execId: String,
       host: String,
       maxLocality: TaskLocality.TaskLocality,
-      taskCpus: Int = sched.CPUS_PER_TASK,
-      taskResourceAssignments: Map[String, ResourceInformation] = Map.empty)
+      taskCpus: BigDecimal = sched.CPUS_PER_TASK,
+      taskResourceAssignments: Map[String, Map[String, Long]] = Map.empty)
     : (Option[TaskDescription], Boolean, Int) =
   {
     val offerExcluded = taskSetExcludelistHelperOpt.exists { excludeList =>
@@ -500,8 +540,8 @@ private[spark] class TaskSetManager(
       index: Int,
       taskLocality: TaskLocality.Value,
       speculative: Boolean,
-      taskCpus: Int,
-      taskResourceAssignments: Map[String, ResourceInformation],
+      taskCpus: BigDecimal,
+      taskResourceAssignments: Map[String, Map[String, Long]],
       launchTime: Long): TaskDescription = {
     // Found a task; do some bookkeeping and return a task description
     val task = tasks(index)
@@ -509,9 +549,11 @@ private[spark] class TaskSetManager(
     // Do various bookkeeping
     copiesRunning(index) += 1
     val attemptNum = taskAttempts(index).size
-    val info = new TaskInfo(taskId, index, attemptNum, launchTime,
+    val info = new TaskInfo(
+      taskId, index, attemptNum, task.partitionId, launchTime,
       execId, host, taskLocality, speculative)
     taskInfos(taskId) = info
+    executorIdToTaskIds.getOrElseUpdate(execId, new OpenHashSet[Long]).add(taskId)
     taskAttempts(index) = info :: taskAttempts(index)
     // Serialize and return the task
     val serializedTask: ByteBuffer = try {
@@ -519,18 +561,28 @@ private[spark] class TaskSetManager(
     } catch {
       // If the task cannot be serialized, then there's no point to re-attempt the task,
       // as it will always fail. So just abort the whole task-set.
+      case e: OutOfMemoryError if Utils.isJavaArraySizeLimitExceeded(e) =>
+        // The task is larger than a Java array can hold. This is not heap exhaustion, so it is
+        // reported with a user-facing error that does not keep the OutOfMemoryError as cause.
+        val failure = JavaArraySizeLimitExceeded.forTask(e, task.stageId, task.partitionId)
+        logError(log"Failed to serialize task ${MDC(TASK_ID, taskId)} (stage " +
+          log"${MDC(STAGE_ID, task.stageId)}, partition ${MDC(PARTITION_ID, task.partitionId)}) " +
+          log"because it exceeded Java's maximum array size: ${MDC(ERROR, failure.jvmMessage)}")
+        abort(failure.getMessage, Some(failure))
+        throw SparkCoreErrors.failToSerializeTaskError(failure)
       case NonFatal(e) =>
-        val msg = s"Failed to serialize task $taskId, not attempting to retry it."
+        val msg = log"Failed to serialize task ${MDC(TASK_ID, taskId)}, not attempting to retry it."
         logError(msg, e)
-        abort(s"$msg Exception during serialization: $e")
+        abort(s"${msg.message} Exception during serialization: $e")
         throw SparkCoreErrors.failToSerializeTaskError(e)
     }
     if (serializedTask.limit() > TaskSetManager.TASK_SIZE_TO_WARN_KIB * 1024 &&
       !emittedTaskSizeWarning) {
       emittedTaskSizeWarning = true
-      logWarning(s"Stage ${task.stageId} contains a task of very large size " +
-        s"(${serializedTask.limit() / 1024} KiB). The maximum recommended task size is " +
-        s"${TaskSetManager.TASK_SIZE_TO_WARN_KIB} KiB.")
+      logWarning(log"Stage ${MDC(STAGE_ID, task.stageId)} contains a task of very large size " +
+        log"(${MDC(NUM_BYTES, serializedTask.limit() / 1024)} KiB). " +
+        log"The maximum recommended task size is " +
+        log"${MDC(NUM_BYTES_TO_WARN, TaskSetManager.TASK_SIZE_TO_WARN_KIB)} KiB.")
     }
     addRunningTask(taskId)
 
@@ -538,9 +590,16 @@ private[spark] class TaskSetManager(
     // a good proxy to task serialization time.
     // val timeTaken = clock.getTime() - startTime
     val tName = taskName(taskId)
-    logInfo(s"Starting $tName ($host, executor ${info.executorId}, " +
-      s"partition ${task.partitionId}, $taskLocality, ${serializedTask.limit()} bytes) " +
-      s"taskResourceAssignments ${taskResourceAssignments}")
+    logInfo(log"Starting ${MDC(TASK_NAME, tName)} (${MDC(HOST, host)}," +
+      log"executor ${MDC(LogKeys.EXECUTOR_ID, info.executorId)}, " +
+      log"partition ${MDC(PARTITION_ID, task.partitionId)}, " +
+      log"${MDC(TASK_LOCALITY, taskLocality)}, " +
+      log"${MDC(SIZE, serializedTask.limit())} bytes) " +
+      (if (taskResourceAssignments.nonEmpty) {
+        log"taskResourceAssignments ${MDC(TASK_RESOURCE_ASSIGNMENTS, taskResourceAssignments)}"
+      } else {
+        log""
+      }))
 
     sched.dagScheduler.taskStarted(task, info)
     new TaskDescription(
@@ -550,12 +609,11 @@ private[spark] class TaskSetManager(
       tName,
       index,
       task.partitionId,
-      addedFiles,
-      addedJars,
-      addedArchives,
+      task.artifacts,
       task.localProperties,
       taskCpus,
       taskResourceAssignments,
+      Option(env.userCredentials.get()).map(vc => (vc.version, vc.bytes)),
       serializedTask)
   }
 
@@ -677,7 +735,6 @@ private[spark] class TaskSetManager(
   private[scheduler] def getCompletelyExcludedTaskIfAny(
       hostToExecutors: HashMap[String, HashSet[String]]): Option[Int] = {
     taskSetExcludelistHelperOpt.flatMap { taskSetExcludelist =>
-      val appHealthTracker = healthTracker.get
       // Only look for unschedulable tasks when at least one executor has registered. Otherwise,
       // task sets will be (unnecessarily) aborted in cases when no executors have registered yet.
       if (hostToExecutors.nonEmpty) {
@@ -704,7 +761,7 @@ private[spark] class TaskSetManager(
           hostToExecutors.forall { case (host, execsOnHost) =>
             // Check if the task can run on the node
             val nodeExcluded =
-              appHealthTracker.isNodeExcluded(host) ||
+              healthTracker.exists(_.isNodeExcluded(host)) ||
                 taskSetExcludelist.isNodeExcludedForTaskSet(host) ||
                 taskSetExcludelist.isNodeExcludedForTask(host, indexInTaskSet)
             if (nodeExcluded) {
@@ -712,7 +769,7 @@ private[spark] class TaskSetManager(
             } else {
               // Check if the task can run on any of the executors
               execsOnHost.forall { exec =>
-                appHealthTracker.isExecutorExcluded(exec) ||
+                healthTracker.exists(_.isExecutorExcluded(exec)) ||
                   taskSetExcludelist.isExecutorExcludedForTaskSet(exec) ||
                   taskSetExcludelist.isExecutorExcludedForTask(exec, indexInTaskSet)
               }
@@ -757,11 +814,12 @@ private[spark] class TaskSetManager(
     totalResultSize += size
     calculatedTasks += 1
     if (!isShuffleMapTasks && maxResultSize > 0 && totalResultSize > maxResultSize) {
-      val msg = s"Total size of serialized results of ${calculatedTasks} tasks " +
-        s"(${Utils.bytesToString(totalResultSize)}) is bigger than ${config.MAX_RESULT_SIZE.key} " +
-        s"(${Utils.bytesToString(maxResultSize)})"
+      val msg = log"Total size of serialized results of ${MDC(COUNT, calculatedTasks)} tasks " +
+        log"(${MDC(SIZE, Utils.bytesToString(totalResultSize))}) is bigger than " +
+        log"${MDC(CONFIG, config.MAX_RESULT_SIZE.key)} " +
+        log"(${MDC(MAX_SIZE, Utils.bytesToString(maxResultSize))})"
       logError(msg)
-      abort(msg)
+      abort(msg.message)
       false
     } else {
       true
@@ -773,9 +831,21 @@ private[spark] class TaskSetManager(
    */
   def handleSuccessfulTask(tid: Long, result: DirectTaskResult[_]): Unit = {
     val info = taskInfos(tid)
+    // SPARK-37300: when the task was already finished state, just ignore it,
+    // so that there won't cause successful and tasksSuccessful wrong result.
+    if (info.finished) {
+      if (dropTaskInfoAccumulablesOnTaskCompletion) {
+        // SPARK-46383: Clear out the accumulables for a completed task to reduce accumulable
+        // lifetime.
+        info.setAccumulables(Nil)
+      }
+      return
+    }
     val index = info.index
     // Check if any other attempt succeeded before this and this attempt has not been handled
     if (successful(index) && killedByOtherAttempt.contains(tid)) {
+      // For ShuffleMapTasks, detect speculation duplicate before handling as killed.
+      detectStalePushIfShuffleTask(tid, info.index, result)
       // Undo the effect on calculatedTasks and totalResultSize made earlier when
       // checking if can fetch more results
       calculatedTasks -= 1
@@ -788,20 +858,26 @@ private[spark] class TaskSetManager(
       // Handle this task as a killed task
       handleFailedTask(tid, TaskState.KILLED,
         TaskKilled("Finish but did not commit due to another attempt succeeded"))
+      // SPARK-46383: Not clearing the accumulables here because they are already cleared in
+      // handleFailedTask.
       return
     }
 
     info.markFinished(TaskState.FINISHED, clock.getTimeMillis())
     if (speculationEnabled) {
-      successfulTaskDurations.insert(info.duration)
+      successfulTaskDurations.insert(info.duration.toDouble)
+      taskProcessRateCalculator.foreach(_.updateAvgTaskProcessRate(tid, result))
     }
     removeRunningTask(tid)
 
     // Kill any other attempts for the same task (since those are unnecessary now that one
     // attempt completed successfully).
     for (attemptInfo <- taskAttempts(index) if attemptInfo.running) {
-      logInfo(s"Killing attempt ${attemptInfo.attemptNumber} for ${taskName(attemptInfo.taskId)}" +
-        s" on ${attemptInfo.host} as the attempt ${info.attemptNumber} succeeded on ${info.host}")
+      logInfo(log"Killing attempt ${MDC(NUM_ATTEMPT, attemptInfo.attemptNumber)} for " +
+        log"${MDC(TASK_NAME, taskName(attemptInfo.taskId))} on " +
+        log"${MDC(HOST, attemptInfo.host)} as the attempt " +
+        log"${MDC(TASK_ATTEMPT_ID, info.attemptNumber)} succeeded on " +
+        log"${MDC(HOST, info.host)}")
       killedByOtherAttempt += attemptInfo.taskId
       sched.backend.killTask(
         attemptInfo.taskId,
@@ -811,16 +887,20 @@ private[spark] class TaskSetManager(
     }
     if (!successful(index)) {
       tasksSuccessful += 1
-      logInfo(s"Finished ${taskName(info.taskId)} in ${info.duration} ms " +
-        s"on ${info.host} (executor ${info.executorId}) ($tasksSuccessful/$numTasks)")
+      logInfo(log"Finished ${MDC(TASK_NAME, taskName(info.taskId))} in " +
+        log"${MDC(DURATION, info.duration)} ms on ${MDC(HOST, info.host)} " +
+        log"(executor ${MDC(LogKeys.EXECUTOR_ID, info.executorId)}) " +
+        log"(${MDC(NUM_SUCCESSFUL_TASKS, tasksSuccessful)}/${MDC(NUM_TASKS, numTasks)})")
       // Mark successful and stop if all the tasks have succeeded.
       successful(index) = true
+      numFailures(index) = 0
       if (tasksSuccessful == numTasks) {
         isZombie = true
       }
     } else {
-      logInfo(s"Ignoring task-finished event for ${taskName(info.taskId)} " +
-        s"because it has already completed successfully")
+      logInfo(log"Ignoring task-finished event for " +
+        log"${MDC(TASK_NAME, taskName(info.taskId))} " +
+        log"because it has already completed successfully")
     }
     // This method is called by "TaskSchedulerImpl.handleSuccessfulTask" which holds the
     // "TaskSchedulerImpl" lock until exiting. To avoid the SPARK-7655 issue, we should not
@@ -828,9 +908,76 @@ private[spark] class TaskSetManager(
     // "result.value()" in "TaskResultGetter.enqueueSuccessfulTask" before reaching here.
     // Note: "result.value()" only deserializes the value when it's called at the first time, so
     // here "result.value()" just returns the value and won't block other threads.
-    sched.dagScheduler.taskEnded(tasks(index), Success, result.value(), result.accumUpdates,
-      result.metricPeaks, info)
+
+    emptyTaskInfoAccumulablesAndNotifyDagScheduler(tid, tasks(index), Success, result.value(),
+      result.accumUpdates, result.metricPeaks)
     maybeFinishTaskSet()
+  }
+
+  /**
+   * A wrapper around [[DAGScheduler.taskEnded()]] that empties out the accumulables for the
+   * TaskInfo object, corresponding to the completed task, referenced by this class.
+   *
+   * SPARK-46383: For the completed task, we ship the original TaskInfo to the DAGScheduler and only
+   * retain a cloned TaskInfo in this class. We then set the accumulables to Nil for the TaskInfo
+   * object that corresponds to the completed task.
+   * We do this to release references to `TaskInfo.accumulables()` as the TaskInfo
+   * objects held by this class are long-lived and have a heavy memory footprint on the driver.
+   *
+   * This is safe as the TaskInfo accumulables are not needed once they are shipped to the
+   * DAGScheduler where they are aggregated. Additionally, the original TaskInfo, and not a
+   * clone, must be sent to the DAGScheduler as this TaskInfo object is sent to the
+   * DAGScheduler on multiple events during the task's lifetime. Users can install
+   * SparkListeners that compare the TaskInfo objects across these SparkListener events and
+   * thus the TaskInfo object sent to the DAGScheduler must always reference the same TaskInfo
+   * object.
+   */
+  private def emptyTaskInfoAccumulablesAndNotifyDagScheduler(
+      taskId: Long,
+      task: Task[_],
+      reason: TaskEndReason,
+      result: Any,
+      accumUpdates: Seq[AccumulatorV2[_, _]],
+      metricPeaks: Array[Long]): Unit = {
+    val taskInfoWithAccumulables = taskInfos(taskId);
+    if (dropTaskInfoAccumulablesOnTaskCompletion) {
+      val index = taskInfoWithAccumulables.index
+      val clonedTaskInfo = taskInfoWithAccumulables.cloneWithEmptyAccumulables()
+      // Update this task's taskInfo while preserving its position in the list
+      taskAttempts(index) =
+        taskAttempts(index).map { i => if (i eq taskInfoWithAccumulables) clonedTaskInfo else i }
+      taskInfos(taskId) = clonedTaskInfo
+    }
+    sched.dagScheduler.taskEnded(task, reason, result, accumUpdates, metricPeaks,
+      taskInfoWithAccumulables)
+  }
+
+  /**
+   * For ShuffleMapTasks, detect stale push: if a partition already has
+   * a registered MapStatus with a different mapId, it means another attempt for the same
+   * partition also pushed data to the merger. Mark this partition so that reducers will
+   * skip the merged block and fallback to unmerged blocks.
+   *
+   * This is called from handleSuccessfulTask for late-arriving or killed attempt results,
+   * where the task result won't be forwarded to DAGScheduler (so DAGScheduler's own
+   * stale detection won't cover these cases).
+   */
+  private def detectStalePushIfShuffleTask(
+      tid: Long, index: Int, result: DirectTaskResult[_]): Unit = {
+    if (!isShuffleMapTasks || shuffleId.isEmpty) {
+      return
+    }
+    // This method is only called for late-arriving or killed attempts, meaning the partition
+    // already has a successful attempt registered. Any MapStatus arriving here is from a
+    // stale (redundant) attempt that also pushed data to the merger.
+    val mapStatus = result.value().asInstanceOf[MapStatus]
+    val sid = shuffleId.get
+    val partitionId = tasks(index).partitionId
+    // Mark its mapIndex (== partitionId, NOT MapStatus.mapId) as stale so reducers can detect
+    // the stale data in merged block chunks via chunkBitmaps and fallback if needed.
+    logInfo(s"[StalePush] Late/killed attempt tid=$tid for partition=$partitionId " +
+      s"(index=$index), attemptMapId=${mapStatus.mapId}. Marked as stale push.")
+    sched.mapOutputTracker.markStalePushedPartition(sid, partitionId)
   }
 
   private[scheduler] def markPartitionCompleted(partitionId: Int): Unit = {
@@ -838,6 +985,7 @@ private[spark] class TaskSetManager(
       if (!successful(index)) {
         tasksSuccessful += 1
         successful(index) = true
+        numFailures(index) = 0
         if (tasksSuccessful == numTasks) {
           isZombie = true
         }
@@ -852,7 +1000,14 @@ private[spark] class TaskSetManager(
    */
   def handleFailedTask(tid: Long, state: TaskState, reason: TaskFailedReason): Unit = {
     val info = taskInfos(tid)
-    if (info.failed || info.killed) {
+    // SPARK-37300: when the task was already finished state, just ignore it,
+    // so that there won't cause copiesRunning wrong result.
+    if (info.finished) {
+      if (dropTaskInfoAccumulablesOnTaskCompletion) {
+        // SPARK-46383: Clear out the accumulables for a completed task to reduce accumulable
+        // lifetime.
+        info.setAccumulables(Nil)
+      }
       return
     }
     removeRunningTask(tid)
@@ -861,7 +1016,11 @@ private[spark] class TaskSetManager(
     copiesRunning(index) -= 1
     var accumUpdates: Seq[AccumulatorV2[_, _]] = Seq.empty
     var metricPeaks: Array[Long] = Array.empty
-    val failureReason = s"Lost ${taskName(tid)} (${info.host} " +
+    val failureReason = log"Lost ${MDC(TASK_NAME, taskName(tid))} " +
+      log"(${MDC(HOST_PORT, info.host)} " +
+      log"executor ${MDC(LogKeys.EXECUTOR_ID, info.executorId)}): " +
+      log"${MDC(ERROR, reason.toErrorString)}"
+    val failureReasonString = s"Lost ${taskName(tid)} (${info.host} " +
       s"executor ${info.executorId}): ${reason.toErrorString}"
     val failureException: Option[Throwable] = reason match {
       case fetchFailed: FetchFailed =>
@@ -886,15 +1045,23 @@ private[spark] class TaskSetManager(
         val task = taskName(tid)
         if (ef.className == classOf[NotSerializableException].getName) {
           // If the task result wasn't serializable, there's no point in trying to re-execute it.
-          logError(s"$task had a not serializable result: ${ef.description}; not retrying")
+          logError(log"${MDC(TASK_NAME, task)} had a not serializable result: " +
+            log"${MDC(ERROR, ef.description)}; not retrying")
+          emptyTaskInfoAccumulablesAndNotifyDagScheduler(tid, tasks(index), reason, null,
+            accumUpdates, metricPeaks)
           abort(s"$task had a not serializable result: ${ef.description}")
           return
         }
         if (ef.className == classOf[TaskOutputFileAlreadyExistException].getName) {
           // If we can not write to output file in the task, there's no point in trying to
           // re-execute it.
-          logError("Task %s in stage %s (TID %d) can not write to output file: %s; not retrying"
-            .format(info.id, taskSet.id, tid, ef.description))
+          logError(
+            log"Task ${MDC(TASK_INDEX, info.index)}.${MDC(TASK_ATTEMPT_ID, info.attemptNumber)} " +
+              log"in stage ${MDC(STAGE_ID, taskSet.stageId)}." +
+            log"${MDC(STAGE_ATTEMPT_ID, taskSet.stageAttemptId)} (TID ${MDC(TASK_ID, tid)}) " +
+            log"can not write to output file: ${MDC(ERROR, ef.description)}; not retrying")
+          emptyTaskInfoAccumulablesAndNotifyDagScheduler(tid, tasks(index), reason, null,
+            accumUpdates, metricPeaks)
           abort("Task %s in stage %s (TID %d) can not write to output file: %s".format(
             info.id, taskSet.id, tid, ef.description))
           return
@@ -920,8 +1087,10 @@ private[spark] class TaskSetManager(
           logWarning(failureReason)
         } else {
           logInfo(
-            s"Lost $task on ${info.host}, executor ${info.executorId}: " +
-              s"${ef.className} (${ef.description}) [duplicate $dupCount]")
+            log"Lost ${MDC(TASK_NAME, task)} on ${MDC(HOST, info.host)}, " +
+            log"executor ${MDC(LogKeys.EXECUTOR_ID, info.executorId)}: " +
+            log"${MDC(CLASS_NAME, ef.className)} " +
+            log"(${MDC(DESCRIPTION, ef.description)}) [duplicate ${MDC(COUNT, dupCount)}]")
         }
         ef.exception
 
@@ -933,12 +1102,18 @@ private[spark] class TaskSetManager(
         None
 
       case e: ExecutorLostFailure if !e.exitCausedByApp =>
-        logInfo(s"${taskName(tid)} failed because while it was being computed, its executor " +
-          "exited for a reason unrelated to the task. Not counting this failure towards the " +
-          "maximum number of failures for the task.")
+        logInfo(log"${MDC(TASK_NAME, taskName(tid))} failed because while it was being computed," +
+          log" its executor exited for a reason unrelated to the task. " +
+          log"Not counting this failure towards the maximum number of failures for the task.")
         None
 
-      case e: TaskFailedReason =>  // TaskResultLost and others
+      case _: ExecutorShutdownFailure =>
+        logInfo(log"${MDC(TASK_NAME, taskName(tid))} failed because its executor was shutting" +
+          log" down while the task was being launched." +
+          log" Not counting this failure towards the maximum number of failures for the task.")
+        None
+
+      case _: TaskFailedReason =>  // TaskResultLost and others
         logWarning(failureReason)
         None
     }
@@ -947,27 +1122,41 @@ private[spark] class TaskSetManager(
       isZombie = true
     }
 
-    sched.dagScheduler.taskEnded(tasks(index), reason, null, accumUpdates, metricPeaks, info)
+    emptyTaskInfoAccumulablesAndNotifyDagScheduler(tid, tasks(index), reason, null,
+      accumUpdates, metricPeaks)
 
-    if (!isZombie && reason.countTowardsTaskFailures) {
+    // A pipelined-group member's transient shuffle cannot be recovered per-task: the rest of the
+    // group has already exchanged part of the stream with this attempt, so retrying the task in
+    // the same stage attempt could deliver rows twice (a producer) or wait for a stream that is
+    // gone (a consumer). So every failure of a live pipelined attempt counts, even a reason that
+    // is normally not counted -- executor loss not caused by the app, a kill (e.g.
+    // SparkContext.killTaskAttempt), or a denied commit -- and the first one fails the group; the
+    // caller reruns it as a fresh job. None of these is benign: a pipelined task runs a single
+    // attempt (a pipelined job rejects speculation, and a failure aborts the set rather than
+    // retrying the task), so there is no losing duplicate to forgive. The kills the scheduler
+    // itself sends when it fails, cancels, or finishes the job do not count: killAllTaskAttempts
+    // makes the set a zombie before they are reported. Non-pipelined sets are unchanged.
+    val countTowardsTaskFailures = reason.countTowardsTaskFailures || taskSet.isPipelined
+    if (!isZombie && countTowardsTaskFailures) {
       assert (null != failureReason)
       taskSetExcludelistHelperOpt.foreach(_.updateExcludedForFailedTask(
-        info.host, info.executorId, index, failureReason))
+        info.host, info.executorId, index, failureReasonString))
       numFailures(index) += 1
-      if (numFailures(index) >= maxTaskFailures) {
-        logError("Task %d in stage %s failed %d times; aborting job".format(
-          index, taskSet.id, maxTaskFailures))
+      if (numFailures(index) >= effectiveMaxTaskFailures) {
+        logError(log"Task ${MDC(TASK_INDEX, index)} in stage " + taskSet.logId +
+          log" failed ${MDC(MAX_ATTEMPTS, effectiveMaxTaskFailures)} times; aborting job")
         abort("Task %d in stage %s failed %d times, most recent failure: %s\nDriver stacktrace:"
-          .format(index, taskSet.id, maxTaskFailures, failureReason), failureException)
+          .format(index, taskSet.id, effectiveMaxTaskFailures, failureReasonString),
+          failureException)
         return
       }
     }
 
     if (successful(index)) {
-      logInfo(s"${taskName(info.taskId)} failed, but the task will not" +
-        " be re-executed (either because the task failed with a shuffle data fetch failure," +
-        " so the previous stage needs to be re-run, or because a different copy of the task" +
-        " has already succeeded).")
+      logInfo(log"${MDC(LogKeys.TASK_NAME, taskName(info.taskId))} failed, but the task will not" +
+        log" be re-executed (either because the task failed with a shuffle data fetch failure," +
+        log" so the previous stage needs to be re-run, or because a different copy of the task" +
+        log" has already succeeded).")
     } else {
       addPendingTask(index)
     }
@@ -976,8 +1165,18 @@ private[spark] class TaskSetManager(
   }
 
   def abort(message: String, exception: Option[Throwable] = None): Unit = sched.synchronized {
-    // TODO: Kill running tasks if we were not terminated due to a Mesos error
     sched.dagScheduler.taskSetFailed(taskSet, message, exception)
+    isZombie = true
+    maybeFinishTaskSet()
+  }
+
+  // Suspends this TSM to avoid launching new tasks.
+  //
+  // Unlike `abort()`, this function intentionally to not notify DAGScheduler to avoid
+  // redundant operations. So the invocation to this function should assume DAGScheduler
+  // already knows about this TSM failure. For example, this function can be called from
+  // `TaskScheduler.killAllTaskAttempts` by DAGScheduler.
+  def suspend(): Unit = {
     isZombie = true
     maybeFinishTaskSet()
   }
@@ -1010,7 +1209,7 @@ private[spark] class TaskSetManager(
 
   override def removeSchedulable(schedulable: Schedulable): Unit = {}
 
-  override def getSortedTaskSetQueue(): ArrayBuffer[TaskSetManager] = {
+  override def getSortedTaskSetQueue: ArrayBuffer[TaskSetManager] = {
     val sortedTaskSetQueue = new ArrayBuffer[TaskSetManager]()
     sortedTaskSetQueue += this
     sortedTaskSetQueue
@@ -1018,37 +1217,87 @@ private[spark] class TaskSetManager(
 
   /** Called by TaskScheduler when an executor is lost so we can re-enqueue our tasks */
   override def executorLost(execId: String, host: String, reason: ExecutorLossReason): Unit = {
-    // Re-enqueue any tasks that ran on the failed executor if this is a shuffle map stage,
-    // and we are not using an external shuffle server which could serve the shuffle outputs.
-    // The reason is the next stage wouldn't be able to fetch the data from this dead executor
-    // so we would need to rerun these tasks on other executors.
-    if (isShuffleMapTasks && !env.blockManager.externalShuffleServiceEnabled && !isZombie) {
-      for ((tid, info) <- taskInfos if info.executorId == execId) {
+    val taskIdsOnExec = executorIdToTaskIds.getOrElse(execId, TaskSetManager.EMPTY_LONG_SET)
+    // Re-enqueue any tasks with potential shuffle data loss that ran on the failed executor
+    // if this is a shuffle map stage, and we are not using an external shuffle server which
+    // could serve the shuffle outputs or the executor lost is caused by decommission (which
+    // can destroy the whole host). The reason is the next stage wouldn't be able to fetch the
+    // data from this dead executor so we would need to rerun these tasks on other executors.
+    // A pipelined-group member must never single-resubmit an already-successful map task: its
+    // transient shuffle output is not addressable and a lone producer rerun hangs the streaming
+    // writer in awaitTerminationAcks. This "Resubmitted" re-enqueue loop bypasses handleFailedTask,
+    // so the group-atomic abort (driven from handleFailedTask via maxTaskFailures=1) would never
+    // see it; exclude pipelined sets here. A genuine executor loss still flows through the
+    // running-task loop below (iter2 -> handleFailedTask(ExecutorLostFailure)), force-counted for a
+    // pipelined set and aborts the whole group. Note isZombie already skips a fully-complete
+    // producer's set; this guard also covers a PARTIALLY-complete producer losing an executor on
+    // decommission.
+    val maybeShuffleMapOutputLoss = isShuffleMapTasks && !taskSet.isPipelined &&
+      !sched.sc.shuffleDriverComponents.supportsReliableStorage() &&
+      (reason.isInstanceOf[ExecutorDecommission] || !env.blockManager.externalShuffleServiceEnabled)
+    if (maybeShuffleMapOutputLoss && !isZombie) {
+      val iter1 = taskIdsOnExec.iterator
+      while (iter1.hasNext) {
+        val tid = iter1.next()
+        val info = taskInfos(tid)
         val index = info.index
+        lazy val isShuffleMapOutputAvailable = reason match {
+          case ExecutorDecommission(_, _) =>
+            val mapId = if (conf.get(config.SHUFFLE_USE_OLD_FETCH_PROTOCOL)) {
+              info.partitionId
+            } else {
+              tid
+            }
+            val locationOpt = env.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster]
+              .getMapOutputLocation(shuffleId.get, mapId)
+            // There are 3 cases of locationOpt:
+            // 1) locationOpt.isDefined && locationOpt.get.host == host:
+            //    this case implies that the shuffle map output is still on the lost executor. The
+            //    map output file is supposed to lose so we should rerun this task;
+            // 2) locationOpt.isDefined && locationOpt.get.host != host:
+            //    this case implies that the shuffle map output has been migrated to another
+            //    host. The task doesn't need to rerun;
+            // 3) locationOpt.isEmpty:
+            //    This shouldn't not happen ideally since TaskSetManager handles executor lost first
+            //    before DAGScheduler. So the map statues for the successful task must be available
+            //    at this moment. keep it here in case the handling order changes.
+            locationOpt.exists(_.host != host)
+
+          case _ => false
+        }
         // We may have a running task whose partition has been marked as successful,
         // this partition has another task completed in another stage attempt.
         // We treat it as a running task and will call handleFailedTask later.
-        if (successful(index) && !info.running && !killedByOtherAttempt.contains(tid)) {
+        if (successful(index) && !info.running && !killedByOtherAttempt.contains(tid) &&
+            !isShuffleMapOutputAvailable) {
           successful(index) = false
           copiesRunning(index) -= 1
           tasksSuccessful -= 1
           addPendingTask(index)
           // Tell the DAGScheduler that this task was resubmitted so that it doesn't think our
           // stage finishes when a total of tasks.size tasks finish.
-          sched.dagScheduler.taskEnded(
-            tasks(index), Resubmitted, null, Seq.empty, Array.empty, info)
+          emptyTaskInfoAccumulablesAndNotifyDagScheduler(tid,
+            tasks(index), Resubmitted, null, Seq.empty, Array.empty)
         }
       }
     }
-    for ((tid, info) <- taskInfos if info.running && info.executorId == execId) {
-      val exitCausedByApp: Boolean = reason match {
-        case exited: ExecutorExited => exited.exitCausedByApp
-        case ExecutorKilled | ExecutorDecommission(_) => false
-        case ExecutorProcessLost(_, _, false) => false
-        case _ => true
+    val iter2 = taskIdsOnExec.iterator
+    while (iter2.hasNext) {
+      val tid = iter2.next()
+      val info = taskInfos(tid)
+      if (info.running) {
+        val exitCausedByApp: Boolean = reason match {
+          case ExecutorExited(_, false, _) => false
+          case ExecutorKilled | ExecutorDecommission(_, _) => false
+          case ExecutorProcessLost(_, _, false) => false
+          // If the task is launching, this indicates that Driver has sent LaunchTask to Executor,
+          // but Executor has not sent StatusUpdate(TaskState.RUNNING) to Driver. Hence, we assume
+          // that the task is not running, and it is NetworkFailure rather than TaskFailure.
+          case _ => !info.launching
+        }
+        handleFailedTask(tid, TaskState.FAILED, ExecutorLostFailure(info.executorId,
+          exitCausedByApp, Some(reason.toString)))
       }
-      handleFailedTask(tid, TaskState.FAILED, ExecutorLostFailure(info.executorId, exitCausedByApp,
-        Some(reason.toString)))
     }
     // recalculate valid locality levels and waits when executor is lost
     recomputeLocality()
@@ -1058,25 +1307,67 @@ private[spark] class TaskSetManager(
    * Check if the task associated with the given tid has past the time threshold and should be
    * speculative run.
    */
-  private def checkAndSubmitSpeculatableTask(
-      tid: Long,
+  private def checkAndSubmitSpeculatableTasks(
       currentTimeMillis: Long,
-      threshold: Double): Boolean = {
-    val info = taskInfos(tid)
-    val index = info.index
-    if (!successful(index) && copiesRunning(index) == 1 &&
-        info.timeRunning(currentTimeMillis) > threshold && !speculatableTasks.contains(index)) {
-      addPendingTask(index, speculatable = true)
-      logInfo(
-        ("Marking task %d in stage %s (on %s) as speculatable because it ran more" +
-          " than %.0f ms(%d speculatable tasks in this taskset now)")
-          .format(index, taskSet.id, info.host, threshold, speculatableTasks.size + 1))
-      speculatableTasks += index
-      sched.dagScheduler.speculativeTaskSubmitted(tasks(index))
-      true
-    } else {
-      false
+      threshold: Double,
+      customizedThreshold: Boolean = false): Boolean = {
+    var foundTasksResult = false
+    for (tid <- runningTasksSet) {
+      val info = taskInfos(tid)
+      val index = info.index
+      if (!successful(index) && copiesRunning(index) == 1 && !speculatableTasks.contains(index)) {
+        val runtimeMs = info.timeRunning(currentTimeMillis)
+
+        def checkMaySpeculate(): Boolean = {
+          if (customizedThreshold || taskProcessRateCalculator.isEmpty) {
+            true
+          } else {
+            isInefficient()
+          }
+        }
+
+        def isInefficient(): Boolean = {
+          (runtimeMs > efficientTaskDurationFactor * threshold) || taskProcessRateIsInefficient()
+        }
+
+        def taskProcessRateIsInefficient(): Boolean = {
+          taskProcessRateCalculator.forall(calculator => {
+            calculator.getRunningTasksProcessRate(tid) <
+              calculator.getAvgTaskProcessRate() * efficientTaskProcessMultiplier
+          })
+        }
+
+        def shouldSpeculateForExecutorDecommissioning(): Boolean = {
+          !customizedThreshold && executorDecommissionKillInterval.isDefined &&
+            !successfulTaskDurations.isEmpty() &&
+            sched.getExecutorDecommissionState(info.executorId).exists { decomState =>
+              // Check if this task might finish after this executor is decommissioned.
+              // We estimate the task's finish time by using the median task duration.
+              // Whereas the time when the executor might be decommissioned is estimated using the
+              // config executorDecommissionKillInterval. If the task is going to finish after
+              // decommissioning, then we will eagerly speculate the task.
+              val taskEndTimeBasedOnMedianDuration =
+                info.launchTime + successfulTaskDurations.percentile()
+              val executorDecomTime = decomState.startTime + executorDecommissionKillInterval.get
+              executorDecomTime < taskEndTimeBasedOnMedianDuration
+            }
+        }
+        val speculated = (runtimeMs > threshold) && checkMaySpeculate() ||
+          shouldSpeculateForExecutorDecommissioning()
+        if (speculated) {
+          addPendingTask(index, speculatable = true)
+          logInfo(
+            log"Marking task ${MDC(TASK_INDEX, index)} in stage " + taskSet.logId +
+            log" (on ${MDC(HOST, info.host)}) as speculatable because it ran more than " +
+            log"${MDC(TIMEOUT, threshold)} ms(${MDC(NUM_TASKS, speculatableTasks.size + 1)}" +
+            log"speculatable tasks in this taskset now)")
+          speculatableTasks += index
+          sched.dagScheduler.speculativeTaskSubmitted(tasks(index), index)
+        }
+        foundTasksResult |= speculated
+      }
     }
+    foundTasksResult
   }
 
   /**
@@ -1088,7 +1379,7 @@ private[spark] class TaskSetManager(
     // No need to speculate if the task set is zombie or is from a barrier stage. If there is only
     // one task we don't speculate since we don't have metrics to decide whether it's taking too
     // long or not, unless a task duration threshold is explicitly provided.
-    if (isZombie || isBarrier || (numTasks == 1 && !speculationTaskDurationThresOpt.isDefined)) {
+    if (isZombie || isBarrier || (numTasks == 1 && !isSpeculationThresholdSpecified)) {
       return false
     }
     var foundTasks = false
@@ -1098,40 +1389,26 @@ private[spark] class TaskSetManager(
     // `successfulTaskDurations` may not equal to `tasksSuccessful`. Here we should only count the
     // tasks that are submitted by this `TaskSetManager` and are completed successfully.
     val numSuccessfulTasks = successfulTaskDurations.size()
+    val timeMs = clock.getTimeMillis()
     if (numSuccessfulTasks >= minFinishedForSpeculation) {
-      val time = clock.getTimeMillis()
-      val medianDuration = successfulTaskDurations.median
-      val threshold = max(speculationMultiplier * medianDuration, minTimeToSpeculation)
+      val medianDuration = successfulTaskDurations.percentile()
+      val threshold = max(speculationMultiplier * medianDuration, minTimeToSpeculation.toDouble)
       // TODO: Threshold should also look at standard deviation of task durations and have a lower
       // bound based on that.
       logDebug("Task length threshold for speculation: " + threshold)
-      for (tid <- runningTasksSet) {
-        var speculated = checkAndSubmitSpeculatableTask(tid, time, threshold)
-        if (!speculated && executorDecommissionKillInterval.isDefined) {
-          val taskInfo = taskInfos(tid)
-          val decomState = sched.getExecutorDecommissionState(taskInfo.executorId)
-          if (decomState.isDefined) {
-            // Check if this task might finish after this executor is decommissioned.
-            // We estimate the task's finish time by using the median task duration.
-            // Whereas the time when the executor might be decommissioned is estimated using the
-            // config executorDecommissionKillInterval. If the task is going to finish after
-            // decommissioning, then we will eagerly speculate the task.
-            val taskEndTimeBasedOnMedianDuration = taskInfos(tid).launchTime + medianDuration
-            val executorDecomTime = decomState.get.startTime + executorDecommissionKillInterval.get
-            val canExceedDeadline = executorDecomTime < taskEndTimeBasedOnMedianDuration
-            if (canExceedDeadline) {
-              speculated = checkAndSubmitSpeculatableTask(tid, time, 0)
-            }
-          }
-        }
-        foundTasks |= speculated
-      }
-    } else if (speculationTaskDurationThresOpt.isDefined && speculationTasksLessEqToSlots) {
-      val time = clock.getTimeMillis()
+      foundTasks = checkAndSubmitSpeculatableTasks(timeMs, threshold)
+    } else if (isSpeculationThresholdSpecified && speculationTasksLessEqToSlots) {
       val threshold = speculationTaskDurationThresOpt.get
       logDebug(s"Tasks taking longer time than provided speculation threshold: $threshold")
-      for (tid <- runningTasksSet) {
-        foundTasks |= checkAndSubmitSpeculatableTask(tid, time, threshold)
+      foundTasks = checkAndSubmitSpeculatableTasks(
+        timeMs, threshold.toDouble, customizedThreshold = true)
+    }
+    // avoid more warning logs.
+    if (foundTasks) {
+      val elapsedMs = clock.getTimeMillis() - timeMs
+      if (elapsedMs > minTimeToSpeculation) {
+        logWarning(log"Time to checkSpeculatableTasks ${MDC(TIME_UNITS, elapsedMs)}ms > " +
+          log"${MDC(MIN_TIME, minTimeToSpeculation)}ms")
       }
     }
     foundTasks
@@ -1207,6 +1484,55 @@ private[spark] class TaskSetManager(
   def executorAdded(): Unit = {
     recomputeLocality()
   }
+
+  /**
+   * A class for checking inefficient tasks to be speculated, a task is inefficient when its data
+   * process rate is less than the average data process rate of all successful tasks in the stage
+   * multiplied by a multiplier.
+   */
+  private[TaskSetManager] class TaskProcessRateCalculator {
+    private var totalRecordsRead = 0L
+    private var totalExecutorRunTime = 0L
+    private var avgTaskProcessRate = Double.MaxValue
+    private val runningTasksProcessRate = new ConcurrentHashMap[Long, Double]()
+
+    private[TaskSetManager] def getAvgTaskProcessRate(): Double = {
+      avgTaskProcessRate
+    }
+
+    private[TaskSetManager] def getRunningTasksProcessRate(taskId: Long): Double = {
+      runningTasksProcessRate.getOrDefault(taskId, 0.0)
+    }
+
+    private[TaskSetManager] def updateAvgTaskProcessRate(
+        taskId: Long,
+        result: DirectTaskResult[_]): Unit = {
+      var recordsRead = 0L
+      var executorRunTime = 0L
+      result.accumUpdates.foreach { a =>
+        if (a.name == Some(shuffleRead.RECORDS_READ) ||
+          a.name == Some(input.RECORDS_READ)) {
+          val acc = a.asInstanceOf[LongAccumulator]
+          recordsRead += acc.value
+        } else if (a.name == Some(InternalAccumulator.EXECUTOR_RUN_TIME)) {
+          val acc = a.asInstanceOf[LongAccumulator]
+          executorRunTime = acc.value
+        }
+      }
+      totalRecordsRead += recordsRead
+      totalExecutorRunTime += executorRunTime
+      if (totalRecordsRead > 0 && totalExecutorRunTime > 0) {
+        avgTaskProcessRate = sched.getTaskProcessRate(totalRecordsRead, totalExecutorRunTime)
+      }
+      runningTasksProcessRate.remove(taskId)
+    }
+
+    private[scheduler] def updateRunningTaskProcessRate(
+        taskId: Long,
+        taskProcessRate: Double): Unit = {
+      runningTasksProcessRate.put(taskId, taskProcessRate)
+    }
+  }
 }
 
 private[spark] object TaskSetManager {
@@ -1216,6 +1542,10 @@ private[spark] object TaskSetManager {
 
   // 1 minute
   val BARRIER_LOGGING_INTERVAL = 60000
+
+  // Shared empty set used as default value for executorIdToTaskIds lookups
+  // to avoid allocating a new empty set on each executorLost call.
+  private val EMPTY_LONG_SET = new OpenHashSet[Long](0)
 }
 
 /**
@@ -1252,10 +1582,10 @@ private[scheduler] case class BarrierPendingLaunchTask(
     host: String,
     index: Int,
     taskLocality: TaskLocality.TaskLocality,
-    assignedResources: Map[String, ResourceInformation]) {
+    assignedResources: Map[String, Map[String, Long]]) {
   // Stored the corresponding index of the WorkerOffer which is responsible to launch the task.
   // Used to revert the assigned resources (e.g., cores, custome resources) when the barrier
   // task set doesn't launch successfully in a single resourceOffers round.
   var assignedOfferIndex: Int = _
-  var assignedCores: Int = 0
+  var assignedCores: BigDecimal = CpuAmount.normalize(BigDecimal(0))
 }

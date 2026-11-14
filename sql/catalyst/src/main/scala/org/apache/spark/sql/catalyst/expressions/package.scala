@@ -21,8 +21,9 @@ import java.util.Locale
 
 import com.google.common.collect.Maps
 
-import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.analysis.{Resolver, UnresolvedAttribute}
+import org.apache.spark.sql.catalyst.util.MetadataColumnHelper
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.types.{StructField, StructType}
 
 /**
@@ -67,21 +68,22 @@ package object expressions  {
    * column of the new row. If the schema of the input row is specified, then the given expression
    * will be bound to that schema.
    */
-  abstract class Projection extends (InternalRow => InternalRow) {
-
-    /**
-     * Initializes internal states given the current partition index.
-     * This is used by nondeterministic expressions to set initial states.
-     * The default implementation does nothing.
-     */
-    def initialize(partitionIndex: Int): Unit = {}
-  }
+  abstract class Projection extends (InternalRow => InternalRow) with ExpressionsEvaluator
 
   /**
    * An identity projection. This returns the input row.
    */
   object IdentityProjection extends Projection {
     override def apply(row: InternalRow): InternalRow = row
+  }
+
+  object AttributeSeq {
+    def fromNormalOutput(attr: Seq[Attribute]): AttributeSeq = {
+      // Normal output attributes should never have the special flag that allows only qualified
+      // access. In case something goes wrong, like a scan relation from a custom data source,
+      // we explicitly remove that special flag to be safe.
+      new AttributeSeq(attr.map(_.markAsAllowAnyAccess()))
+    }
   }
 
   /**
@@ -97,6 +99,13 @@ package object expressions  {
     // accessing attributes by their ordinals. To avoid this performance penalty, convert the input
     // to an array.
     @transient private lazy val attrsArray = attrs.toArray
+
+    // Attributes with a null name (e.g. produced from a StructField built with a null name via
+    // the DataFrame API) are unaddressable by any column reference, whose name parts are never
+    // null. Exclude them from the case-insensitive name maps below so that grouping by the
+    // lower-cased name does not throw a NullPointerException during resolution (SPARK-57725).
+    // Filter attrsArray (not attrs) to avoid re-traversing a possibly linked-list attrs.
+    @transient private lazy val namedAttrs: Seq[Attribute] = attrsArray.filter(_.name != null).toSeq
 
     @transient private lazy val exprIdToOrdinal = {
       val arr = attrsArray
@@ -124,18 +133,18 @@ package object expressions  {
     }
 
     private def unique[T](m: Map[T, Seq[Attribute]]): Map[T, Seq[Attribute]] = {
-      m.mapValues(_.distinct).toMap
+      m.transform((_, v) => v.distinct)
     }
 
     /** Map to use for direct case insensitive attribute lookups. */
     @transient private lazy val direct: Map[String, Seq[Attribute]] = {
-      unique(attrs.groupBy(_.name.toLowerCase(Locale.ROOT)))
+      unique(namedAttrs.groupBy(_.name.toLowerCase(Locale.ROOT)))
     }
 
     /** Map to use for qualified case insensitive attribute lookups with 2 part key */
     @transient private lazy val qualified: Map[(String, String), Seq[Attribute]] = {
       // key is 2 part: table/alias and name
-      val grouped = attrs.filter(_.qualifier.nonEmpty).groupBy {
+      val grouped = namedAttrs.filter(_.qualifier.nonEmpty).groupBy {
         a => (a.qualifier.last.toLowerCase(Locale.ROOT), a.name.toLowerCase(Locale.ROOT))
       }
       unique(grouped)
@@ -144,7 +153,7 @@ package object expressions  {
     /** Map to use for qualified case insensitive attribute lookups with 3 part key */
     @transient private lazy val qualified3Part: Map[(String, String, String), Seq[Attribute]] = {
       // key is 3 part: database name, table name and name
-      val grouped = attrs.filter(a => a.qualifier.length >= 2 && a.qualifier.length <= 3)
+      val grouped = namedAttrs.filter(a => a.qualifier.length >= 2 && a.qualifier.length <= 3)
         .groupBy { a =>
           val qualifier = if (a.qualifier.length == 2) {
             a.qualifier
@@ -162,7 +171,7 @@ package object expressions  {
     @transient
     private lazy val qualified4Part: Map[(String, String, String, String), Seq[Attribute]] = {
       // key is 4 part: catalog name, database name, table name and name
-      val grouped = attrs.filter(_.qualifier.length == 3).groupBy { a =>
+      val grouped = namedAttrs.filter(_.qualifier.length == 3).groupBy { a =>
         a.qualifier match {
           case Seq(catalog, db, tbl) =>
             (catalog.toLowerCase(Locale.ROOT),
@@ -265,7 +274,7 @@ package object expressions  {
         case (Seq(), _) =>
           val name = nameParts.head
           val attributes = collectMatches(name, direct.get(name.toLowerCase(Locale.ROOT)))
-          (attributes, nameParts.tail)
+          (attributes.filterNot(_.qualifiedAccessOnly), nameParts.tail)
         case _ => matches
       }
     }
@@ -314,10 +323,12 @@ package object expressions  {
       var i = nameParts.length - 1
       while (i >= 0 && candidates.isEmpty) {
         val name = nameParts(i)
-        candidates = collectMatches(
-          name,
-          nameParts.take(i),
-          direct.get(name.toLowerCase(Locale.ROOT)))
+        val attrsToLookup = if (i == 0) {
+          direct.get(name.toLowerCase(Locale.ROOT)).map(_.filterNot(_.qualifiedAccessOnly))
+        } else {
+          direct.get(name.toLowerCase(Locale.ROOT))
+        }
+        candidates = collectMatches(name, nameParts.take(i), attrsToLookup)
         if (candidates.nonEmpty) {
           nestedFields = nameParts.takeRight(nameParts.length - i - 1)
         }
@@ -327,16 +338,63 @@ package object expressions  {
       (candidates, nestedFields)
     }
 
-    /** Perform attribute resolution given a name and a resolver. */
+    /**
+     * Resolve `nameParts` into a specific [[NamedExpression]] using the provided `resolver`.
+     *
+     * This method finds all suitable candidates for the resolution based on the name matches and
+     * checks if the nested fields are requested.
+     * - If there's only one match and nested fields are requested, wrap the matched attribute with
+     *   [[ExtractValue]], and recursively wrap that with additional [[ExtractValue]]s
+     *   for each nested field. In the end, alias the final expression with the last nested field
+     *   name.
+     * - If there's only one match and no nested fields are requested, return the matched attribute.
+     * - If there are no matches, return None.
+     * - If there is more than one match, throw [[QueryCompilationErrors.ambiguousReferenceError]].
+     */
     def resolve(nameParts: Seq[String], resolver: Resolver): Option[NamedExpression] = {
+      val (candidates, nestedFields) = getCandidatesForResolution(nameParts, resolver)
+      val resolvedCandidates = resolveCandidates(nameParts, resolver, candidates, nestedFields)
+      resolvedCandidates match {
+        case Seq() => None
+        case Seq(a) => Some(a)
+        case _ =>
+          throw QueryCompilationErrors.ambiguousReferenceError(
+            UnresolvedAttribute(nameParts).name,
+            resolvedCandidates.map(_.toAttribute)
+          )
+      }
+    }
+
+    def getCandidatesForResolution(
+        nameParts: Seq[String],
+        resolver: Resolver): (Seq[Attribute], Seq[String]) = {
       val (candidates, nestedFields) = if (hasThreeOrLessQualifierParts) {
         matchWithThreeOrLessQualifierParts(nameParts, resolver)
       } else {
         matchWithFourOrMoreQualifierParts(nameParts, resolver)
       }
 
+      val prunedCandidates = if (candidates.size > 1) {
+        candidates.filter(c => !c.metadata.contains("__is_duplicate"))
+      } else {
+        candidates
+      }
+
+      (prunedCandidates, nestedFields)
+    }
+
+    def resolveCandidates(
+        nameParts: Seq[String],
+        resolver: Resolver,
+        candidates: Seq[Attribute],
+        nestedFields: Seq[String]): Seq[NamedExpression] = {
       def name = UnresolvedAttribute(nameParts).name
-      candidates match {
+      // We may have resolved the attributes from metadata columns. The resolved attributes will be
+      // put in a logical plan node and becomes normal attributes. They can still keep the special
+      // attribute metadata to indicate that they are from metadata columns, but they should not
+      // keep any restrictions that may break column resolution for normal attributes.
+      // See SPARK-42084 for more details.
+      candidates.distinct.map(_.markAsAllowAnyAccess()) match {
         case Seq(a) if nestedFields.nonEmpty =>
           // One match, but we also need to extract the requested nested field.
           // The foldLeft adds ExtractValues for every remaining parts of the identifier,
@@ -345,30 +403,24 @@ package object expressions  {
           // Then this will add ExtractValue("c", ExtractValue("b", a)), and alias the final
           // expression as "c".
           val fieldExprs = nestedFields.foldLeft(a: Expression) { (e, name) =>
-            ExtractValue(e, Literal(name), resolver)
+            // applyOrNull propagates NULL when the base is NullType (e.g. a NullType column from
+            // schema evolution) instead of throwing INVALID_EXTRACT_BASE_FIELD_TYPE.
+            ExtractValue.applyOrNull(e, Literal(name), resolver)
           }
-          Some(Alias(fieldExprs, nestedFields.last)())
+          Seq(Alias(fieldExprs, nestedFields.last)())
 
         case Seq(a) =>
           // One match, no nested fields, use it.
-          Some(a)
+          Seq(a)
 
         case Seq() =>
           // No matches.
-          None
+          Seq()
 
         case ambiguousReferences =>
           // More than one match.
-          val referenceNames = ambiguousReferences.map(_.qualifiedName).mkString(", ")
-          throw new AnalysisException(s"Reference '$name' is ambiguous, could be: $referenceNames.")
+          ambiguousReferences
       }
     }
   }
-
-  /**
-   * When an expression inherits this, meaning the expression is null intolerant (i.e. any null
-   * input will result in null output). We will use this information during constructing IsNotNull
-   * constraints.
-   */
-  trait NullIntolerant extends Expression
 }

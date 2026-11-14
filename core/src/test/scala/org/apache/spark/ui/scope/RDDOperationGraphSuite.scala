@@ -17,10 +17,12 @@
 
 package org.apache.spark.ui.scope
 
+import org.scalatest.PrivateMethodTester
+
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.rdd.DeterministicLevel
 
-class RDDOperationGraphSuite extends SparkFunSuite {
+class RDDOperationGraphSuite extends SparkFunSuite with PrivateMethodTester {
   test("Test simple cluster equals") {
     // create a 2-cluster chain with a child
     val c1 = new RDDOperationCluster("1", false, "Bender")
@@ -35,5 +37,23 @@ class RDDOperationGraphSuite extends SparkFunSuite {
     c1copy.attachChildCluster(c2copy)
 
     assert(c1 == c1copy)
+  }
+
+  test("SPARK-43441: makeDotNode should not fail when DeterministicLevel is absent") {
+    val node = new RDDOperationNode(0, "", false, false, "", null)
+    val _makeDotNode = PrivateMethod[String](Symbol("makeDotNode"))
+    RDDOperationGraph.invokePrivate(_makeDotNode(node))
+  }
+
+  test("RDD names are HTML-escaped in html-type dagre labels") {
+    // RDD names come from application code and these labels are rendered as HTML.
+    val name = "RDD <b>name</b> & more"
+    val node = new RDDOperationNode(1, name, false, false, "callsite",
+      DeterministicLevel.DETERMINATE)
+    val _makeDotNode = PrivateMethod[String](Symbol("makeDotNode"))
+    val dotNode = RDDOperationGraph.invokePrivate(_makeDotNode(node))
+    assert(dotNode.contains("&lt;b&gt;name&lt;/b&gt; &amp; more"))
+    // The intentional <br> separator between name and callsite must be preserved.
+    assert(dotNode.contains("<br>callsite"))
   }
 }

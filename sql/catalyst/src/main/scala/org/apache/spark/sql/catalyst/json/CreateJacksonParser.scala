@@ -17,19 +17,18 @@
 
 package org.apache.spark.sql.catalyst.json
 
-import java.io.{ByteArrayInputStream, InputStream, InputStreamReader}
+import java.io.{ByteArrayInputStream, InputStream, InputStreamReader, Reader}
 import java.nio.channels.Channels
-import java.nio.charset.Charset
 import java.nio.charset.StandardCharsets
 
 import com.fasterxml.jackson.core.{JsonFactory, JsonParser}
 import org.apache.hadoop.io.Text
-import sun.nio.cs.StreamDecoder
 
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.util.CharsetProvider
 import org.apache.spark.unsafe.types.UTF8String
 
-private[sql] object CreateJacksonParser extends Serializable {
+object CreateJacksonParser extends Serializable {
   def string(jsonFactory: JsonFactory, record: String): JsonParser = {
     jsonFactory.createParser(record)
   }
@@ -58,17 +57,28 @@ private[sql] object CreateJacksonParser extends Serializable {
   //    a reader with specific encoding.
   // The method creates a reader for an array with given encoding and sets size of internal
   // decoding buffer according to size of input array.
-  private def getStreamDecoder(enc: String, in: Array[Byte], length: Int): StreamDecoder = {
+  private def getStreamDecoder(
+      enc: String,
+      in: Array[Byte],
+      length: Int,
+      legacyCharsets: Boolean,
+      legacyErrorAction: Boolean): Reader = {
     val bais = new ByteArrayInputStream(in, 0, length)
     val byteChannel = Channels.newChannel(bais)
     val decodingBufferSize = Math.min(length, 8192)
-    val decoder = Charset.forName(enc).newDecoder()
-
-    StreamDecoder.forDecoder(byteChannel, decoder, decodingBufferSize)
+    val decoder = CharsetProvider.newDecoder(
+      enc, legacyCharsets, legacyErrorAction, caller = "Jackson Parser")
+    Channels.newReader(byteChannel, decoder, decodingBufferSize)
   }
 
-  def text(enc: String, jsonFactory: JsonFactory, record: Text): JsonParser = {
-    val sd = getStreamDecoder(enc, record.getBytes, record.getLength)
+  def text(
+      enc: String,
+      legacyCharsets: Boolean,
+      legacyErrorAction: Boolean,
+      jsonFactory: JsonFactory,
+      record: Text): JsonParser = {
+    val sd = getStreamDecoder(enc, record.getBytes, record.getLength, legacyCharsets,
+      legacyErrorAction)
     jsonFactory.createParser(sd)
   }
 
@@ -86,9 +96,29 @@ private[sql] object CreateJacksonParser extends Serializable {
     jsonFactory.createParser(ba, 0, ba.length)
   }
 
-  def internalRow(enc: String, jsonFactory: JsonFactory, row: InternalRow): JsonParser = {
+  def internalRow(
+      enc: String,
+      legacyCharsets: Boolean,
+      legacyErrorAction: Boolean,
+      jsonFactory: JsonFactory,
+      row: InternalRow): JsonParser = {
     val binary = row.getBinary(0)
-    val sd = getStreamDecoder(enc, binary, binary.length)
+    val sd = getStreamDecoder(enc, binary, binary.length, legacyCharsets, legacyErrorAction)
+
+    jsonFactory.createParser(sd)
+  }
+
+  def bytes(jsonFactory: JsonFactory, record: Array[Byte]): JsonParser = {
+    jsonFactory.createParser(record, 0, record.length)
+  }
+
+  def bytes(
+      enc: String,
+      legacyCharsets: Boolean,
+      legacyErrorAction: Boolean,
+      jsonFactory: JsonFactory,
+      record: Array[Byte]): JsonParser = {
+    val sd = getStreamDecoder(enc, record, record.length, legacyCharsets, legacyErrorAction)
 
     jsonFactory.createParser(sd)
   }

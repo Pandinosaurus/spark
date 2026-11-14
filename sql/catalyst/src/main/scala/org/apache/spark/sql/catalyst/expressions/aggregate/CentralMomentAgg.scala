@@ -23,6 +23,7 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.trees.UnaryLike
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * A central moment is the expected value of a specified power of the deviation of a random
@@ -59,7 +60,7 @@ abstract class CentralMomentAgg(child: Expression, nullOnDivideByZero: Boolean)
 
   protected val n = AttributeReference("n", DoubleType, nullable = false)()
   protected val avg = AttributeReference("avg", DoubleType, nullable = false)()
-  protected val m2 = AttributeReference("m2", DoubleType, nullable = false)()
+  protected[sql] val m2 = AttributeReference("m2", DoubleType, nullable = false)()
   protected val m3 = AttributeReference("m3", DoubleType, nullable = false)()
   protected val m4 = AttributeReference("m4", DoubleType, nullable = false)()
 
@@ -74,7 +75,8 @@ abstract class CentralMomentAgg(child: Expression, nullOnDivideByZero: Boolean)
 
   override val aggBufferAttributes = trimHigherOrder(Seq(n, avg, m2, m3, m4))
 
-  override val initialValues: Seq[Expression] = Array.fill(momentOrder + 1)(Literal(0.0))
+  override val initialValues: Seq[Expression] =
+    Array.fill(momentOrder + 1)(Literal(0.0)).toImmutableArraySeq
 
   override lazy val updateExpressions: Seq[Expression] = updateExpressionsDef
 
@@ -83,9 +85,16 @@ abstract class CentralMomentAgg(child: Expression, nullOnDivideByZero: Boolean)
     val n1 = n.left
     val n2 = n.right
     val newN = n1 + n2
-    val delta = avg.right - avg.left
+    // When one side is an empty buffer (n1 == 0 or n2 == 0), the combined buffer is just the other
+    // side. Force `delta` to 0.0 in that case so that the `delta * deltaN * n1 * n2` terms vanish
+    // cleanly; otherwise a large `avg` difference can overflow `delta * deltaN` to Infinity before
+    // it is multiplied by the zero count, producing NaN (e.g. `Infinity * 0 = NaN`) and corrupting
+    // the merged moments. `newAvg` is set directly to the non-empty side's average.
+    val isEmptyLeft = n1 === Literal(0.0)
+    val isEmptyRight = n2 === Literal(0.0)
+    val delta = If(isEmptyLeft || isEmptyRight, Literal(0.0), avg.right - avg.left)
     val deltaN = If(newN === 0.0, 0.0, delta / newN)
-    val newAvg = avg.left + deltaN * n2
+    val newAvg = If(isEmptyLeft, avg.right, If(isEmptyRight, avg.left, avg.left + deltaN * n2))
 
     // higher order moments computed according to:
     // https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Higher-order_statistics
@@ -145,6 +154,11 @@ abstract class CentralMomentAgg(child: Expression, nullOnDivideByZero: Boolean)
 // scalastyle:off line.size.limit
 @ExpressionDescription(
   usage = "_FUNC_(expr) - Returns the population standard deviation calculated from values of a group.",
+  arguments = """
+    Arguments:
+      * expr - The expression to compute the population standard deviation of.
+        An expression that evaluates to a numeric.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(col) FROM VALUES (1), (2), (3) AS tab(col);
@@ -176,6 +190,11 @@ case class StddevPop(
 // scalastyle:off line.size.limit
 @ExpressionDescription(
   usage = "_FUNC_(expr) - Returns the sample standard deviation calculated from values of a group.",
+  arguments = """
+    Arguments:
+      * expr - The expression to compute the sample standard deviation of.
+        An expression that evaluates to a numeric.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(col) FROM VALUES (1), (2), (3) AS tab(col);
@@ -208,6 +227,11 @@ case class StddevSamp(
 // Compute the population variance of a column
 @ExpressionDescription(
   usage = "_FUNC_(expr) - Returns the population variance calculated from values of a group.",
+  arguments = """
+    Arguments:
+      * expr - The expression to compute the population variance of.
+        An expression that evaluates to a numeric.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(col) FROM VALUES (1), (2), (3) AS tab(col);
@@ -237,6 +261,11 @@ case class VariancePop(
 // Compute the sample variance of a column
 @ExpressionDescription(
   usage = "_FUNC_(expr) - Returns the sample variance calculated from values of a group.",
+  arguments = """
+    Arguments:
+      * expr - The expression to compute the sample variance of.
+        An expression that evaluates to a numeric.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(col) FROM VALUES (1), (2), (3) AS tab(col);
@@ -264,8 +293,26 @@ case class VarianceSamp(
     copy(child = newChild)
 }
 
+case class RegrReplacement(child: Expression)
+  extends CentralMomentAgg(child, !SQLConf.get.legacyStatisticalAggregate) {
+
+  override protected def momentOrder = 2
+
+  override val evaluateExpression: Expression = {
+    If(n === 0.0, Literal.create(null, DoubleType), m2)
+  }
+
+  override protected def withNewChildInternal(newChild: Expression): RegrReplacement =
+    copy(child = newChild)
+}
+
 @ExpressionDescription(
   usage = "_FUNC_(expr) - Returns the skewness value calculated from values of a group.",
+  arguments = """
+    Arguments:
+      * expr - The expression to compute the skewness of.
+        An expression that evaluates to a numeric.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(col) FROM VALUES (-10), (-20), (100), (1000) AS tab(col);
@@ -297,6 +344,11 @@ case class Skewness(
 
 @ExpressionDescription(
   usage = "_FUNC_(expr) - Returns the kurtosis value calculated from values of a group.",
+  arguments = """
+    Arguments:
+      * expr - The expression to compute the kurtosis of.
+        An expression that evaluates to a numeric.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(col) FROM VALUES (-10), (-20), (100), (1000) AS tab(col);
@@ -323,5 +375,118 @@ case class Kurtosis(
   override def prettyName: String = "kurtosis"
 
   override protected def withNewChildInternal(newChild: Expression): Kurtosis =
+    copy(child = newChild)
+}
+
+/**
+ * Standard deviation in Pandas' fashion.
+ * This expression is dedicated only for Pandas API on Spark.
+ * Refer to pandas.core.nanops.nanstd.
+ */
+case class PandasStddev(
+    child: Expression,
+    ddof: Int)
+  extends CentralMomentAgg(child, true) {
+
+  def this(child: Expression, ddof: Expression) =
+    this(child, PandasAggregate.expressionToDDOF(ddof, "pandas_stddev"))
+
+  override protected def momentOrder = 2
+
+  override val evaluateExpression: Expression = {
+    If(n === 0.0, Literal.create(null, DoubleType),
+      If(n === ddof.toDouble, divideByZeroEvalResult, sqrt(m2 / (n - ddof.toDouble))))
+  }
+
+  override def prettyName: String = "pandas_stddev"
+
+  override protected def withNewChildInternal(newChild: Expression): PandasStddev =
+    copy(child = newChild)
+}
+
+/**
+ * Variance in Pandas' fashion. This expression is dedicated only for Pandas API on Spark.
+ * Refer to pandas.core.nanops.nanvar.
+ */
+case class PandasVariance(
+    child: Expression,
+    ddof: Int)
+  extends CentralMomentAgg(child, true) {
+
+  def this(child: Expression, ddof: Expression) =
+    this(child, PandasAggregate.expressionToDDOF(ddof, "pandas_variance"))
+
+  override protected def momentOrder = 2
+
+  override val evaluateExpression: Expression = {
+    If(n === 0.0, Literal.create(null, DoubleType),
+      If(n === ddof.toDouble, divideByZeroEvalResult, m2 / (n - ddof.toDouble)))
+  }
+
+  override def prettyName: String = "pandas_variance"
+
+  override protected def withNewChildInternal(newChild: Expression): PandasVariance =
+    copy(child = newChild)
+}
+
+/**
+ * Skewness in Pandas' fashion. This expression is dedicated only for Pandas API on Spark.
+ * Refer to pandas.core.nanops.nanskew.
+ */
+case class PandasSkewness(child: Expression)
+  extends CentralMomentAgg(child, true) {
+
+  override def prettyName: String = "pandas_skewness"
+
+  override protected def momentOrder = 3
+
+  override val evaluateExpression: Expression = {
+    // floating point error
+    //
+    // Pandas #18044 in _libs/windows.pyx calc_skew follow this behavior
+    // to fix the fperr to treat m2 <1e-14 as zero
+    //
+    // see https://github.com/pandas-dev/pandas/issues/18044 for details
+    val _m2 = If(abs(m2) < 1e-14, Literal(0.0), m2)
+    val _m3 = If(abs(m3) < 1e-14, Literal(0.0), m3)
+
+    If(n < 3.0, Literal.create(null, DoubleType),
+      If(_m2 === 0.0, Literal(0.0), sqrt(n - 1.0) * (n / (n - 2.0)) * _m3 / sqrt(_m2 * _m2 * _m2)))
+  }
+
+  override protected def withNewChildInternal(newChild: Expression): PandasSkewness =
+    copy(child = newChild)
+}
+
+/**
+ * Kurtosis in Pandas' fashion. This expression is dedicated only for Pandas API on Spark.
+ * Refer to pandas.core.nanops.nankurt.
+ */
+case class PandasKurtosis(child: Expression)
+  extends CentralMomentAgg(child, true) {
+
+  override protected def momentOrder = 4
+
+  override val evaluateExpression: Expression = {
+    val adj = ((n - 1.0) / (n - 2.0)) * ((n - 1.0) / (n - 3.0)) * 3.0
+    val numerator = n * (n + 1.0) * (n - 1.0) * m4
+    val denominator = (n - 2.0) * (n - 3.0) * m2 * m2
+
+    // floating point error
+    //
+    // Pandas #18044 in _libs/windows.pyx calc_kurt follow this behavior
+    // to fix the fperr to treat denom <1e-14 as zero
+    //
+    // see https://github.com/pandas-dev/pandas/issues/18044 for details
+    val _numerator = If(abs(numerator) < 1e-14, Literal(0.0), numerator)
+    val _denominator = If(abs(denominator) < 1e-14, Literal(0.0), denominator)
+
+    If(n < 4.0, Literal.create(null, DoubleType),
+      If(_denominator === 0.0, Literal(0.0), _numerator / _denominator - adj))
+  }
+
+  override def prettyName: String = "pandas_kurtosis"
+
+  override protected def withNewChildInternal(newChild: Expression): PandasKurtosis =
     copy(child = newChild)
 }

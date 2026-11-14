@@ -15,17 +15,17 @@
 # limitations under the License.
 #
 
-import decimal
 import datetime
+import decimal
 
 import pandas as pd
 
 from pyspark import pandas as ps
-from pyspark.pandas.tests.data_type_ops.testing_utils import TestCasesUtils
+from pyspark.pandas.tests.data_type_ops.testing_utils import OpsTestBase
 from pyspark.testing.pandasutils import PandasOnSparkTestCase
 
 
-class ComplexOpsTest(PandasOnSparkTestCase, TestCasesUtils):
+class ComplexOpsTestsMixin:
     @property
     def pser(self):
         return pd.Series([[1, 2, 3]])
@@ -100,19 +100,23 @@ class ComplexOpsTest(PandasOnSparkTestCase, TestCasesUtils):
             "this_struct": ps.Index([("x", 1)]).to_series().reset_index(drop=True),
             "that_struct": ps.Index([("a", 2)]).to_series().reset_index(drop=True),
         }
-        return ps.concat(pssers, axis=1)
+        return ps.concat([psser.rename(name) for name, psser in pssers.items()], axis=1)
 
     def test_add(self):
         pdf, psdf = self.array_pdf, self.array_psdf
         for col in self.array_df_cols:
-            self.assert_eq(pdf[col] + pdf[col], psdf[col] + psdf[col])
+            self.assert_eq(pdf[col] + pdf[col], psdf[col] + psdf[col], check_exact=False)
 
         # Numeric array + Numeric array
         for col in self.numeric_array_df_cols:
             pser1, psser1 = pdf[col], psdf[col]
             for other_col in self.numeric_array_df_cols:
                 pser2, psser2 = pdf[other_col], psdf[other_col]
-                self.assert_eq((pser1 + pser2).sort_values(), (psser1 + psser2).sort_values())
+                self.assert_eq(
+                    (pser1 + pser2).sort_values(),
+                    (psser1 + psser2).sort_values(),
+                    check_exact=False,
+                )
 
         # Non-numeric array + Non-numeric array
         self.assertRaises(
@@ -130,12 +134,17 @@ class ComplexOpsTest(PandasOnSparkTestCase, TestCasesUtils):
 
         for col in self.non_numeric_array_df_cols:
             pser, psser = pdf[col], psdf[col]
-            self.assert_eq(pser + pser, psser + psser)
+            self.assert_eq(pser + pser, psser + psser, check_exact=False)
 
         # Numeric array + Non-numeric array
         for numeric_col in self.numeric_array_df_cols:
             for non_numeric_col in self.non_numeric_array_df_cols:
                 self.assertRaises(TypeError, lambda: psdf[numeric_col] + psdf[non_numeric_col])
+
+        # Array + non-array
+        self.assertRaises(TypeError, lambda: self.psser + 1)
+        psdf = ps.DataFrame({"array": [[1, 2]], "int": [1]})
+        self.assertRaises(TypeError, lambda: psdf["array"] + psdf["int"])
 
     def test_sub(self):
         self.assertRaises(TypeError, lambda: self.psser - "x")
@@ -184,7 +193,7 @@ class ComplexOpsTest(PandasOnSparkTestCase, TestCasesUtils):
 
     def test_pow(self):
         self.assertRaises(TypeError, lambda: self.psser ** "x")
-        self.assertRaises(TypeError, lambda: self.psser ** 1)
+        self.assertRaises(TypeError, lambda: self.psser**1)
 
         psdf = self.array_psdf
         for col in self.array_df_cols:
@@ -216,7 +225,7 @@ class ComplexOpsTest(PandasOnSparkTestCase, TestCasesUtils):
 
     def test_rpow(self):
         self.assertRaises(TypeError, lambda: "x" ** self.psser)
-        self.assertRaises(TypeError, lambda: 1 ** self.psser)
+        self.assertRaises(TypeError, lambda: 1**self.psser)
 
     def test_and(self):
         self.assertRaises(TypeError, lambda: self.psser & True)
@@ -240,7 +249,7 @@ class ComplexOpsTest(PandasOnSparkTestCase, TestCasesUtils):
         pdf, psdf = self.array_pdf, self.array_psdf
         for col in self.array_df_cols:
             pser, psser = pdf[col], psdf[col]
-            self.assert_eq(pser, psser.to_pandas())
+            self.assert_eq(pser, psser._to_pandas(), check_exact=False)
             self.assert_eq(ps.from_pandas(pser), psser)
 
     def test_isnull(self):
@@ -262,7 +271,7 @@ class ComplexOpsTest(PandasOnSparkTestCase, TestCasesUtils):
         self.assertRaises(TypeError, lambda: ~self.psser)
 
     def test_eq(self):
-        pdf, psdf = self.complex_pdf, self.complex_pdf
+        pdf, psdf = self.complex_pdf, self.complex_psdf
         self.assert_eq(
             pdf["this_array"] == pdf["that_array"], psdf["this_array"] == psdf["that_array"]
         )
@@ -277,7 +286,7 @@ class ComplexOpsTest(PandasOnSparkTestCase, TestCasesUtils):
         )
 
     def test_ne(self):
-        pdf, psdf = self.complex_pdf, self.complex_pdf
+        pdf, psdf = self.complex_pdf, self.complex_psdf
         self.assert_eq(
             pdf["this_array"] != pdf["that_array"], psdf["this_array"] != psdf["that_array"]
         )
@@ -292,7 +301,7 @@ class ComplexOpsTest(PandasOnSparkTestCase, TestCasesUtils):
         )
 
     def test_lt(self):
-        pdf, psdf = self.complex_pdf, self.complex_pdf
+        pdf, psdf = self.complex_pdf, self.complex_psdf
         self.assert_eq(
             pdf["this_array"] < pdf["that_array"], psdf["this_array"] < psdf["that_array"]
         )
@@ -307,7 +316,7 @@ class ComplexOpsTest(PandasOnSparkTestCase, TestCasesUtils):
         )
 
     def test_le(self):
-        pdf, psdf = self.complex_pdf, self.complex_pdf
+        pdf, psdf = self.complex_pdf, self.complex_psdf
         self.assert_eq(
             pdf["this_array"] <= pdf["that_array"], psdf["this_array"] <= psdf["that_array"]
         )
@@ -322,7 +331,7 @@ class ComplexOpsTest(PandasOnSparkTestCase, TestCasesUtils):
         )
 
     def test_gt(self):
-        pdf, psdf = self.complex_pdf, self.complex_pdf
+        pdf, psdf = self.complex_pdf, self.complex_psdf
         self.assert_eq(
             pdf["this_array"] > pdf["that_array"], psdf["this_array"] > psdf["that_array"]
         )
@@ -337,7 +346,7 @@ class ComplexOpsTest(PandasOnSparkTestCase, TestCasesUtils):
         )
 
     def test_ge(self):
-        pdf, psdf = self.complex_pdf, self.complex_pdf
+        pdf, psdf = self.complex_pdf, self.complex_psdf
         self.assert_eq(
             pdf["this_array"] >= pdf["that_array"], psdf["this_array"] >= psdf["that_array"]
         )
@@ -352,14 +361,15 @@ class ComplexOpsTest(PandasOnSparkTestCase, TestCasesUtils):
         )
 
 
+class ComplexOpsTests(
+    ComplexOpsTestsMixin,
+    OpsTestBase,
+    PandasOnSparkTestCase,
+):
+    pass
+
+
 if __name__ == "__main__":
-    import unittest
-    from pyspark.pandas.tests.data_type_ops.test_complex_ops import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -9,9 +9,9 @@ license: |
   The ASF licenses this file to You under the Apache License, Version 2.0
   (the "License"); you may not use this file except in compliance with
   the License.  You may obtain a copy of the License at
- 
+
      http://www.apache.org/licenses/LICENSE-2.0
- 
+
   Unless required by applicable law or agreed to in writing, software
   distributed under the License is distributed on an "AS IS" BASIS,
   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -23,16 +23,16 @@ Spark SQL provides `spark.read().text("file_name")` to read a file or directory 
 
 <div class="codetabs">
 
+<div data-lang="python"  markdown="1">
+{% include_example text_dataset python/sql/datasource.py %}
+</div>
+
 <div data-lang="scala"  markdown="1">
 {% include_example text_dataset scala/org/apache/spark/examples/sql/SQLDataSourceExample.scala %}
 </div>
 
 <div data-lang="java"  markdown="1">
 {% include_example text_dataset java/org/apache/spark/examples/sql/JavaSQLDataSourceExample.java %}
-</div>
-
-<div data-lang="python"  markdown="1">
-{% include_example text_dataset python/sql/datasource.py %}
 </div>
 
 </div>
@@ -47,8 +47,8 @@ Data source options of text can be set via:
   *  `DataStreamWriter`
 *  `OPTIONS` clause at [CREATE TABLE USING DATA_SOURCE](sql-ref-syntax-ddl-create-table-datasource.html)
 
-<table class="table">
-  <tr><th><b>Property Name</b></th><th><b>Default</b></th><th><b>Meaning</b></th><th><b>Scope</b></th></tr>
+<table>
+  <thead><tr><th><b>Property Name</b></th><th><b>Default</b></th><th><b>Meaning</b></th><th><b>Scope</b></th></tr></thead>
   <tr>
     <td><code>wholetext</code></td>
     <td><code>false</code></td>
@@ -66,6 +66,12 @@ Data source options of text can be set via:
     <td>(none)</td>
     <td>Compression codec to use when saving to file. This can be one of the known case-insensitive shorten names (none, bzip2, gzip, lz4, snappy and deflate).</td>
     <td>write</td>
+  </tr>
+  <tr>
+    <td><code>decompression</code></td>
+    <td>(none)</td>
+    <td>Compression codec used to decompress the input files, instead of inferring it from each file name extension. This can be one of the known case-insensitive short names (<code>none</code>, <code>uncompressed</code>, <code>bzip2</code>, <code>deflate</code>, <code>gzip</code>, <code>lz4</code>, <code>snappy</code>, <code>zstd</code>, <code>zstandard</code> and <code>zst</code>) or a fully qualified Hadoop <code>CompressionCodec</code> class name. <code>none</code> and <code>uncompressed</code> read the files as-is, even when the file name carries a compression extension. The codec applies to every file read. When archive reading is enabled (<code>spark.sql.files.archive.reader.enabled</code>), setting it when the input includes an archive file (<code>.tar</code>, <code>.tar.gz</code>, <code>.tgz</code>, <code>.zip</code> or <code>.7z</code>) is not supported and fails the query. Unlike the write option <code>compression</code>, which is ignored on read, it does not affect writes.</td>
+    <td>read</td>
   </tr>
 </table>
 Other generic options can be found in <a href="https://spark.apache.org/docs/latest/sql-data-sources-generic-options.html"> Generic File Source Options</a>.

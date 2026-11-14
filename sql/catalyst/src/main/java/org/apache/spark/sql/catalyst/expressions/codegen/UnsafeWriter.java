@@ -24,7 +24,11 @@ import org.apache.spark.unsafe.Platform;
 import org.apache.spark.unsafe.array.ByteArrayMethods;
 import org.apache.spark.unsafe.bitset.BitSetMethods;
 import org.apache.spark.unsafe.types.CalendarInterval;
+import org.apache.spark.unsafe.types.TimestampNanosVal;
+import org.apache.spark.sql.catalyst.expressions.TimestampNanosRowValues;
+import org.apache.spark.unsafe.types.BinaryView;
 import org.apache.spark.unsafe.types.UTF8String;
+import org.apache.spark.unsafe.types.VariantVal;
 
 /**
  * Base class for writing Unsafe* structures.
@@ -110,6 +114,10 @@ public abstract class UnsafeWriter {
     writeUnalignedBytes(ordinal, input.getBaseObject(), input.getBaseOffset(), input.numBytes());
   }
 
+  public final void write(int ordinal, BinaryView input) {
+    writeUnalignedBytes(ordinal, input.getBaseObject(), input.getBaseOffset(), input.numBytes());
+  }
+
   public final void write(int ordinal, byte[] input) {
     write(ordinal, input, 0, input.length);
   }
@@ -131,22 +139,65 @@ public abstract class UnsafeWriter {
     increaseCursor(roundedSize);
   }
 
-  public final void write(int ordinal, CalendarInterval input) {
+  public void write(int ordinal, CalendarInterval input) {
     // grow the global buffer before writing data.
     grow(16);
 
     if (input == null) {
       BitSetMethods.set(getBuffer(), startingOffset, ordinal);
+      Platform.putLong(getBuffer(), cursor(), 0L);
+      Platform.putLong(getBuffer(), cursor() + 8, 0L);
     } else {
       // Write the months, days and microseconds fields of interval to the variable length portion.
-      Platform.putInt(getBuffer(), cursor(), input.months);
-      Platform.putInt(getBuffer(), cursor() + 4, input.days);
+      long longVal =
+        ((long) input.months & 0xFFFFFFFFL) | (((long) input.days << 32) & 0xFFFFFFFF00000000L);
+      Platform.putLong(getBuffer(), cursor(), longVal);
       Platform.putLong(getBuffer(), cursor() + 8, input.microseconds);
     }
     // we need to reserve the space so that we can update it later.
     setOffsetAndSize(ordinal, 16);
     // move the cursor forward.
     increaseCursor(16);
+  }
+
+  // 16-byte variable-length payload; same layout as UnsafeRow#setTimestampNanosPayload.
+  public void write(int ordinal, TimestampNanosVal input) {
+    grow(TimestampNanosRowValues.SIZE_IN_BYTES);
+    if (input == null) {
+      BitSetMethods.set(getBuffer(), startingOffset, ordinal);
+      // Zero the reserved payload so that a null value is byte-identical no matter what stale bytes
+      // the reused buffer holds. The buffer is not cleared between rows, so without this two null
+      // keys can carry different bytes and split into separate groups (a nullable nanosecond
+      // GROUP BY / join key produced several null groups). Mirrors the in-place null-update path
+      // UnsafeRow#setTimestampNanosPayload, which zeroes the payload the same way.
+      TimestampNanosRowValues.zeroPayload(getBuffer(), 0, (int) cursor());
+    } else {
+      TimestampNanosRowValues.writePayload(
+        getBuffer(), 0, (int) cursor(), input.epochMicros, input.nanosWithinMicro);
+    }
+    setOffsetAndSize(ordinal, TimestampNanosRowValues.SIZE_IN_BYTES);
+    increaseCursor(TimestampNanosRowValues.SIZE_IN_BYTES);
+  }
+
+  public void write(int ordinal, VariantVal input) {
+    // See the class comment of VariantVal for the format of the binary content.
+    byte[] value = input.getValue();
+    byte[] metadata = input.getMetadata();
+    int totalSize = 4 + value.length + metadata.length;
+    int roundedSize = ByteArrayMethods.roundNumberOfBytesToNearestWord(totalSize);
+    grow(roundedSize);
+    zeroOutPaddingBytes(totalSize);
+    Platform.putInt(getBuffer(), cursor(), value.length);
+    Platform.copyMemory(value, Platform.BYTE_ARRAY_OFFSET, getBuffer(), cursor() + 4, value.length);
+    Platform.copyMemory(
+        metadata,
+        Platform.BYTE_ARRAY_OFFSET,
+        getBuffer(),
+        cursor() + 4 + value.length,
+        metadata.length
+    );
+    setOffsetAndSize(ordinal, totalSize);
+    increaseCursor(roundedSize);
   }
 
   public final void write(int ordinal, UnsafeRow row) {

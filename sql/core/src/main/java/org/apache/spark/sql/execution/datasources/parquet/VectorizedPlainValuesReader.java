@@ -17,7 +17,6 @@
 package org.apache.spark.sql.execution.datasources.parquet;
 
 import java.io.IOException;
-import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
@@ -26,9 +25,13 @@ import org.apache.parquet.column.values.ValuesReader;
 import org.apache.parquet.io.api.Binary;
 import org.apache.parquet.io.ParquetDecodingException;
 
+import org.apache.spark.SparkUnsupportedOperationException;
 import org.apache.spark.sql.catalyst.util.RebaseDateTime;
 import org.apache.spark.sql.execution.datasources.DataSourceUtils;
 import org.apache.spark.sql.execution.vectorized.WritableColumnVector;
+import org.apache.spark.sql.types.GeographyType;
+import org.apache.spark.sql.types.GeometryType;
+import org.apache.spark.util.ByteBufferOutputStream;
 
 /**
  * An implementation of the Parquet PLAIN decoder that supports the vectorized interface.
@@ -50,22 +53,65 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
 
   @Override
   public void skip() {
-    throw new UnsupportedOperationException();
+    throw SparkUnsupportedOperationException.apply();
+  }
+
+  private void updateCurrentByte() {
+    try {
+      currentByte = (byte) in.read();
+    } catch (IOException e) {
+      throw new ParquetDecodingException("Failed to read a byte", e);
+    }
   }
 
   @Override
   public final void readBooleans(int total, WritableColumnVector c, int rowId) {
-    // TODO: properly vectorize this
-    for (int i = 0; i < total; i++) {
-      c.putBoolean(rowId + i, readBoolean());
+    int i = 0;
+    if (bitOffset > 0) {
+      i = Math.min(8 - bitOffset, total);
+      c.putBooleans(rowId, i, currentByte, bitOffset);
+      bitOffset = (bitOffset + i) & 7;
+    }
+    // Batch-read all full bytes in a single getBuffer call instead of per-byte in.read().
+    // getBuffer returns a slice with position=0 and remaining=fullBytes.
+    int fullBytes = (total - i) / 8;
+    if (fullBytes > 0) {
+      ByteBuffer buffer = getBuffer(fullBytes);
+      if (buffer.hasArray()) {
+        byte[] array = buffer.array();
+        int offset = buffer.arrayOffset() + buffer.position();
+        for (int j = 0; j < fullBytes; j++) {
+          c.putBooleans(rowId + i + j * 8, array[offset + j]);
+        }
+      } else {
+        for (int j = 0; j < fullBytes; j++) {
+          c.putBooleans(rowId + i + j * 8, buffer.get());
+        }
+      }
+      i += fullBytes * 8;
+    }
+    if (i < total) {
+      updateCurrentByte();
+      bitOffset = total - i;
+      c.putBooleans(rowId + i, bitOffset, currentByte, 0);
     }
   }
 
   @Override
   public final void skipBooleans(int total) {
-    // TODO: properly vectorize this
-    for (int i = 0; i < total; i++) {
-      readBoolean();
+    int i = 0;
+    if (bitOffset > 0) {
+      i = Math.min(8 - bitOffset, total);
+      bitOffset = (bitOffset + i) & 7;
+    }
+    if (i + 7 < total) {
+      int numBytesToSkip = (total - i) / 8;
+      skipFully(numBytesToSkip);
+      i += numBytesToSkip * 8;
+    }
+    if (i < total) {
+      updateCurrentByte();
+      bitOffset = total - i;
     }
   }
 
@@ -75,6 +121,31 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
     } catch (IOException e) {
       throw new ParquetDecodingException("Failed to read " + length + " bytes", e);
     }
+  }
+
+  /** Skips exactly `n` bytes, failing on a short page like `getBuffer` does on reads. */
+  private void skipFully(long n) {
+    VectorizedReaderBase.skipFully(in, n);
+  }
+
+  /**
+   * Reads the length prefix of a binary value. The length is read from the file, so validate it
+   * against the rest of the page: on a `SingleBufferInputStream`, slicing or skipping a negative
+   * length moves the stream position backwards instead of failing, and `readNBytes` returns a
+   * short array instead of failing when the length runs past the end of the page.
+   */
+  private int readLength() {
+    int len = readInteger();
+    if (len < 0) {
+      throw new ParquetDecodingException(
+          "Corrupted PLAIN page: negative binary length: " + len);
+    }
+    int available = in.available();
+    if (len > available) {
+      throw new ParquetDecodingException("Corrupted PLAIN page: binary length " + len +
+          " is larger than the " + available + " bytes left in the page");
+    }
+    return len;
   }
 
   @Override
@@ -94,7 +165,7 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
 
   @Override
   public void skipIntegers(int total) {
-    in.skip(total * 4L);
+    skipFully(total * 4L);
   }
 
   @Override
@@ -103,6 +174,54 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
     ByteBuffer buffer = getBuffer(requiredBytes);
     for (int i = 0; i < total; i += 1) {
       c.putLong(rowId + i, Integer.toUnsignedLong(buffer.getInt()));
+    }
+  }
+
+  @Override
+  public final void readIntegersAsLongs(int total, WritableColumnVector c, int rowId) {
+    int requiredBytes = total * 4;
+    ByteBuffer buffer = getBuffer(requiredBytes);
+    // No `hasArray` bulk-copy path: source (int32) and target (int64) have different byte
+    // widths so a contiguous byte copy is impossible. Matches the pattern in peer
+    // type-converting bulk methods such as `readUnsignedIntegers`.
+    for (int i = 0; i < total; i += 1) {
+      c.putLong(rowId + i, buffer.getInt());
+    }
+  }
+
+  @Override
+  public final void readIntegersAsDoubles(int total, WritableColumnVector c, int rowId) {
+    int requiredBytes = total * 4;
+    ByteBuffer buffer = getBuffer(requiredBytes);
+    // No `hasArray` bulk-copy path: source (int32) and target (double, 8 bytes) have
+    // different widths so a contiguous byte copy is impossible. Matches the pattern in
+    // `readIntegersAsLongs` and `readUnsignedIntegers`.
+    for (int i = 0; i < total; i += 1) {
+      c.putDouble(rowId + i, buffer.getInt());
+    }
+  }
+
+  @Override
+  public final void readFloatsAsDoubles(int total, WritableColumnVector c, int rowId) {
+    int requiredBytes = total * 4;
+    ByteBuffer buffer = getBuffer(requiredBytes);
+    // No `hasArray` bulk-copy path: source (float, 4 bytes) and target (double, 8 bytes)
+    // have different widths so a contiguous byte copy is impossible. Matches the pattern
+    // in `readIntegersAsLongs`.
+    for (int i = 0; i < total; i += 1) {
+      c.putDouble(rowId + i, buffer.getFloat());
+    }
+  }
+
+  @Override
+  public final void readLongsAsInts(int total, WritableColumnVector c, int rowId) {
+    int requiredBytes = total * 8;
+    ByteBuffer buffer = getBuffer(requiredBytes);
+    // No `hasArray` bulk-copy path: source (int64, 8 bytes) and target (int32, 4 bytes)
+    // have different widths so a contiguous byte copy is impossible. Matches the pattern
+    // in `readIntegersAsLongs`.
+    for (int i = 0; i < total; i += 1) {
+      c.putInt(rowId + i, (int) buffer.getLong());
     }
   }
 
@@ -155,17 +274,97 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
 
   @Override
   public void skipLongs(int total) {
-    in.skip(total * 8L);
+    skipFully(total * 8L);
   }
 
   @Override
   public final void readUnsignedLongs(int total, WritableColumnVector c, int rowId) {
     int requiredBytes = total * 8;
     ByteBuffer buffer = getBuffer(requiredBytes);
-    for (int i = 0; i < total; i += 1) {
-      c.putByteArray(
-        rowId + i, new BigInteger(Long.toUnsignedString(buffer.getLong())).toByteArray());
+    // scratch buffer: max 9 bytes (0x00 sign byte + 8 value bytes), reused per batch
+    byte[] scratch = new byte[9];
+    if (buffer.hasArray()) {
+      byte[] src = buffer.array();
+      int offset = buffer.arrayOffset() + buffer.position();
+      for (int i = 0; i < total; i++, rowId++, offset += 8) {
+        putLittleEndianBytesAsBigInteger(c, rowId, src, offset, scratch);
+      }
+    } else {
+      // direct buffer fallback: copy 8 bytes per value
+      byte[] data = new byte[8];
+      for (int i = 0; i < total; i++, rowId++) {
+        buffer.get(data);
+        putLittleEndianBytesAsBigInteger(c, rowId, data, 0, scratch);
+      }
     }
+  }
+
+  /**
+   * Writes 8 little-endian bytes from {@code src[offset..offset+7]} into {@code c} at
+   * {@code rowId} as a big-endian byte array compatible with {@link java.math.BigInteger}
+   * two's-complement encoding.
+   *
+   * <p>The output matches the semantics of {@link java.math.BigInteger#toByteArray()}:
+   * <ul>
+   *   <li>Big-endian byte order</li>
+   *   <li>Minimal encoding: no unnecessary leading zero bytes</li>
+   *   <li>A {@code 0x00} sign byte is prepended if the most significant byte has bit 7
+   *       set, ensuring the value is interpreted as positive by {@code BigInteger}</li>
+   *   <li>Zero is encoded as {@code [0x00]} (1 byte), not an empty array, because
+   *       {@code new BigInteger(new byte[0])} throws {@link NumberFormatException}</li>
+   * </ul>
+   *
+   * <p>This is used by {@link #readUnsignedLongs} to store Parquet {@code UINT_64} values
+   * into a {@code DecimalType(20, 0)} column vector, where each value is stored as a
+   * byte array in {@code arrayData()} and later reconstructed via
+   * {@code new BigInteger(bytes)}.
+   *
+   * @param c      the target column vector; must be of {@code DecimalType(20, 0)}
+   * @param rowId  the row index to write into
+   * @param src    the source byte array containing little-endian encoded data
+   * @param offset the starting position in {@code src}; reads bytes
+   *               {@code src[offset..offset+7]}
+   * @param scratch a caller-provided reusable buffer of at least 9 bytes; its contents
+   *                after this call are undefined
+   */
+  private static void putLittleEndianBytesAsBigInteger(
+     WritableColumnVector c, int rowId, byte[] src, int offset, byte[] scratch) {
+    // src is little-endian; the most significant byte is at src[offset + 7].
+    // Scan from the most significant end to find the first non-zero byte,
+    // which determines the minimal number of bytes needed for encoding.
+    int msbIndex = offset + 7;
+    while (msbIndex > offset && src[msbIndex] == 0) {
+      msbIndex--;
+    }
+
+    // Zero value: must write [0x00] rather than an empty array.
+    // BigInteger.ZERO.toByteArray() returns [0x00], and new BigInteger(new byte[0])
+    // throws NumberFormatException("Zero length BigInteger").
+    if (msbIndex == offset && src[offset] == 0) {
+      scratch[0] = 0x00;
+      // putByteArray copies the bytes into arrayData(), so scratch can be safely reused
+      c.putByteArray(rowId, scratch, 0, 1);
+      return;
+    }
+
+    // Prepend a 0x00 sign byte if the most significant byte has bit 7 set.
+    // This matches BigInteger.toByteArray() behavior: positive values whose highest
+    // magnitude byte has the MSB set are prefixed with 0x00 to distinguish them
+    // from negative values in two's-complement encoding.
+    boolean needSignByte = (src[msbIndex] & 0x80) != 0;
+    int valueLen = msbIndex - offset + 1;
+    int totalLen = needSignByte ? valueLen + 1 : valueLen;
+
+    int scratchOffset = 0;
+    if (needSignByte) {
+      scratch[scratchOffset++] = 0x00;
+    }
+    // Reverse byte order: little-endian src → big-endian dest
+    for (int i = msbIndex; i >= offset; i--) {
+      scratch[scratchOffset++] = src[i];
+    }
+    // putByteArray copies the bytes into arrayData(), so scratch can be safely reused
+    c.putByteArray(rowId, scratch, 0, totalLen);
   }
 
   // A fork of `readLongs` to rebase the timestamp values. For performance reasons, this method
@@ -173,7 +372,11 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
   // if rebase is not needed.
   @Override
   public final void readLongsWithRebase(
-      int total, WritableColumnVector c, int rowId, boolean failIfRebase) {
+      int total,
+      WritableColumnVector c,
+      int rowId,
+      boolean failIfRebase,
+      String timeZone) {
     int requiredBytes = total * 8;
     ByteBuffer buffer = getBuffer(requiredBytes);
     boolean rebase = false;
@@ -185,7 +388,9 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
         throw DataSourceUtils.newRebaseExceptionInRead("Parquet");
       } else {
         for (int i = 0; i < total; i += 1) {
-          c.putLong(rowId + i, RebaseDateTime.rebaseJulianToGregorianMicros(buffer.getLong()));
+          c.putLong(
+            rowId + i,
+            RebaseDateTime.rebaseJulianToGregorianMicros(timeZone, buffer.getLong()));
         }
       }
     } else {
@@ -217,7 +422,7 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
 
   @Override
   public void skipFloats(int total) {
-    in.skip(total * 4L);
+    skipFully(total * 4L);
   }
 
   @Override
@@ -237,7 +442,7 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
 
   @Override
   public void skipDoubles(int total) {
-    in.skip(total * 8L);
+    skipFully(total * 8L);
   }
 
   @Override
@@ -247,16 +452,24 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
     int requiredBytes = total * 4;
     ByteBuffer buffer = getBuffer(requiredBytes);
 
-    for (int i = 0; i < total; i += 1) {
-      c.putByte(rowId + i, buffer.get());
-      // skip the next 3 bytes
-      buffer.position(buffer.position() + 3);
+    if (buffer.hasArray()) {
+      byte[] array = buffer.array();
+      int offset = buffer.arrayOffset() + buffer.position();
+      for (int i = 0; i < total; i++) {
+        c.putByte(rowId + i, array[offset + i * 4]);
+      }
+    } else {
+      for (int i = 0; i < total; i += 1) {
+        c.putByte(rowId + i, buffer.get());
+        // skip the next 3 bytes
+        buffer.position(buffer.position() + 3);
+      }
     }
   }
 
   @Override
   public final void skipBytes(int total) {
-    in.skip(total * 4L);
+    skipFully(total * 4L);
   }
 
   @Override
@@ -264,25 +477,25 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
     int requiredBytes = total * 4;
     ByteBuffer buffer = getBuffer(requiredBytes);
 
-    for (int i = 0; i < total; i += 1) {
-      c.putShort(rowId + i, (short) buffer.getInt());
+    if (buffer.hasArray()) {
+      int offset = buffer.arrayOffset() + buffer.position();
+      c.putShortsFromIntsLittleEndian(rowId, total, buffer.array(), offset);
+    } else {
+      for (int i = 0; i < total; i += 1) {
+        c.putShort(rowId + i, (short) buffer.getInt());
+      }
     }
   }
 
   @Override
   public void skipShorts(int total) {
-    in.skip(total * 4L);
+    skipFully(total * 4L);
   }
 
   @Override
   public final boolean readBoolean() {
-    // TODO: vectorize decoding and keep boolean[] instead of currentByte
     if (bitOffset == 0) {
-      try {
-        currentByte = (byte) in.read();
-      } catch (IOException e) {
-        throw new ParquetDecodingException("Failed to read a byte", e);
-      }
+      updateCurrentByte();
     }
 
     boolean v = (currentByte & (1 << bitOffset)) != 0;
@@ -326,14 +539,14 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
   @Override
   public final void readBinary(int total, WritableColumnVector v, int rowId) {
     for (int i = 0; i < total; i++) {
-      int len = readInteger();
+      int len = readLength();
       ByteBuffer buffer = getBuffer(len);
       if (buffer.hasArray()) {
         v.putByteArray(rowId + i, buffer.array(), buffer.arrayOffset() + buffer.position(), len);
       } else {
-        byte[] bytes = new byte[len];
-        buffer.get(bytes);
-        v.putByteArray(rowId + i, bytes);
+        // Copy directly from the ByteBuffer into the column vector's backing storage,
+        // bypassing any intermediate byte[] allocation.
+        v.putByteArray(rowId + i, buffer, buffer.position(), len);
       }
     }
   }
@@ -341,8 +554,8 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
   @Override
   public void skipBinary(int total) {
     for (int i = 0; i < total; i++) {
-      int len = readInteger();
-      in.skip(len);
+      int len = readLength();
+      skipFully(len);
     }
   }
 
@@ -360,7 +573,69 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
   }
 
   @Override
+  public final void readFixedLenByteArray(int total, int len, WritableColumnVector v, int rowId) {
+    for (int i = 0; i < total; i++) {
+      ByteBuffer buffer = getBuffer(len);
+      if (buffer.hasArray()) {
+        v.putByteArray(rowId + i, buffer.array(), buffer.arrayOffset() + buffer.position(), len);
+      } else {
+        v.putByteArray(rowId + i, buffer, buffer.position(), len);
+      }
+    }
+  }
+
+  @Override
   public void skipFixedLenByteArray(int total, int len) {
-    in.skip(total * (long) len);
+    skipFully(total * (long) len);
+  }
+
+  @Override
+  public void readGeometry(int total, WritableColumnVector v, int rowId) {
+    assert(v.dataType() instanceof GeometryType);
+    int srid = ((GeometryType) v.dataType()).srid();
+    try {
+      readGeoData(total, v, rowId, srid, WKBToGeometryConverter.INSTANCE);
+    } catch (IOException e) {
+      throw new ParquetDecodingException("Failed to read geometry", e);
+    }
+  }
+
+  @Override
+  public void readGeography(int total, WritableColumnVector v, int rowId) {
+    assert(v.dataType() instanceof GeographyType);
+    int srid = ((GeographyType) v.dataType()).srid();
+    try {
+      readGeoData(total, v, rowId, srid, WKBToGeographyConverter.INSTANCE);
+    } catch (IOException e) {
+      throw new ParquetDecodingException("Failed to read geography", e);
+    }
+  }
+
+  private void readGeoData(int total, WritableColumnVector v, int rowId, int srid,
+     WKBConverterStrategy converter) throws IOException {
+    // Go through the input stream and convert the WKB to the internal representation
+    // writing it to the output buffer and putting the (offset, length) in the vector.
+    // Finally, append all data from the output buffer in a single operation.
+    int base = v.arrayData().getElementsAppended();
+    int dataLen = 0;
+    final int intSize = 4;
+    ByteBuffer lenBuffer = ByteBuffer.allocate(intSize);
+    ByteBufferOutputStream out = new ByteBufferOutputStream();
+
+    for (int i = 0; i < total; i++) {
+      int len = readLength();
+
+      // Converts WKB into a physical representation of geometry/geography.
+      byte[] physicalValue = converter.convert(in.readNBytes(len), srid);
+      v.putArray(rowId + i, base + dataLen + intSize, physicalValue.length);
+
+      lenBuffer.putInt(0, physicalValue.length);
+      out.write(lenBuffer.array());
+      out.write(physicalValue);
+
+      dataLen += intSize + physicalValue.length;
+    }
+    out.close();
+    v.arrayData().appendBytes(dataLen, out.toByteArray(), 0);
   }
 }

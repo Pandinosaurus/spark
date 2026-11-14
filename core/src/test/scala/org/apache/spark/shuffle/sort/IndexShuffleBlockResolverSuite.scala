@@ -25,21 +25,24 @@ import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito._
 import org.mockito.invocation.InvocationOnMock
 import org.roaringbitmap.RoaringBitmap
-import org.scalatest.BeforeAndAfterEach
 
 import org.apache.spark.{SparkConf, SparkFunSuite}
 import org.apache.spark.internal.config
 import org.apache.spark.shuffle.{IndexShuffleBlockResolver, ShuffleBlockInfo}
 import org.apache.spark.storage._
-import org.apache.spark.util.Utils
+import org.apache.spark.util.{SslTestUtils, Utils}
 
-class IndexShuffleBlockResolverSuite extends SparkFunSuite with BeforeAndAfterEach {
+class IndexShuffleBlockResolverSuite extends SparkFunSuite {
 
   @Mock(answer = RETURNS_SMART_NULLS) private var blockManager: BlockManager = _
   @Mock(answer = RETURNS_SMART_NULLS) private var diskBlockManager: DiskBlockManager = _
 
+  def createSparkConf(): SparkConf = {
+    new SparkConf(loadDefaults = false)
+  }
+
   private var tempDir: File = _
-  private val conf: SparkConf = new SparkConf(loadDefaults = false)
+  private val conf: SparkConf = createSparkConf()
   private val appId = "TESTAPP"
 
   override def beforeEach(): Unit = {
@@ -56,6 +59,11 @@ class IndexShuffleBlockResolverSuite extends SparkFunSuite with BeforeAndAfterEa
       any[BlockId], any[Option[Array[String]]])).thenAnswer(
       (invocation: InvocationOnMock) => new File(tempDir, invocation.getArguments.head.toString))
     when(diskBlockManager.localDirs).thenReturn(Array(tempDir))
+    when(diskBlockManager.createTempFileWith(any(classOf[File])))
+      .thenAnswer { invocationOnMock =>
+        val file = invocationOnMock.getArguments()(0).asInstanceOf[File]
+        Utils.tempFileWith(file)
+      }
     conf.set("spark.app.id", appId)
   }
 
@@ -228,7 +236,7 @@ class IndexShuffleBlockResolverSuite extends SparkFunSuite with BeforeAndAfterEa
         ShuffleMergedBlockId(shuffleId, shuffleMergeId, reduceId),
         dirs)
     assert(mergedBlockMeta.getNumChunks === 3)
-    assert(mergedBlockMeta.readChunkBitmaps().size === 3)
+    assert(mergedBlockMeta.readChunkBitmaps().length === 3)
     assert(mergedBlockMeta.readChunkBitmaps()(0).contains(1))
     assert(mergedBlockMeta.readChunkBitmaps()(0).contains(2))
     assert(!mergedBlockMeta.readChunkBitmaps()(0).contains(3))
@@ -269,5 +277,27 @@ class IndexShuffleBlockResolverSuite extends SparkFunSuite with BeforeAndAfterEa
     assert(checksumAlgo === conf.get(config.SHUFFLE_CHECKSUM_ALGORITHM))
     val checksumsFromFile = resolver.getChecksums(checksumFile, 10)
     assert(checksumsInMemory === checksumsFromFile)
+  }
+
+  test("SPARK-57504: getChecksums returns null instead of throwing NPE when the " +
+    "checksum file cannot be opened") {
+    val resolver = new IndexShuffleBlockResolver(conf, blockManager)
+    // If opening the checksum file fails, getChecksums is meant to return null: it
+    // already catches IOException/EOFException. But the old non-null-safe
+    // `finally { in.close() }` threw NPE when the failure came from the stream
+    // constructor (`in` was still null), masking the original error. The sibling
+    // methods checkIndexAndDataFile and getMergedBlockData already handle this
+    // correctly. Force a constructor failure with a file that appears to exist but
+    // cannot be opened.
+    val unopenableChecksumFile = new File(tempDir, "missing.checksum") {
+      override def exists(): Boolean = true
+    }
+    assert(resolver.getChecksums(unopenableChecksumFile, 10) === null)
+  }
+}
+
+class SslIndexShuffleBlockResolverSuite extends IndexShuffleBlockResolverSuite {
+  override def createSparkConf(): SparkConf = {
+    SslTestUtils.updateWithSSLConfig(super.createSparkConf())
   }
 }

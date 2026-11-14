@@ -17,11 +17,11 @@
 
 package org.apache.spark.sql.connector
 
-import java.util
+import java.util.Locale
 
 import org.scalatest.BeforeAndAfter
 
-import org.apache.spark.sql.{DataFrame, QueryTest, SaveMode}
+import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SaveMode}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException
 import org.apache.spark.sql.connector.catalog._
@@ -53,12 +53,33 @@ class DataSourceV2DataFrameSessionCatalogSuite
 
   override protected val catalogAndNamespace: String = ""
 
+  test("display properties survive ALTER TABLE in the session catalog") {
+    val t = "display_properties"
+    withTable(t) {
+      sql(s"CREATE TABLE $t (id bigint) USING $v2Format")
+      val table = sessionCatalog.loadTable(Identifier.of(Array("default"), t))
+        .asInstanceOf[InMemoryTable]
+      table.setDisplayProperties(java.util.Map.of("catalog-label", "catalog-value"))
+
+      sql(s"ALTER TABLE $t SET TBLPROPERTIES ('k' = 'v')")
+      checkAnswer(sql(s"SHOW TBLPROPERTIES $t"),
+        Seq(Row("catalog-label", "catalog-value"), Row("k", "v")))
+      checkAnswer(sql(s"DESCRIBE TABLE EXTENDED $t").where("col_name = 'Table Properties'"),
+        Row("Table Properties", "[catalog-label=catalog-value,k=v]", ""))
+
+      assert(!sql(s"SHOW TABLE EXTENDED LIKE '$t'")
+        .head().getString(3).contains("catalog-label"))
+
+      sql(s"ALTER TABLE $t UNSET TBLPROPERTIES ('k')")
+      checkAnswer(sql(s"SHOW TBLPROPERTIES $t"), Row("catalog-label", "catalog-value"))
+    }
+  }
+
   test("saveAsTable: Append mode should not fail if the table already exists " +
     "and a same-name temp view exist") {
     withTable("same_name") {
       withTempView("same_name") {
-        val format = spark.sessionState.conf.defaultDataSourceName
-        sql(s"CREATE TABLE same_name(id LONG) USING $format")
+        sql(s"CREATE TABLE same_name(id LONG) USING $v2Format")
         spark.range(10).createTempView("same_name")
         spark.range(20).write.format(v2Format).mode(SaveMode.Append).saveAsTable("same_name")
         checkAnswer(spark.table("same_name"), spark.range(10).toDF())
@@ -83,11 +104,43 @@ class DataSourceV2DataFrameSessionCatalogSuite
   test("saveAsTable passes path and provider information properly") {
     val t1 = "prop_table"
     withTable(t1) {
-      spark.range(20).write.format(v2Format).option("path", "abc").saveAsTable(t1)
+      spark.range(20).write.format(v2Format).option("path", "/abc").saveAsTable(t1)
       val cat = spark.sessionState.catalogManager.currentCatalog.asInstanceOf[TableCatalog]
       val tableInfo = cat.loadTable(Identifier.of(Array("default"), t1))
-      assert(tableInfo.properties().get("location") === "abc")
+      assert(tableInfo.properties().get("location") === "file:/abc")
       assert(tableInfo.properties().get("provider") === v2Format)
+    }
+  }
+
+  test("SPARK-49246: saveAsTable with v1 format") {
+    withTable("t") {
+      sql("CREATE TABLE t(c INT) USING csv")
+      val df = spark.range(10).toDF()
+      df.write.mode(SaveMode.Overwrite).format("csv").saveAsTable("t")
+      verifyTable("t", df)
+    }
+  }
+
+  test("SPARK-58389: time travel options are ignored for V1 table writes") {
+    withTable("t") {
+      sql("CREATE TABLE t(c BIGINT) USING csv")
+      val df = spark.range(1).toDF("c")
+
+      df.write
+        .format(v2Format)
+        .option("versionAsOf", "1")
+        .insertInto("t")
+      verifyTable("t", df)
+
+      // SaveMode.Ignore leaves the existing V1 table unchanged, but the write must still
+      // reach the V1 fallback before Spark rejects the time-travel option.
+      df.write
+        .format(v2Format)
+        .option("versionAsOf", "1")
+        .mode(SaveMode.Ignore)
+        .saveAsTable("t")
+
+      verifyTable("t", df)
     }
   }
 }
@@ -97,7 +150,7 @@ class InMemoryTableSessionCatalog extends TestV2SessionCatalogBase[InMemoryTable
       name: String,
       schema: StructType,
       partitions: Array[Transform],
-      properties: util.Map[String, String]): InMemoryTable = {
+      properties: java.util.Map[String, String]): InMemoryTable = {
     new InMemoryTable(name, schema, partitions, properties)
   }
 
@@ -105,14 +158,39 @@ class InMemoryTableSessionCatalog extends TestV2SessionCatalogBase[InMemoryTable
     val identToUse = Option(InMemoryTableSessionCatalog.customIdentifierResolution)
       .map(_(ident))
       .getOrElse(ident)
-    super.loadTable(identToUse)
+
+    // For single-part namespaces, follow Iceberg's pattern: first try to load the table
+    // normally, fall back to metadata table resolution only on NoSuchTableException
+    try {
+      super.loadTable(identToUse)
+    } catch {
+      case _: AnalysisException if identToUse.name().toLowerCase(Locale.ROOT) == "snapshots" =>
+        loadSnapshotTable(identToUse)
+    }
+  }
+
+  private def loadSnapshotTable(ident: Identifier): InMemorySnapshotsTable = {
+    val parentTableName = ident.namespace().last
+    val parentNamespace = ident.namespace().dropRight(1)
+    val parentIdent = Identifier.of(
+      if (parentNamespace.isEmpty) Array("default") else parentNamespace,
+      parentTableName)
+    val parentTable = super.loadTable(parentIdent).asInstanceOf[InMemoryTable]
+    new InMemorySnapshotsTable(parentTable)
   }
 
   override def alterTable(ident: Identifier, changes: TableChange*): Table = {
     Option(tables.get(ident)) match {
       case Some(table) =>
         val properties = CatalogV2Util.applyPropertiesChanges(table.properties, changes)
-        val schema = CatalogV2Util.applySchemaChanges(table.schema, changes)
+        val provider = Option(properties.get("provider"))
+
+        val schema = CatalogV2Util.applySchemaChanges(
+          table.schema,
+          changes,
+          provider,
+          "ALTER TABLE"
+        )
 
         // fail if the last column in the schema was dropped
         if (schema.fields.isEmpty) {
@@ -120,13 +198,14 @@ class InMemoryTableSessionCatalog extends TestV2SessionCatalogBase[InMemoryTable
         }
 
         val newTable = new InMemoryTable(table.name, schema, table.partitioning, properties)
-          .withData(table.data)
+          .alterTableWithData(table.data, schema)
+        newTable.setDisplayProperties(table.displayProperties())
 
         tables.put(ident, newTable)
 
         newTable
       case _ =>
-        throw QueryCompilationErrors.noSuchTableError(ident)
+        throw QueryCompilationErrors.noSuchTableError(name(), ident)
     }
   }
 }
@@ -147,15 +226,18 @@ object InMemoryTableSessionCatalog {
 }
 
 private [connector] trait SessionCatalogTest[T <: Table, Catalog <: TestV2SessionCatalogBase[T]]
-  extends QueryTest
-  with SharedSparkSession
-  with BeforeAndAfter {
+  extends SharedSparkSession
+  with BeforeAndAfter { self: InsertIntoSQLOnlyTests =>
 
   protected def catalog(name: String): CatalogPlugin = {
     spark.sessionState.catalogManager.catalog(name)
   }
 
-  protected val v2Format: String = classOf[FakeV2Provider].getName
+  protected def sessionCatalog: Catalog = {
+    catalog(SESSION_CATALOG_NAME).asInstanceOf[Catalog]
+  }
+
+  protected val v2Format: String = classOf[FakeV2ProviderWithCustomSchema].getName
 
   protected val catalogClassName: String = classOf[InMemoryTableSessionCatalog].getName
 
@@ -165,7 +247,9 @@ private [connector] trait SessionCatalogTest[T <: Table, Catalog <: TestV2Sessio
 
   override def afterEach(): Unit = {
     super.afterEach()
-    catalog(SESSION_CATALOG_NAME).asInstanceOf[Catalog].clearTables()
+    sessionCatalog.checkUsage()
+    sessionCatalog.clearTables()
+    sessionCatalog.clearFunctions()
     spark.conf.unset(V2_SESSION_CATALOG_IMPLEMENTATION.key)
   }
 
@@ -177,6 +261,7 @@ private [connector] trait SessionCatalogTest[T <: Table, Catalog <: TestV2Sessio
     val t1 = "tbl"
     val df = Seq((1L, "a"), (2L, "b"), (3L, "c")).toDF("id", "data")
     df.write.format(v2Format).saveAsTable(t1)
+    checkInsertMetrics(t1, numInsertedRows = 3)
     verifyTable(t1, df)
   }
 
@@ -184,6 +269,7 @@ private [connector] trait SessionCatalogTest[T <: Table, Catalog <: TestV2Sessio
     val t1 = "tbl"
     val df = Seq((1L, "a"), (2L, "b"), (3L, "c")).toDF("id", "data")
     df.write.format(v2Format).mode("append").saveAsTable(t1)
+    checkInsertMetrics(t1, numInsertedRows = 3)
     verifyTable(t1, df)
   }
 
@@ -207,10 +293,12 @@ private [connector] trait SessionCatalogTest[T <: Table, Catalog <: TestV2Sessio
       df.select("id", "data").write.format(v2Format).saveAsTable(t1)
     }
     df.write.format(v2Format).mode("append").saveAsTable(t1)
+    checkInsertMetrics(t1, numInsertedRows = 3)
     verifyTable(t1, df)
 
     // Check that appends are by name
-    df.select('data, 'id).write.format(v2Format).mode("append").saveAsTable(t1)
+    df.select($"data", $"id").write.format(v2Format).mode("append").saveAsTable(t1)
+    checkInsertMetrics(t1, numInsertedRows = 3)
     verifyTable(t1, df.union(df))
   }
 
@@ -246,6 +334,7 @@ private [connector] trait SessionCatalogTest[T <: Table, Catalog <: TestV2Sessio
     val t1 = "tbl"
     val df = Seq((1L, "a"), (2L, "b"), (3L, "c")).toDF("id", "data")
     df.write.format(v2Format).mode("ignore").saveAsTable(t1)
+    checkInsertMetrics(t1, numInsertedRows = 3)
     verifyTable(t1, df)
   }
 

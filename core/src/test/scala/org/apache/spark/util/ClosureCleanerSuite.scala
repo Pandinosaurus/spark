@@ -23,6 +23,7 @@ import org.apache.spark.{SparkContext, SparkException, SparkFunSuite, TaskContex
 import org.apache.spark.LocalSparkContext._
 import org.apache.spark.partial.CountEvaluator
 import org.apache.spark.rdd.RDD
+import org.apache.spark.util.ArrayImplicits._
 
 class ClosureCleanerSuite extends SparkFunSuite {
   test("closures inside an object") {
@@ -59,9 +60,38 @@ class ClosureCleanerSuite extends SparkFunSuite {
     }
   }
 
+  test("return statements in closures capturing a null value are identified at cleaning time") {
+    intercept[ReturnStatementInClosureException] {
+      TestObjectWithBogusReturnsAndNullCapture.run()
+    }
+  }
+
   test("return statements from named functions nested in closures don't raise exceptions") {
     val result = TestObjectWithNestedReturns.run()
     assert(result === 1)
+  }
+
+  test("hasReturnStatement identifies non-local returns per method") {
+    TestObjectWithReturnInClosure.run()
+    val cls = TestObjectWithReturnInClosure.getClass
+    val implMethodName = {
+      val proxy =
+        IndylambdaScalaClosures.getSerializationProxy(TestObjectWithReturnInClosure.lastClosure)
+      assert(proxy.isDefined)
+      proxy.get.getImplMethodName
+    }
+    // Any-method query.
+    assert(ClosureCleaner.hasReturnStatement(cls, None))
+    // Targeted query with the exact impl method name.
+    assert(ClosureCleaner.hasReturnStatement(cls, Some(implMethodName)))
+    // An "$adapted" wrapper name resolves to the underlying method that holds the closure body
+    // (see https://github.com/scala/scala-dev/issues/109).
+    assert(ClosureCleaner.hasReturnStatement(cls, Some(implMethodName + "$adapted")))
+    // A method that does not exist on the class must not match.
+    assert(!ClosureCleaner.hasReturnStatement(cls, Some("$anonfun$doesNotExist$1")))
+    // A class whose closures contain no non-local returns.
+    TestObjectWithoutReturnInClosure.run()
+    assert(!ClosureCleaner.hasReturnStatement(TestObjectWithoutReturnInClosure.getClass, None))
   }
 
   test("user provided closures are actually cleaned") {
@@ -140,7 +170,7 @@ object TestObject {
     var nonSer = new NonSerializable
     val x = 5
     withSpark(new SparkContext("local", "test")) { sc =>
-      val nums = sc.parallelize(Array(1, 2, 3, 4))
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
       nums.map(_ + x).reduce(_ + _)
     }
   }
@@ -154,7 +184,7 @@ class TestClass extends Serializable {
   def run(): Int = {
     var nonSer = new NonSerializable
     withSpark(new SparkContext("local", "test")) { sc =>
-      val nums = sc.parallelize(Array(1, 2, 3, 4))
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
       nums.map(_ + getX).reduce(_ + _)
     }
   }
@@ -166,7 +196,7 @@ class TestClassWithoutDefaultConstructor(x: Int) extends Serializable {
   def run(): Int = {
     var nonSer = new NonSerializable
     withSpark(new SparkContext("local", "test")) { sc =>
-      val nums = sc.parallelize(Array(1, 2, 3, 4))
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
       nums.map(_ + getX).reduce(_ + _)
     }
   }
@@ -181,7 +211,7 @@ class TestClassWithoutFieldAccess {
     var nonSer2 = new NonSerializable
     val x = 5
     withSpark(new SparkContext("local", "test")) { sc =>
-      val nums = sc.parallelize(Array(1, 2, 3, 4))
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
       nums.map(_ + x).reduce(_ + _)
     }
   }
@@ -190,7 +220,7 @@ class TestClassWithoutFieldAccess {
 object TestObjectWithBogusReturns {
   def run(): Int = {
     withSpark(new SparkContext("local", "test")) { sc =>
-      val nums = sc.parallelize(Array(1, 2, 3, 4))
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
       // this return is invalid since it will transfer control outside the closure
       nums.map {x => return 1 ; x * 2}
       1
@@ -198,10 +228,44 @@ object TestObjectWithBogusReturns {
   }
 }
 
+object TestObjectWithBogusReturnsAndNullCapture {
+  def run(): Int = {
+    withSpark(new SparkContext("local", "test")) { sc =>
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
+      val s: String = null
+      // The closure's first captured argument may be the (null) `s` rather than the non-local
+      // return's key: the cleaner must still detect the invalid return rather than bail out on
+      // the null capture.
+      nums.map { x => if (s != null) return 1; x * 2 }
+      1
+    }
+  }
+}
+
+object TestObjectWithReturnInClosure {
+  // The non-local `return` forces the enclosing method to have type Int, so it cannot return the
+  // closure to the caller directly; stash it for the test to inspect instead.
+  var lastClosure: Int => Int = null
+  def run(): Int = {
+    val f = (x: Int) => { if (x < 0) return -1; x }
+    lastClosure = f
+    f(1)
+  }
+}
+
+object TestObjectWithoutReturnInClosure {
+  var lastClosure: Int => Int = null
+  def run(): Int = {
+    val f = (x: Int) => x * 2
+    lastClosure = f
+    f(1)
+  }
+}
+
 object TestObjectWithNestedReturns {
   def run(): Int = {
     withSpark(new SparkContext("local", "test")) { sc =>
-      val nums = sc.parallelize(Array(1, 2, 3, 4))
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
       nums.map {x =>
         // this return is fine since it will not transfer control outside the closure
         def foo(): Int = { return 5; 1 }
@@ -217,7 +281,7 @@ object TestObjectWithNesting {
     var nonSer = new NonSerializable
     var answer = 0
     withSpark(new SparkContext("local", "test")) { sc =>
-      val nums = sc.parallelize(Array(1, 2, 3, 4))
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
       val y = 1
       for (i <- 1 to 4) {
         var nonSer2 = new NonSerializable
@@ -236,7 +300,7 @@ class TestClassWithNesting(val y: Int) extends Serializable {
     var nonSer = new NonSerializable
     var answer = 0
     withSpark(new SparkContext("local", "test")) { sc =>
-      val nums = sc.parallelize(Array(1, 2, 3, 4))
+      val nums = sc.parallelize(Array(1, 2, 3, 4).toImmutableArraySeq)
       for (i <- 1 to 4) {
         var nonSer2 = new NonSerializable
         val x = i
@@ -373,7 +437,7 @@ class TestCreateNullValue {
         println(getX)
       }
       // scalastyle:on println
-      ClosureCleaner.clean(closure)
+      SparkClosureCleaner.clean(closure)
     }
     nestedClosure()
   }

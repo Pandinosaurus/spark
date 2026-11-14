@@ -22,13 +22,14 @@ import java.sql.Timestamp
 import org.apache.spark.{SparkContext, SparkException}
 import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskStart}
 import org.apache.spark.sql._
-import org.apache.spark.sql.execution.streaming._
 import org.apache.spark.sql.execution.streaming.continuous._
+import org.apache.spark.sql.execution.streaming.runtime._
 import org.apache.spark.sql.execution.streaming.sources.ContinuousMemoryStream
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf.{CONTINUOUS_STREAMING_EPOCH_BACKLOG_QUEUE_SIZE, MIN_BATCHES_TO_RETAIN}
 import org.apache.spark.sql.streaming.{StreamTest, Trigger}
 import org.apache.spark.sql.test.TestSparkSession
+import org.apache.spark.tags.SlowSQLTest
 
 class ContinuousSuiteBase extends StreamTest {
   // We need more than the default local[2] to be able to schedule all partitions simultaneously.
@@ -60,7 +61,7 @@ class ContinuousSuiteBase extends StreamTest {
       c.committedOffsets.lastOption.map { case (_, offset) =>
         offset match {
           case o: RateStreamOffset =>
-            o.partitionToValueAndRunTimeMs.mapValues(_.value).toMap
+            o.partitionToValueAndRunTimeMs.transform((_, v) => v.value)
         }
       }
     }
@@ -89,6 +90,7 @@ class ContinuousSuiteBase extends StreamTest {
   override protected val defaultTrigger = Trigger.Continuous(100)
 }
 
+@SlowSQLTest
 class ContinuousSuite extends ContinuousSuiteBase {
   import IntegratedUDFTestUtils._
   import testImplicits._
@@ -148,7 +150,7 @@ class ContinuousSuite extends ContinuousSuiteBase {
 
   test("filter") {
     val input = ContinuousMemoryStream[Int]
-    val df = input.toDF().where('value > 2)
+    val df = input.toDF().where($"value" > 2)
 
     testStream(df)(
       AddData(input, 0, 1),
@@ -181,6 +183,24 @@ class ContinuousSuite extends ContinuousSuiteBase {
 
     assert(except.message.contains(
       "Continuous processing does not support current time operations."))
+  }
+
+  test("SPARK-57837: nanosecond current-timestamp functions are rejected") {
+    // current_timestamp(p) -> CurrentTimestampNanos and localtimestamp(p) -> LocalTimestampNanos
+    // must be rejected in continuous processing just like their microsecond forms. The nanos
+    // types are enabled by default under Utils.isTesting.
+    Seq("current_timestamp(9)", "now(9)", "localtimestamp(9)").foreach { fn =>
+      val input = ContinuousMemoryStream[Int]
+      val df = input.toDF().selectExpr(fn)
+
+      val except = intercept[AnalysisException] {
+        testStream(df)(StartStream())
+      }
+
+      assert(except.message.contains(
+        "Continuous processing does not support current time operations."),
+        s"$fn should be rejected for continuous processing")
+    }
   }
 
   test("subquery alias") {
@@ -257,7 +277,7 @@ class ContinuousSuite extends ContinuousSuiteBase {
       .option("numPartitions", "2")
       .option("rowsPerSecond", "2")
       .load()
-      .select('value)
+      .select($"value")
 
     val query = df.writeStream
       .format("memory")
@@ -279,7 +299,7 @@ class ContinuousSuite extends ContinuousSuiteBase {
   Seq(TestScalaUDF("udf"), TestPythonUDF("udf"), TestScalarPandasUDF("udf")).foreach { udf =>
     test(s"continuous mode with various UDFs - ${udf.prettyName}") {
       assume(
-        shouldTestScalarPandasUDFs && udf.isInstanceOf[TestScalarPandasUDF] ||
+        shouldTestPandasUDFs && udf.isInstanceOf[TestScalarPandasUDF] ||
         shouldTestPythonUDFs && udf.isInstanceOf[TestPythonUDF] ||
         udf.isInstanceOf[TestScalaUDF])
 
@@ -297,6 +317,7 @@ class ContinuousSuite extends ContinuousSuiteBase {
   }
 }
 
+@SlowSQLTest
 class ContinuousStressSuite extends ContinuousSuiteBase {
   import testImplicits._
 
@@ -306,7 +327,7 @@ class ContinuousStressSuite extends ContinuousSuiteBase {
       .option("numPartitions", "5")
       .option("rowsPerSecond", "500")
       .load()
-      .select('value)
+      .select($"value")
 
     testStream(df)(
       StartStream(longContinuousTrigger),
@@ -326,7 +347,7 @@ class ContinuousStressSuite extends ContinuousSuiteBase {
       .option("numPartitions", "5")
       .option("rowsPerSecond", "500")
       .load()
-      .select('value)
+      .select($"value")
 
     testStream(df)(
       StartStream(Trigger.Continuous(2012)),
@@ -345,7 +366,7 @@ class ContinuousStressSuite extends ContinuousSuiteBase {
       .option("numPartitions", "5")
       .option("rowsPerSecond", "500")
       .load()
-      .select('value)
+      .select($"value")
 
     testStream(df)(
       StartStream(Trigger.Continuous(1012)),
@@ -372,6 +393,7 @@ class ContinuousStressSuite extends ContinuousSuiteBase {
   }
 }
 
+@SlowSQLTest
 class ContinuousMetaSuite extends ContinuousSuiteBase {
   import testImplicits._
 
@@ -436,7 +458,7 @@ class ContinuousEpochBacklogSuite extends ContinuousSuiteBase {
         .option("numPartitions", "2")
         .option("rowsPerSecond", "500")
         .load()
-        .select('value)
+        .select($"value")
 
       testStream(df)(
         StartStream(Trigger.Continuous(1)),

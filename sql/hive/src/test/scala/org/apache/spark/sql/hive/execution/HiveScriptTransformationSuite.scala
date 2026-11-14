@@ -25,17 +25,21 @@ import org.apache.hadoop.hive.serde2.`lazy`.LazySimpleSerDe
 import org.scalatest.exceptions.TestFailedException
 
 import org.apache.spark.{SparkException, TestUtils}
-import org.apache.spark.sql.Row
+import org.apache.spark.sql.{AnalysisException, QueryTest, Row}
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference}
 import org.apache.spark.sql.catalyst.util.DateTimeConstants
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.hive.test.TestHiveSingleton
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.types.DayTimeIntervalType._
 import org.apache.spark.sql.types.YearMonthIntervalType._
+import org.apache.spark.tags.SlowHiveTest
 import org.apache.spark.unsafe.types.CalendarInterval
+import org.apache.spark.util.ArrayImplicits._
 
+@SlowHiveTest
 class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with TestHiveSingleton {
   import testImplicits._
 
@@ -56,7 +60,7 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
     )
   }
 
-  private val hiveIOSchema: ScriptTransformationIOSchema = {
+  private def hiveIOSchema: ScriptTransformationIOSchema = {
     defaultIOSchema.copy(
       inputSerdeClass = Some(classOf[LazySimpleSerDe].getCanonicalName),
       outputSerdeClass = Some(classOf[LazySimpleSerDe].getCanonicalName)
@@ -75,7 +79,7 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
         child = child,
         ioschema = hiveIOSchema
       ),
-      rowsDf.collect())
+      rowsDf.collect().toImmutableArraySeq)
     assert(uncaughtExceptionHandler.exception.isEmpty)
   }
 
@@ -92,7 +96,7 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
           child = ExceptionInjectingOperator(child),
           ioschema = hiveIOSchema
         ),
-        rowsDf.collect())
+        rowsDf.collect().toImmutableArraySeq)
     }
     assert(e.getMessage().contains("intentional exception"))
     // Before SPARK-25158, uncaughtExceptionHandler will catch IllegalArgumentException
@@ -111,7 +115,7 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
           output = Seq(AttributeReference("a", StringType)()),
           child = rowsDf.queryExecution.sparkPlan,
           ioschema = hiveIOSchema)
-      SparkPlanTest.executePlan(plan, hiveContext)
+      QueryTest.executePlan(plan, hiveContext)
     }
     assert(e.getMessage.contains("Subprocess exited with status"))
     assert(uncaughtExceptionHandler.exception.isEmpty)
@@ -133,7 +137,7 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
         child = child,
         ioschema = hiveIOSchema
       ),
-      rowsDf.select("name").collect())
+      rowsDf.select("name").collect().toImmutableArraySeq)
     assert(uncaughtExceptionHandler.exception.isEmpty)
   }
 
@@ -148,7 +152,7 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
           output = Seq(AttributeReference("a", StringType)()),
           child = rowsDf.queryExecution.sparkPlan,
           ioschema = hiveIOSchema)
-      SparkPlanTest.executePlan(plan, hiveContext)
+      QueryTest.executePlan(plan, hiveContext)
     }
     assert(e.getMessage.contains("Subprocess exited with status"))
     assert(uncaughtExceptionHandler.exception.isEmpty)
@@ -176,12 +180,12 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
         """.stripMargin),
         identity,
         df.select(
-          'a.cast("string").as("key"),
+          $"a".cast("string").as("key"),
           concat_ws("\t",
-            'b.cast("string"),
-            'c.cast("string"),
-            'd.cast("string"),
-            'e.cast("string")).as("value")).collect())
+            $"b".cast("string"),
+            $"c".cast("string"),
+            $"d".cast("string"),
+            $"e".cast("string")).as("value")).collect().toImmutableArraySeq)
 
       // In hive default serde mode, if we don't define output schema,
       // when output column size > 2 and just specify serde,
@@ -204,8 +208,8 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
         """.stripMargin),
         identity,
         df.select(
-          'a.cast("string").as("key"),
-          'b.cast("string").as("value")).collect())
+          $"a".cast("string").as("key"),
+          $"b".cast("string").as("value")).collect().toImmutableArraySeq)
 
 
       // In hive default serde mode, if we don't define output schema,
@@ -232,12 +236,12 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
         """.stripMargin),
         identity,
         df.select(
-          'a.cast("string").as("key"),
+          $"a".cast("string").as("key"),
           concat_ws("\t",
-            'b.cast("string"),
-            'c.cast("string"),
-            'd.cast("string"),
-            'e.cast("string")).as("value")).collect())
+            $"b".cast("string"),
+            $"c".cast("string"),
+            $"d".cast("string"),
+            $"e".cast("string")).as("value")).collect().toImmutableArraySeq)
 
       // In hive default serde mode, if we don't define output schema,
       // when output column size > 2 and specify serde
@@ -262,8 +266,8 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
         """.stripMargin),
         identity,
         df.select(
-          'a.cast("string").as("key"),
-          'b.cast("string").as("value")).collect())
+          $"a".cast("string").as("key"),
+          $"b".cast("string").as("value")).collect().toImmutableArraySeq)
 
       // In hive default serde mode, if we don't define output schema,
       // when output column size = 2 and specify serde, it will these two column as
@@ -287,8 +291,8 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
         """.stripMargin),
         identity,
         df.select(
-          'a.cast("string").as("key"),
-          'b.cast("string").as("value")).collect())
+          $"a".cast("string").as("key"),
+          $"b".cast("string").as("value")).collect().toImmutableArraySeq)
 
       // In hive default serde mode, if we don't define output schema,
       // when output column size < 2 and specify serde, it will return null for deficiency
@@ -312,8 +316,8 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
         """.stripMargin),
         identity,
         df.select(
-          'a.cast("string").as("key"),
-          lit(null)).collect())
+          $"a".cast("string").as("key"),
+          lit(null)).collect().toImmutableArraySeq)
     }
   }
 
@@ -326,12 +330,12 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
         (1, "1", Array(0, 1, 2), Map("a" -> 1)),
         (2, "2", Array(3, 4, 5), Map("b" -> 2))
       ).toDF("a", "b", "c", "d")
-        .select('a, 'b, 'c, 'd, struct('a, 'b).as("e"))
+        .select($"a", $"b", $"c", $"d", struct($"a", $"b").as("e"))
       df.createTempView("v")
 
       // Hive serde support ArrayType/MapType/StructType as input and output data type
       checkAnswer(
-        df.select('c, 'd, 'e),
+        df.select($"c", $"d", $"e"),
         (child: SparkPlan) => createScriptTransformationExec(
           script = "cat",
           output = Seq(
@@ -344,7 +348,7 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
           child = child,
           ioschema = hiveIOSchema
         ),
-        df.select('c, 'd, 'e).collect())
+        df.select($"c", $"d", $"e").collect().toImmutableArraySeq)
     }
   }
 
@@ -355,7 +359,7 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
         (1, "1", Array(0, 1, 2), Map("a" -> 1)),
         (2, "2", Array(3, 4, 5), Map("b" -> 2))
       ).toDF("a", "b", "c", "d")
-        .select('a, 'b, 'c, 'd, struct('a, 'b).as("e"))
+        .select($"a", $"b", $"c", $"d", struct($"a", $"b").as("e"))
       df.createTempView("v")
 
       // Hive serde support ArrayType/MapType/StructType as input and output data type
@@ -365,7 +369,96 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
           |USING 'cat' AS (c array<int>, d map<string, int>, e struct<col1:int, col2:string>)
           |FROM v
         """.stripMargin)
-      checkAnswer(query, identity, df.select('c, 'd, 'e).collect())
+      checkAnswer(query, identity, df.select($"c", $"d", $"e").collect().toImmutableArraySeq)
+    }
+  }
+
+  test("SPARK-60090: TRANSFORM CHAR/VARCHAR with Hive SerDe uses Project assignment") {
+    assume(TestUtils.testCommandAvailable("/bin/bash"))
+    withSQLConf(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "true") {
+      // Hive sessions default to LazySimpleSerDe; script I/O stays STRING-shaped and
+      // Project applies pad / EXCEED_LIMIT_LENGTH for the declared AS types.
+      val query = sql(
+        """
+          |SELECT TRANSFORM(
+          |  array(CAST('ab' AS CHAR(4) COLLATE UTF8_LCASE)),
+          |  named_struct('value', CAST('xyz' AS VARCHAR(6))))
+          |USING 'cat'
+          |AS (
+          |  chars ARRAY<CHAR(4) COLLATE UTF8_LCASE>,
+          |  nested STRUCT<value: VARCHAR(6) COLLATE UNICODE_CI>)
+          |FROM VALUES (1) input(dummy)
+          |""".stripMargin)
+      assert(query.schema.map(_.dataType) === Seq(
+        ArrayType(CharType(4, "UTF8_LCASE")),
+        StructType(Seq(StructField("value", VarcharType(6, "UNICODE_CI"))))))
+      checkAnswer(query, Row(Seq("ab  "), Row("xyz")))
+
+      checkExceedLimitLength(
+        intercept[Exception] {
+          sql(
+            """
+              |SELECT TRANSFORM('abcdef')
+              |USING 'cat'
+              |AS (c CHAR(4))
+              |FROM VALUES (1) input(dummy)
+              |""".stripMargin).collect()
+        },
+        "4")
+      checkExceedLimitLength(
+        intercept[Exception] {
+          sql(
+            """
+              |SELECT TRANSFORM('abcdefgh')
+              |USING 'cat'
+              |AS (v VARCHAR(5))
+              |FROM VALUES (1) input(dummy)
+              |""".stripMargin).collect()
+        },
+        "5")
+      Seq(
+        """
+          |SELECT TRANSFORM(array('abcdef'))
+          |USING 'cat'
+          |AS (value ARRAY<CHAR(4)>)
+          |FROM VALUES (1) input(dummy)
+          |""".stripMargin,
+        """
+          |SELECT TRANSFORM(named_struct('value', 'abcdef'))
+          |USING 'cat'
+          |AS (value STRUCT<value: VARCHAR(4)>)
+          |FROM VALUES (1) input(dummy)
+          |""".stripMargin).foreach { q =>
+        checkExceedLimitLength(intercept[Exception](sql(q).collect()), "4")
+      }
+    }
+  }
+
+  test("SPARK-60090: Hive TRANSFORM view keeps CHAR/VARCHAR Project assignment") {
+    assume(TestUtils.testCommandAvailable("/bin/bash"))
+    withSQLConf(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "true") {
+      withView("v") {
+        sql(
+          """CREATE VIEW v AS
+            |SELECT TRANSFORM('ab') USING 'cat' AS (c CHAR(4))
+            |FROM VALUES (1) input(dummy)""".stripMargin)
+        withSQLConf(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "false") {
+          checkAnswer(sql("SELECT * FROM v"), Row("ab  "))
+        }
+      }
+    }
+    withSQLConf(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "true") {
+      withView("v_overflow") {
+        sql(
+          """CREATE VIEW v_overflow AS
+            |SELECT TRANSFORM('abcdef') USING 'cat' AS (c CHAR(4))
+            |FROM VALUES (1) input(dummy)""".stripMargin)
+        withSQLConf(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "false") {
+          checkExceedLimitLength(
+            intercept[Exception](sql("SELECT * FROM v_overflow").collect()),
+            "4")
+        }
+      }
     }
   }
 
@@ -378,29 +471,33 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
       ).toDF("a", "b", "c")
       df.createTempView("v")
 
-      val e1 = intercept[SparkException] {
-        val plan = createScriptTransformationExec(
-          script = "cat",
-          output = Seq(
-            AttributeReference("a", IntegerType)(),
-            AttributeReference("b", CalendarIntervalType)()),
-          child = df.select('a, 'b).queryExecution.sparkPlan,
-          ioschema = hiveIOSchema)
-        SparkPlanTest.executePlan(plan, hiveContext)
-      }.getMessage
-      assert(e1.contains("interval cannot be converted to Hive TypeInfo"))
+      checkError(
+        exception = intercept[AnalysisException] {
+          val plan = createScriptTransformationExec(
+            script = "cat",
+            output = Seq(
+              AttributeReference("a", IntegerType)(),
+              AttributeReference("b", CalendarIntervalType)()),
+            child = df.select($"a", $"b").queryExecution.sparkPlan,
+            ioschema = hiveIOSchema)
+          QueryTest.executePlan(plan, hiveContext)
+        },
+        condition = "UNSUPPORTED_DATATYPE",
+        parameters = Map("typeName" -> "\"INTERVAL\""))
 
-      val e2 = intercept[SparkException] {
-        val plan = createScriptTransformationExec(
-          script = "cat",
-          output = Seq(
-            AttributeReference("a", IntegerType)(),
-            AttributeReference("c", new TestUDT.MyDenseVectorUDT)()),
-          child = df.select('a, 'c).queryExecution.sparkPlan,
-          ioschema = hiveIOSchema)
-        SparkPlanTest.executePlan(plan, hiveContext)
-      }.getMessage
-      assert(e2.contains("array<double> cannot be converted to Hive TypeInfo"))
+      checkError(
+        exception = intercept[AnalysisException] {
+          val plan = createScriptTransformationExec(
+            script = "cat",
+            output = Seq(
+              AttributeReference("a", IntegerType)(),
+              AttributeReference("c", new TestUDT.MyDenseVectorUDT)()),
+            child = df.select($"a", $"c").queryExecution.sparkPlan,
+            ioschema = hiveIOSchema)
+          QueryTest.executePlan(plan, hiveContext)
+        },
+        condition = "UNSUPPORTED_DATATYPE",
+        parameters = Map("typeName" -> "UDT(\"ARRAY<DOUBLE>\")"))
     }
   }
 
@@ -413,24 +510,27 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
         (1, new CalendarInterval(7, 1, 1000), new TestUDT.MyDenseVector(Array(1, 2, 3)))
       ).toDF("a", "b", "c")
       df.createTempView("v")
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(
+            """
+              |SELECT TRANSFORM(a, b) USING 'cat' AS (a, b)
+              |FROM v
+            """.stripMargin).collect()
+        },
+        condition = "UNSUPPORTED_DATATYPE",
+        parameters = Map("typeName" -> "\"INTERVAL\""))
 
-      val e1 = intercept[SparkException] {
-        sql(
-          """
-            |SELECT TRANSFORM(a, b) USING 'cat' AS (a, b)
-            |FROM v
-          """.stripMargin).collect()
-      }.getMessage
-      assert(e1.contains("interval cannot be converted to Hive TypeInfo"))
-
-      val e2 = intercept[SparkException] {
-        sql(
-          """
-            |SELECT TRANSFORM(a, c) USING 'cat' AS (a, c)
-            |FROM v
-          """.stripMargin).collect()
-      }.getMessage
-      assert(e2.contains("array<double> cannot be converted to Hive TypeInfo"))
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(
+            """
+              |SELECT TRANSFORM(a, c) USING 'cat' AS (a, c)
+              |FROM v
+            """.stripMargin).collect()
+        },
+        condition = "UNSUPPORTED_DATATYPE",
+        parameters = Map("typeName" -> "UDT(\"ARRAY<DOUBLE>\")"))
     }
   }
 
@@ -569,7 +669,8 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
             AttributeReference("j", DayTimeIntervalType(SECOND))()),
           child = child,
           ioschema = hiveIOSchema),
-        df.select($"a", $"b", $"c", $"d", $"e", $"f", $"g", $"h", $"i", $"j").collect())
+        df.select($"a", $"b", $"c", $"d", $"e", $"f", $"g", $"h", $"i", $"j").collect()
+          .toImmutableArraySeq)
     }
   }
 
@@ -596,7 +697,7 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
             AttributeReference("c", YearMonthIntervalType(MONTH))()),
           child = child,
           ioschema = hiveIOSchema),
-        df.select($"a", $"b", $"c").collect())
+        df.select($"a", $"b", $"c").collect().toImmutableArraySeq)
     }
   }
 
@@ -614,9 +715,46 @@ class HiveScriptTransformationSuite extends BaseScriptTransformationSuite with T
             output = Seq(AttributeReference("a", DayTimeIntervalType())()),
             child = child,
             ioschema = hiveIOSchema),
-          df.select($"a").collect())
+          df.select($"a").collect().toImmutableArraySeq)
       }.getMessage
       assert(e.contains("java.lang.ArithmeticException: long overflow"))
+    }
+  }
+
+  test("SPARK-38075: ORDER BY with LIMIT should not add fake rows") {
+    withTempView("v") {
+      val df = Seq((1), (2), (3)).toDF("a")
+      df.createTempView("v")
+      checkAnswer(sql(
+        """
+          |SELECT TRANSFORM(a)
+          |  USING 'cat' AS (a)
+          |FROM v
+          |ORDER BY a
+          |LIMIT 10
+          |""".stripMargin),
+        identity,
+        Row("1") :: Row("2") :: Row("3") :: Nil)
+    }
+  }
+
+  test("SPARK-41790: Set TRANSFORM reader and writer's format correctly") {
+    withTempView("v") {
+      val df = Seq(
+        (1, 2)
+      ).toDF("a", "b")
+      df.createTempView("v")
+
+      checkAnswer(
+        sql(
+          s"""
+             |SELECT TRANSFORM(a, b)
+             |  ROW FORMAT DELIMITED
+             |  FIELDS TERMINATED BY ','
+             |  USING 'cat'
+             |  AS (c)
+             |FROM v
+          """.stripMargin), identity, Row("1,2") :: Nil)
     }
   }
 }

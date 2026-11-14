@@ -19,17 +19,24 @@
 PySpark supports custom serializers for transferring data; this can improve
 performance.
 
-By default, PySpark uses :class:`PickleSerializer` to serialize objects using Python's
-`cPickle` serializer, which can serialize nearly any Python object.
+By default, PySpark uses :class:`CPickleSerializer` to serialize objects. This is an alias
+that resolves to :class:`CloudPickleSerializer` (which uses the ``cloudpickle`` library and
+can serialize nearly any Python object); setting the ``PYSPARK_ENABLE_NAMEDTUPLE_PATCH=1``
+environment variable makes it resolve to :class:`PickleSerializer` (which uses the standard
+library ``pickle`` module) instead.
 Other serializers, like :class:`MarshalSerializer`, support fewer datatypes but can be
 faster.
+
+These serializers apply to the classic RDD path only, as shown below. Spark SQL and
+DataFrame data transfers default to Arrow-based serialization (see
+:mod:`pyspark.sql.pandas.serializers`) since SPARK-54555.
 
 
 Examples
 --------
 The serializer is chosen when creating :class:`SparkContext`:
 
->>> from pyspark.context import SparkContext
+>>> from pyspark.core.context import SparkContext
 >>> from pyspark.serializers import MarshalSerializer
 >>> sc = SparkContext('local', 'test', serializer=MarshalSerializer())
 >>> sc.parallelize(list(range(1000))).map(lambda x: 2 * x).take(10)
@@ -53,35 +60,43 @@ which contains two batches of two objects:
 >>> sc.stop()
 """
 
-import sys
-from itertools import chain, product
-import marshal
-import struct
-import types
+import codecs
 import collections
-import zlib
+import io
 import itertools
+import marshal
+import os
 import pickle
+import struct
+import sys
+import types
+import zlib
 
 pickle_protocol = pickle.HIGHEST_PROTOCOL
 
 from pyspark import cloudpickle
-from pyspark.util import print_exec  # type: ignore
+
+__all__ = [
+    "PickleSerializer",
+    "CPickleSerializer",
+    "CloudPickleSerializer",
+    "MarshalSerializer",
+    "UTF8Deserializer",
+]
 
 
-__all__ = ["PickleSerializer", "MarshalSerializer", "UTF8Deserializer"]
-
-
-class SpecialLengths(object):
+class SpecialLengths:
     END_OF_DATA_SECTION = -1
     PYTHON_EXCEPTION_THROWN = -2
-    TIMING_DATA = -3
+    METRICS_DATA = -3
     END_OF_STREAM = -4
     NULL = -5
     START_ARROW_STREAM = -6
+    START_OF_INIT_MESSAGE = -8
+    START_OF_INIT_RESPONSE = -9
 
 
-class Serializer(object):
+class Serializer:
     def dump_stream(self, iterator, stream):
         """
         Serialize an iterator of objects to the output stream.
@@ -91,6 +106,13 @@ class Serializer(object):
     def load_stream(self, stream):
         """
         Return an iterator of deserialized objects from the input stream.
+        """
+        raise NotImplementedError
+
+    def dumps(self, obj):
+        """
+        Serialize an object into a byte array.
+        When batching is used, this will be called with an array of objects.
         """
         raise NotImplementedError
 
@@ -111,9 +133,6 @@ class Serializer(object):
     def __eq__(self, other):
         return isinstance(other, self.__class__) and self.__dict__ == other.__dict__
 
-    def __ne__(self, other):
-        return not self.__eq__(other)
-
     def __repr__(self):
         return "%s()" % self.__class__.__name__
 
@@ -122,7 +141,6 @@ class Serializer(object):
 
 
 class FramedSerializer(Serializer):
-
     """
     Serializer that writes objects as a stream of (length, data) pairs,
     where `length` is a 32-bit integer and data is `length` bytes.
@@ -143,7 +161,7 @@ class FramedSerializer(Serializer):
         serialized = self.dumps(obj)
         if serialized is None:
             raise ValueError("serialized value should not be None")
-        if len(serialized) > (1 << 31):
+        if len(serialized) >= (1 << 31):
             raise ValueError("can not serialize object larger than 2G")
         write_int(len(serialized), stream)
         stream.write(serialized)
@@ -159,13 +177,6 @@ class FramedSerializer(Serializer):
             raise EOFError
         return self.loads(obj)
 
-    def dumps(self, obj):
-        """
-        Serialize an object into a byte array.
-        When batching is used, this will be called with an array of objects.
-        """
-        raise NotImplementedError
-
     def loads(self, obj):
         """
         Deserialize an object from a byte array.
@@ -174,7 +185,6 @@ class FramedSerializer(Serializer):
 
 
 class BatchedSerializer(Serializer):
-
     """
     Serializes a stream of objects in batches by calling its wrapped
     Serializer with streams of objects.
@@ -190,28 +200,16 @@ class BatchedSerializer(Serializer):
     def _batched(self, iterator):
         if self.batchSize == self.UNLIMITED_BATCH_SIZE:
             yield list(iterator)
-        elif hasattr(iterator, "__len__") and hasattr(iterator, "__getslice__"):
-            n = len(iterator)
-            for i in range(0, n, self.batchSize):
-                yield iterator[i : i + self.batchSize]
         else:
-            items = []
-            count = 0
-            for item in iterator:
-                items.append(item)
-                count += 1
-                if count == self.batchSize:
-                    yield items
-                    items = []
-                    count = 0
-            if items:
-                yield items
+            it = iter(iterator)
+            while batch := list(itertools.islice(it, self.batchSize)):
+                yield batch
 
     def dump_stream(self, iterator, stream):
         self.serializer.dump_stream(self._batched(iterator), stream)
 
     def load_stream(self, stream):
-        return chain.from_iterable(self._load_stream_without_unbatching(stream))
+        return itertools.chain.from_iterable(self._load_stream_without_unbatching(stream))
 
     def _load_stream_without_unbatching(self, stream):
         return self.serializer.load_stream(stream)
@@ -221,7 +219,6 @@ class BatchedSerializer(Serializer):
 
 
 class FlattenedValuesSerializer(BatchedSerializer):
-
     """
     Serializes a stream of list of pairs, split the list of values
     which contain more than a certain number of objects to make them
@@ -276,7 +273,6 @@ class AutoBatchedSerializer(BatchedSerializer):
 
 
 class CartesianDeserializer(Serializer):
-
     """
     Deserializes the JavaRDD cartesian() of two PythonRDDs.
     Due to pyspark batching we cannot simply use the result of the Java RDD cartesian,
@@ -290,19 +286,18 @@ class CartesianDeserializer(Serializer):
     def _load_stream_without_unbatching(self, stream):
         key_batch_stream = self.key_ser._load_stream_without_unbatching(stream)
         val_batch_stream = self.val_ser._load_stream_without_unbatching(stream)
-        for (key_batch, val_batch) in zip(key_batch_stream, val_batch_stream):
+        for key_batch, val_batch in zip(key_batch_stream, val_batch_stream):
             # for correctness with repeated cartesian/zip this must be returned as one batch
-            yield product(key_batch, val_batch)
+            yield itertools.product(key_batch, val_batch)
 
     def load_stream(self, stream):
-        return chain.from_iterable(self._load_stream_without_unbatching(stream))
+        return itertools.chain.from_iterable(self._load_stream_without_unbatching(stream))
 
     def __repr__(self):
         return "CartesianDeserializer(%s, %s)" % (str(self.key_ser), str(self.val_ser))
 
 
 class PairDeserializer(Serializer):
-
     """
     Deserializes the JavaRDD zip() of two PythonRDDs.
     Due to pyspark batching we cannot simply use the result of the Java RDD zip,
@@ -316,7 +311,7 @@ class PairDeserializer(Serializer):
     def _load_stream_without_unbatching(self, stream):
         key_batch_stream = self.key_ser._load_stream_without_unbatching(stream)
         val_batch_stream = self.val_ser._load_stream_without_unbatching(stream)
-        for (key_batch, val_batch) in zip(key_batch_stream, val_batch_stream):
+        for key_batch, val_batch in zip(key_batch_stream, val_batch_stream):
             # For double-zipped RDDs, the batches can be iterators from other PairDeserializer,
             # instead of lists. We need to convert them to lists if needed.
             key_batch = key_batch if hasattr(key_batch, "__len__") else list(key_batch)
@@ -330,7 +325,7 @@ class PairDeserializer(Serializer):
             yield zip(key_batch, val_batch)
 
     def load_stream(self, stream):
-        return chain.from_iterable(self._load_stream_without_unbatching(stream))
+        return itertools.chain.from_iterable(self._load_stream_without_unbatching(stream))
 
     def __repr__(self):
         return "PairDeserializer(%s, %s)" % (str(self.key_ser), str(self.val_ser))
@@ -344,86 +339,98 @@ class NoOpSerializer(FramedSerializer):
         return obj
 
 
-# Hack namedtuple, make it picklable
+if os.environ.get("PYSPARK_ENABLE_NAMEDTUPLE_PATCH") == "1":
+    # Hack namedtuple, make it picklable.
+    # For Python 3.8+, we use CPickle-based cloudpickle.
+    # SPARK-41189: There are still behaviour differences between regular pickle
+    # and Cloudpickle e.g., bug fixes from the upstream. It's safer to have
+    # a switch to turn on and off for the time being.
 
-__cls = {}  # type: ignore
+    __cls = {}  # type: ignore[var-annotated]
 
+    def _restore(name, fields, value):
+        """Restore an object of namedtuple"""
+        k = (name, fields)
+        cls = __cls.get(k)
+        if cls is None:
+            cls = collections.namedtuple(name, fields)
+            __cls[k] = cls
+        return cls(*value)
 
-def _restore(name, fields, value):
-    """Restore an object of namedtuple"""
-    k = (name, fields)
-    cls = __cls.get(k)
-    if cls is None:
-        cls = collections.namedtuple(name, fields)
-        __cls[k] = cls
-    return cls(*value)
+    def _hack_namedtuple(cls):
+        """Make class generated by namedtuple picklable"""
+        name = cls.__name__
+        fields = cls._fields
 
+        def __reduce__(self):
+            return (_restore, (name, fields, tuple(self)))
 
-def _hack_namedtuple(cls):
-    """Make class generated by namedtuple picklable"""
-    name = cls.__name__
-    fields = cls._fields
+        cls.__reduce__ = __reduce__
+        return cls
 
-    def __reduce__(self):
-        return (_restore, (name, fields, tuple(self)))
+    def _hijack_namedtuple():
+        """Hack namedtuple() to make it picklable"""
+        # hijack only one time
+        if hasattr(collections.namedtuple, "__hijack"):
+            return
 
-    cls.__reduce__ = __reduce__
-    cls._is_namedtuple_ = True
-    return cls
+        global _old_namedtuple  # or it will put in closure
+        global _old_namedtuple_kwdefaults  # or it will put in closure too
 
+        def _copy_func(f):
+            return types.FunctionType(
+                f.__code__, f.__globals__, f.__name__, f.__defaults__, f.__closure__
+            )
 
-def _hijack_namedtuple():
-    """Hack namedtuple() to make it picklable"""
-    # hijack only one time
-    if hasattr(collections.namedtuple, "__hijack"):
-        return
+        _old_namedtuple = _copy_func(collections.namedtuple)
+        _old_namedtuple_kwdefaults = collections.namedtuple.__kwdefaults__
 
-    global _old_namedtuple  # or it will put in closure
-    global _old_namedtuple_kwdefaults  # or it will put in closure too
+        def namedtuple(*args, **kwargs):
+            for k, v in _old_namedtuple_kwdefaults.items():
+                kwargs[k] = kwargs.get(k, v)
+            cls = _old_namedtuple(*args, **kwargs)
+            return _hack_namedtuple(cls)
 
-    def _copy_func(f):
-        return types.FunctionType(
-            f.__code__, f.__globals__, f.__name__, f.__defaults__, f.__closure__
+        # replace namedtuple with the new one
+        collections.namedtuple.__globals__["_old_namedtuple_kwdefaults"] = (
+            _old_namedtuple_kwdefaults
         )
+        collections.namedtuple.__globals__["_old_namedtuple"] = _old_namedtuple
+        collections.namedtuple.__globals__["_hack_namedtuple"] = _hack_namedtuple
+        collections.namedtuple.__code__ = namedtuple.__code__
+        collections.namedtuple.__hijack = 1
 
-    _old_namedtuple = _copy_func(collections.namedtuple)
-    _old_namedtuple_kwdefaults = collections.namedtuple.__kwdefaults__
+        # hack the cls already generated by namedtuple.
+        # Those created in other modules can be pickled as normal,
+        # so only hack those in __main__ module
+        for n, o in sys.modules["__main__"].__dict__.items():
+            if (
+                type(o) is type
+                and o.__base__ is tuple
+                and hasattr(o, "_fields")
+                and "__reduce__" not in o.__dict__
+            ):
+                _hack_namedtuple(o)  # hack inplace
 
-    def namedtuple(*args, **kwargs):
-        for k, v in _old_namedtuple_kwdefaults.items():
-            kwargs[k] = kwargs.get(k, v)
-        cls = _old_namedtuple(*args, **kwargs)
-        return _hack_namedtuple(cls)
-
-    # replace namedtuple with the new one
-    collections.namedtuple.__globals__["_old_namedtuple_kwdefaults"] = _old_namedtuple_kwdefaults
-    collections.namedtuple.__globals__["_old_namedtuple"] = _old_namedtuple
-    collections.namedtuple.__globals__["_hack_namedtuple"] = _hack_namedtuple
-    collections.namedtuple.__code__ = namedtuple.__code__
-    collections.namedtuple.__hijack = 1
-
-    # hack the cls already generated by namedtuple.
-    # Those created in other modules can be pickled as normal,
-    # so only hack those in __main__ module
-    for n, o in sys.modules["__main__"].__dict__.items():
-        if (
-            type(o) is type
-            and o.__base__ is tuple
-            and hasattr(o, "_fields")
-            and "__reduce__" not in o.__dict__
-        ):
-            _hack_namedtuple(o)  # hack inplace
+    _hijack_namedtuple()
 
 
-_hijack_namedtuple()
+class _RestrictedUnpickler(pickle.Unpickler):
+    def __init__(self, file, allowed_names, *, encoding="bytes"):
+        super().__init__(file, encoding=encoding)
+        self.allowed_names = allowed_names
+
+    def find_class(self, module, name):
+        if (module, name) not in self.allowed_names:
+            raise pickle.UnpicklingError(f"Unpickling {module}.{name} is not allowed")
+        return super().find_class(module, name)
 
 
 class PickleSerializer(FramedSerializer):
-
     """
     Serializes objects using Python's pickle serializer:
 
-        http://docs.python.org/2/library/pickle.html
+        https://docs.python.org/3/library/pickle.html
 
     This serializer supports nearly any Python object, but may
     not be as fast as more specialized serializers.
@@ -436,8 +443,22 @@ class PickleSerializer(FramedSerializer):
         return pickle.loads(obj, encoding=encoding)
 
 
-class CloudPickleSerializer(PickleSerializer):
+class CloudPickleSerializer(FramedSerializer):
+    # Class-level default for `allowed_names`. Instances of this serializer are pickled and
+    # shipped across the driver and workers, which may run different Spark versions. Pickle
+    # restores an instance via __new__ + __dict__ without calling __init__, so an instance
+    # pickled by a version that predates `allowed_names` would otherwise lack the attribute
+    # entirely. Declaring the default here keeps `self.allowed_names` resolvable in that
+    # cross-version case; only a version-matched, explicitly restricted instance sets it.
+    allowed_names = None
+
+    def __init__(self, allowed_names=None):
+        super().__init__()
+        self.allowed_names = allowed_names
+
     def dumps(self, obj):
+        from pyspark.util import print_exec
+
         try:
             return cloudpickle.dumps(obj, pickle_protocol)
         except pickle.PickleError:
@@ -451,15 +472,26 @@ class CloudPickleSerializer(PickleSerializer):
             print_exec(sys.stderr)
             raise pickle.PicklingError(msg)
 
+    def loads(self, obj, encoding="bytes"):
+        if self.allowed_names is not None:
+            unpickler = _RestrictedUnpickler(io.BytesIO(obj), self.allowed_names, encoding=encoding)
+            return unpickler.load()
+        return cloudpickle.loads(obj, encoding=encoding)
+
+
+if os.environ.get("PYSPARK_ENABLE_NAMEDTUPLE_PATCH") == "1":
+    CPickleSerializer = PickleSerializer
+else:
+    CPickleSerializer = CloudPickleSerializer  # type: ignore[misc, assignment]
+
 
 class MarshalSerializer(FramedSerializer):
-
     """
     Serializes objects using Python's Marshal serializer:
 
-        http://docs.python.org/2/library/marshal.html
+        https://docs.python.org/3/library/marshal.html
 
-    This serializer is faster than PickleSerializer but supports fewer datatypes.
+    This serializer is faster than CloudPickleSerializer but supports fewer datatypes.
     """
 
     def dumps(self, obj):
@@ -469,42 +501,12 @@ class MarshalSerializer(FramedSerializer):
         return marshal.loads(obj)
 
 
-class AutoSerializer(FramedSerializer):
-
-    """
-    Choose marshal or pickle as serialization protocol automatically
-    """
-
-    def __init__(self):
-        FramedSerializer.__init__(self)
-        self._type = None
-
-    def dumps(self, obj):
-        if self._type is not None:
-            return b"P" + pickle.dumps(obj, -1)
-        try:
-            return b"M" + marshal.dumps(obj)
-        except Exception:
-            self._type = b"P"
-            return b"P" + pickle.dumps(obj, -1)
-
-    def loads(self, obj):
-        _type = obj[0]
-        if _type == b"M":
-            return marshal.loads(obj[1:])
-        elif _type == b"P":
-            return pickle.loads(obj[1:])
-        else:
-            raise ValueError("invalid serialization type: %s" % _type)
-
-
 class CompressedSerializer(FramedSerializer):
     """
     Compress the serialized data
     """
 
     def __init__(self, serializer):
-        FramedSerializer.__init__(self)
         assert isinstance(serializer, FramedSerializer), "serializer must be a FramedSerializer"
         self.serializer = serializer
 
@@ -519,7 +521,6 @@ class CompressedSerializer(FramedSerializer):
 
 
 class UTF8Deserializer(Serializer):
-
     """
     Deserializes streams written by String.getBytes.
     """
@@ -534,7 +535,7 @@ class UTF8Deserializer(Serializer):
         elif length == SpecialLengths.NULL:
             return None
         s = stream.read(length)
-        return s.decode("utf-8") if self.use_unicode else s
+        return codecs.decode(s, "utf-8") if self.use_unicode else s
 
     def load_stream(self, stream):
         try:
@@ -587,8 +588,7 @@ def write_with_length(obj, stream):
     stream.write(obj)
 
 
-class ChunkedStream(object):
-
+class ChunkedStream:
     """
     This is a file-like object takes a stream of data, of unknown length, and breaks it into fixed
     length frames.  The intended use case is serializing large data and sending it immediately over
@@ -650,6 +650,6 @@ class ChunkedStream(object):
 if __name__ == "__main__":
     import doctest
 
-    (failure_count, test_count) = doctest.testmod()
+    failure_count, test_count = doctest.testmod()
     if failure_count:
         sys.exit(-1)

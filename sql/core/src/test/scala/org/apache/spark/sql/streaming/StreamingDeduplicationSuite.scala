@@ -17,13 +17,29 @@
 
 package org.apache.spark.sql.streaming
 
-import org.apache.spark.sql.DataFrame
+import java.io.File
+import java.util.UUID
+
+import org.apache.hadoop.conf.Configuration
+
+import org.apache.spark.SparkUnsupportedOperationException
+import org.apache.spark.sql.{DataFrame, Dataset}
+import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeProjection}
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes._
-import org.apache.spark.sql.execution.streaming.MemoryStream
+import org.apache.spark.sql.execution.streaming.operators.stateful.StatefulOperatorsUtils
+import org.apache.spark.sql.execution.streaming.operators.stateful.StatePartitionKeyExtractorFactory
+import org.apache.spark.sql.execution.streaming.runtime.MemoryStream
+import org.apache.spark.sql.execution.streaming.state._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.{StringType, StructType}
+import org.apache.spark.tags.SlowSQLTest
+import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.util.Utils
 
-class StreamingDeduplicationSuite extends StateStoreMetricsTest {
+@SlowSQLTest
+class StreamingDeduplicationSuite extends StateStoreMetricsTest
+  with StreamingDeduplicationSuiteBase {
 
   import testImplicits._
 
@@ -41,6 +57,79 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest {
       AddData(inputData, "b"),
       CheckLastBatch("b"),
       assertNumStateRows(total = 2, updated = 1)
+    )
+  }
+
+  // Canonical quiet NaN and a non-canonical NaN with a different bit pattern.
+  // Both are NaN, but they have distinct raw bit representations.
+  private val canonicalNaN = java.lang.Float.intBitsToFloat(0x7fc00000)
+  private val nonCanonicalNaN = java.lang.Float.intBitsToFloat(0x7f800001)
+  assert(java.lang.Float.isNaN(canonicalNaN) && java.lang.Float.isNaN(nonCanonicalNaN),
+    "Both values must be NaN")
+  assert(java.lang.Float.floatToRawIntBits(canonicalNaN) !=
+    java.lang.Float.floatToRawIntBits(nonCanonicalNaN),
+    "The two NaN values must have different bit patterns")
+
+  test("same NaN bit pattern should be deduplicated") {
+    val inputData = MemoryStream[(Float, Int)]
+    val result = inputData.toDS().toDF("value", "id").dropDuplicates("value")
+
+    testStream(result, Append)(
+      AddData(inputData, (canonicalNaN, 1)),
+      CheckLastBatch((canonicalNaN, 1)),
+      assertNumStateRows(total = 1, updated = 1),
+
+      AddData(inputData, (canonicalNaN, 2)),
+      CheckLastBatch(),
+      assertNumStateRows(total = 1, updated = 0),
+
+      CheckAnswer((canonicalNaN, 1))
+    )
+  }
+
+  /**
+   * Tests that different NaN bit patterns are deduplicated for a given key type.
+   * `buildKey` transforms the base DataFrame (columns: f, id) to add a "key" column.
+   */
+  private def testNaNDedup(keyDesc: String, buildKey: DataFrame => DataFrame): Unit = {
+    test(s"NaN normalization in dedup key: $keyDesc") {
+      val inputData = MemoryStream[(Float, Int)]
+      val base = inputData.toDS().toDF("f", "id")
+      val result = buildKey(base).dropDuplicates("key").select("f", "id")
+
+      testStream(result, Append)(
+        AddData(inputData, (canonicalNaN, 1)),
+        CheckLastBatch((canonicalNaN, 1)),
+        assertNumStateRows(total = 1, updated = 1),
+
+        // Non-canonical NaN should be treated as a duplicate
+        AddData(inputData, (nonCanonicalNaN, 2)),
+        CheckLastBatch(),
+        assertNumStateRows(total = 1, updated = 0),
+
+        CheckAnswer((canonicalNaN, 1))
+      )
+    }
+  }
+
+  testNaNDedup("scalar float", _.withColumn("key", col("f")))
+  testNaNDedup("struct containing float", _.withColumn("key", struct(col("f"))))
+  testNaNDedup("array containing float", _.withColumn("key", array(col("f"))))
+
+  test("negative zero and positive zero should be deduplicated") {
+    val inputData = MemoryStream[(Float, Int)]
+    val result = inputData.toDS().toDF("value", "id").dropDuplicates("value")
+
+    testStream(result, Append)(
+      AddData(inputData, (0.0f, 1)),
+      CheckLastBatch((0.0f, 1)),
+      assertNumStateRows(total = 1, updated = 1),
+
+      AddData(inputData, (-0.0f, 2)),
+      CheckLastBatch(),
+      assertNumStateRows(total = 1, updated = 0),
+
+      CheckAnswer((0.0f, 1))
     )
   }
 
@@ -145,9 +234,8 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest {
       .withColumn("eventTime", timestamp_seconds($"value"))
       .withWatermark("eventTime", "10 seconds")
       .dropDuplicates()
-      .withWatermark("eventTime", "10 seconds")
-      .groupBy(window($"eventTime", "5 seconds") as 'window)
-      .agg(count("*") as 'count)
+      .groupBy(window($"eventTime", "5 seconds") as Symbol("window"))
+      .agg(count("*") as Symbol("count"))
       .select($"window".getField("start").cast("long").as[Long], $"count".as[Long])
 
     testStream(windowedaggregate)(
@@ -258,7 +346,7 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest {
 
   test("SPARK-19841: watermarkPredicate should filter based on keys") {
     val input = MemoryStream[(Int, Int)]
-    val df = input.toDS.toDF("time", "id")
+    val df = input.toDS().toDF("time", "id")
       .withColumn("time", timestamp_seconds($"time"))
       .withWatermark("time", "1 second")
       .dropDuplicates("id", "time") // Change the column positions
@@ -277,7 +365,7 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest {
 
   test("SPARK-21546: dropDuplicates should ignore watermark when it's not a key") {
     val input = MemoryStream[(Int, Int)]
-    val df = input.toDS.toDF("id", "time")
+    val df = input.toDS().toDF("id", "time")
       .withColumn("time", timestamp_seconds($"time"))
       .withWatermark("time", "1 second")
       .dropDuplicates("id")
@@ -285,6 +373,38 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest {
     testStream(df)(
       AddData(input, 1 -> 1, 1 -> 2, 2 -> 2),
       CheckAnswer(1 -> 1, 2 -> 2)
+    )
+  }
+
+  test("SPARK-58979: dedup event-time projected away") {
+    val input = MemoryStream[(String, Long)]
+    val result = input.toDF()
+      .selectExpr("_1 AS id", "CAST(_2 AS TIMESTAMP) AS ts")
+      .withWatermark("ts", "10 seconds")
+      .dropDuplicates("id")
+      .select("id")
+
+    testStream(result, Append)(
+      AddData(input, ("a", 1000000L)),
+      CheckNewAnswer("a"),
+      AddData(input, ("b", 1000L)),
+      CheckNewAnswer()
+    )
+  }
+
+  test("SPARK-58979: dedup event-time retained") {
+    val input = MemoryStream[(String, Long)]
+    val result = input.toDF()
+      .selectExpr("_1 AS id", "CAST(_2 AS TIMESTAMP) AS ts")
+      .withWatermark("ts", "10 seconds")
+      .dropDuplicates("id")
+      .selectExpr("id", "CAST(ts AS LONG) AS tsl")
+
+    testStream(result, Append)(
+      AddData(input, ("a", 1000000L)),
+      CheckNewAnswer(("a", 1000000L)),
+      AddData(input, ("b", 1000L)),
+      CheckNewAnswer()
     )
   }
 
@@ -313,7 +433,7 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest {
         },
         AssertOnQuery { q =>
           eventually(timeout(streamingTimeout)) {
-            q.lastProgress.sink.numOutputRows == 0L
+            assert(q.lastProgress.sink.numOutputRows == 0L)
             true
           }
         }
@@ -328,7 +448,7 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest {
     " shifted partition IDs") {
     def constructUnionDf(desiredPartitionsForInput1: Int)
       : (MemoryStream[Int], MemoryStream[Int], DataFrame) = {
-      val input1 = MemoryStream[Int](desiredPartitionsForInput1)
+      val input1 = MemoryStream[Int](spark, desiredPartitionsForInput1)
       val input2 = MemoryStream[Int]
       val df1 = input1.toDF().select($"value")
       val df2 = input2.toDF().dropDuplicates("value")
@@ -413,4 +533,379 @@ class StreamingDeduplicationSuite extends StateStoreMetricsTest {
       assertStateOperatorCustomMetric("numDroppedDuplicateRows", expected = 1)
     )
   }
+
+  test("SPARK-39650: duplicate with specific keys should allow input to change schema") {
+    withTempDir { checkpoint =>
+      val dedupeInputData = MemoryStream[(String, Int)]
+      val dedupe = dedupeInputData.toDS().dropDuplicates("_1")
+
+      testStream(dedupe, Append)(
+        StartStream(checkpointLocation = checkpoint.getCanonicalPath),
+
+        AddData(dedupeInputData, "a" -> 1),
+        CheckLastBatch("a" -> 1),
+
+        AddData(dedupeInputData, "a" -> 2, "b" -> 3),
+        CheckLastBatch("b" -> 3)
+      )
+
+      val dedupeInputData2 = MemoryStream[(String, Int, String)]
+      val dedupe2 = dedupeInputData2.toDS().dropDuplicates("_1")
+
+      // initialize new memory stream with previously executed batches
+      dedupeInputData2.addData(("a", 1, "dummy"))
+      dedupeInputData2.addData(Seq(("a", 2, "dummy"), ("b", 3, "dummy")))
+
+      testStream(dedupe2, Append)(
+        StartStream(checkpointLocation = checkpoint.getCanonicalPath),
+
+        AddData(dedupeInputData2, ("a", 5, "a"), ("b", 2, "b"), ("c", 9, "c")),
+        CheckLastBatch(("c", 9, "c"))
+      )
+    }
+  }
+
+  Seq("3.3.0", "3.5.1").foreach { sparkVersion =>
+    test("SPARK-39650: recovery from checkpoint having all columns as value schema " +
+      s"with sparkVersion=$sparkVersion") {
+      // NOTE: We are also changing the schema of input compared to the checkpoint.
+      // In the checkpoint we define the input schema as (String, Int).
+      val inputData = MemoryStream[(String, Int, String)]
+      val dedupe = inputData.toDS().dropDuplicates("_1")
+
+      val resourcePath = "/structured-streaming/checkpoint-version-" + sparkVersion +
+        "-streaming-deduplication/"
+      val resourceUri = this.getClass.getResource(resourcePath).toURI
+
+      val checkpointDir = Utils.createTempDir().getCanonicalFile
+      // Copy the checkpoint to a temp dir to prevent changes to the original.
+      // Not doing this will lead to the test passing on the first run, but fail subsequent runs.
+      Utils.copyDirectory(new File(resourceUri), checkpointDir)
+
+      inputData.addData(("a", 1, "dummy"))
+      inputData.addData(("a", 2, "dummy"), ("b", 3, "dummy"))
+
+      testStream(dedupe, Append)(
+        StartStream(checkpointLocation = checkpointDir.getAbsolutePath),
+        /*
+        Note: The checkpoint was generated using the following input in Spark version 3.3.0
+        AddData(inputData, ("a", 1)),
+        CheckLastBatch(("a", 1)),
+        AddData(inputData, ("a", 2), ("b", 3)),
+        CheckLastBatch(("b", 3))
+       */
+
+        AddData(inputData, ("a", 5, "a"), ("b", 2, "b"), ("c", 9, "c")),
+        CheckLastBatch(("c", 9, "c"))
+      )
+    }
+  }
+
+  Seq("3.3.0", "3.5.1").foreach { sparkVersion =>
+    test("SPARK-39650: recovery from checkpoint with changes on key schema " +
+      s"are not allowed with sparkVersion=$sparkVersion") {
+      // NOTE: We are also changing the schema of input compared to the checkpoint.
+      // In the checkpoint we define the input schema as (String, Int).
+      val inputData = MemoryStream[(String, Int, String)]
+      val dedupe = inputData.toDS().dropDuplicates("_1", "_2")
+
+      val resourcePath = "/structured-streaming/checkpoint-version-" + sparkVersion +
+        "-streaming-deduplication/"
+      val resourceUri = this.getClass.getResource(resourcePath).toURI
+
+      val checkpointDir = Utils.createTempDir().getCanonicalFile
+      // Copy the checkpoint to a temp dir to prevent changes to the original.
+      // Not doing this will lead to the test passing on the first run, but fail subsequent runs.
+      Utils.copyDirectory(new File(resourceUri), checkpointDir)
+
+      inputData.addData(("a", 1, "dummy"))
+      inputData.addData(("a", 2, "dummy"), ("b", 3, "dummy"))
+
+      // trying to evolve the key schema is not allowed and should throw an exception
+      val ex = intercept[StreamingQueryException] {
+        testStream(dedupe, Append)(
+          StartStream(checkpointLocation = checkpointDir.getAbsolutePath),
+          AddData(inputData, ("a", 5, "a"), ("b", 2, "b"), ("c", 9, "c")),
+          CheckLastBatch(("a", 5, "a"), ("b", 2, "b"), ("c", 9, "c"))
+        )
+      }
+
+      // verify that the key schema not compatible error is thrown
+      checkError(
+        ex.getCause.asInstanceOf[SparkUnsupportedOperationException],
+        condition = "STATE_STORE_KEY_SCHEMA_NOT_COMPATIBLE",
+        parameters = Map("storedKeySchema" -> ".*",
+          "newKeySchema" -> ".*"),
+        matchPVals = true
+      )
+    }
+  }
+
+  test("collation aware deduplication") {
+    val inputData = MemoryStream[(String, Int)]
+    val result = inputData.toDF()
+      .select(col("_1")
+        .try_cast(StringType("UTF8_BINARY")).as("str"),
+        col("_2").as("int"))
+      .dropDuplicates("str")
+
+    testStream(result, Append)(
+      AddData(inputData, "a" -> 1),
+      CheckLastBatch("a" -> 1),
+      assertNumStateRows(total = 1, updated = 1, droppedByWatermark = 0),
+      AddData(inputData, "a" -> 2), // Dropped
+      CheckLastBatch(),
+      assertNumStateRows(total = 1, updated = 0, droppedByWatermark = 0),
+      // scalastyle:off
+      AddData(inputData, "ä" -> 1),
+      CheckLastBatch("ä" -> 1),
+      // scalastyle:on
+      assertNumStateRows(total = 2, updated = 1, droppedByWatermark = 0)
+    )
+  }
+
+  test("non-binary collation aware deduplication not supported") {
+    val inputData = MemoryStream[(String)]
+    val result = inputData.toDF()
+      .select(col("value")
+        .try_cast(StringType("UTF8_LCASE")).as("str"))
+      .dropDuplicates("str")
+
+    val ex = intercept[StreamingQueryException] {
+      testStream(result, Append)(
+        AddData(inputData, "a"),
+        CheckLastBatch("a"))
+    }
+
+    checkError(
+      ex.getCause.asInstanceOf[SparkUnsupportedOperationException],
+      condition = "STATE_STORE_UNSUPPORTED_OPERATION_BINARY_INEQUALITY",
+      parameters = Map(
+        "schema" -> ".+\"str\":\"spark.UTF8_LCASE\".+"
+      ),
+      matchPVals = true
+    )
+  }
+
+  test("test that avro encoding is not supported") {
+    val inputData = MemoryStream[String]
+    val result = inputData.toDS().dropDuplicates()
+
+    val ex = intercept[Exception] {
+      withSQLConf(SQLConf.STREAMING_STATE_STORE_ENCODING_FORMAT.key -> "avro") {
+        testStream(result, Append)(
+          AddData(inputData, "a"),
+          ProcessAllAvailable()
+        )
+      }
+    }
+    assert(ex.getMessage.contains("State store encoding format as avro is not supported"))
+  }
+
+  test("Partition key extraction - Dedupe") {
+    val df = (input: Dataset[(String, Int)]) => input.dropDuplicates("_1").toDF()
+
+    testPartitionKeyExtraction(
+      StatefulOperatorsUtils.DEDUPLICATE_EXEC_OP_NAME,
+      inputData = Seq(("a", 1), ("b", 2), ("c", 3)),
+      dedupeDF = df,
+      // The key schema for dedup is just the _1 column (String)
+      keySchema = new StructType().add("_1", StringType),
+      // Empty value schema for dedup
+      valueSchema = new StructType(),
+      sqlConf = spark.sessionState.conf
+    )
+  }
+
+  // Total incremental removals over the query's retained recent progress (recentProgress is
+  // retention-bounded, so this is not the full batch history), read from the operator's
+  // numRowsIncrementallyRemoved custom metric. Where a stateful operator ran (stateOperators is
+  // non-empty) the metric must be present -- assert rather than default it to 0, so a regression
+  // that stops emitting the metric fails the test instead of silently reading as zero.
+  private def numRowsIncrementallyRemoved(q: StreamingQuery): Long = {
+    q.recentProgress.flatMap(_.stateOperators.headOption).map { op =>
+      assert(op.customMetrics.containsKey("numRowsIncrementallyRemoved"),
+        s"numRowsIncrementallyRemoved custom metric missing; got ${op.customMetrics}")
+      op.customMetrics.get("numRowsIncrementallyRemoved").toLong
+    }.sum
+  }
+
+  // Total state rows removed over the query's retained recent progress (recentProgress is
+  // retention-bounded, so this is not the full batch history), read from the operator's first-class
+  // numRowsRemoved metric (the incremental removals are a subset of these). This asserts that
+  // eviction actually removed state, which numRowsIncrementallyRemoved alone does not: a batch-end
+  // drain removes rows without incrementing the incremental counter.
+  private def totalStateRowsRemoved(q: StreamingQuery): Long =
+    q.recentProgress.flatMap(_.stateOperators.headOption.map(_.numRowsRemoved)).sum
+
+  test("deduplicate with watermark - incremental cleanup preserves dedup output") {
+    // With a non-zero incremental cleanup factor, removal of watermark-expired state is spread
+    // across input-record processing rather than occurring all at once at batch end. The
+    // deduplicated OUTPUT must be unchanged. (State is evicted against the late-events watermark
+    // under incremental cleanup, so the timing of state removal lags by a batch compared to the
+    // factor-0 default -- this test asserts on output and on the late-event safety property, not
+    // on per-batch state counts.)
+    withSQLConf(SQLConf.STREAMING_STATE_INCREMENTAL_CLEANUP_FACTOR.key -> "10") {
+      val inputData = MemoryStream[Int]
+      val result = inputData.toDS()
+        .withColumn("eventTime", timestamp_seconds($"value"))
+        .withWatermark("eventTime", "10 seconds")
+        .dropDuplicates()
+        .select($"eventTime".cast("long").as[Long])
+
+      testStream(result, Append)(
+        // Duplicates within the batch are dropped; each distinct event time is emitted once.
+        AddData(inputData, (1 to 5).flatMap(_ => (10 to 15)): _*),
+        CheckAnswer(10 to 15: _*),
+
+        AddData(inputData, 25), // Advances watermark; 25 is new and emitted.
+        CheckNewAnswer(25),
+
+        // A record at 10 is now below the watermark: it must be dropped, and crucially it must not
+        // be re-emitted even though incremental cleanup may not yet have removed its key. This is
+        // the safety property behind evicting against the late-events (not eviction) watermark.
+        AddData(inputData, 10),
+        CheckNewAnswer(),
+
+        AddData(inputData, 45),
+        CheckNewAnswer(45),
+
+        // A duplicate of a surviving recent key (45) is still deduplicated.
+        AddData(inputData, 45),
+        CheckNewAnswer()
+      )
+    }
+  }
+
+  test("deduplicate with watermark - incremental cleanup evicts during record processing") {
+    // A batch that carries input records AND has state eligible for eviction under the late-events
+    // watermark should evict incrementally as those records are processed, so
+    // numRowsIncrementallyRemoved is non-zero. (Eviction uses the late-events watermark under
+    // incremental cleanup, which lags the eviction watermark by one batch.)
+    withSQLConf(SQLConf.STREAMING_STATE_INCREMENTAL_CLEANUP_FACTOR.key -> "10") {
+      val inputData = MemoryStream[Int]
+      val result = inputData.toDS()
+        .withColumn("eventTime", timestamp_seconds($"value"))
+        .withWatermark("eventTime", "10 seconds")
+        .dropDuplicates()
+        .select($"eventTime".cast("long").as[Long])
+
+      testStream(result, Append)(
+        // Batch 0: three distinct keys at 10, 11, 12. Watermark is 0, nothing evictable yet.
+        AddData(inputData, 10, 11, 12),
+        CheckAnswer(10, 11, 12),
+        assertNumStateRows(total = 3, updated = 3),
+        AssertOnQuery(q => numRowsIncrementallyRemoved(q) == 0,
+          "no incremental removal before any state is evictable"),
+
+        // Batch 1: a new key at 100 advances the eviction watermark to 90, but the late-events
+        // watermark used by incremental cleanup still lags (it is the previous batch's eviction
+        // watermark). The keys [10, 11, 12] are not yet below the late-events watermark, so no
+        // removal happens in this batch; it is deferred to batch 2.
+        AddData(inputData, 100),
+        CheckNewAnswer(100),
+
+        // Batch 2: another new record. By now the late-events watermark has advanced past the
+        // original keys, so processing this record incrementally evicts them.
+        AddData(inputData, 101),
+        CheckNewAnswer(101),
+        AssertOnQuery(q => numRowsIncrementallyRemoved(q) > 0,
+          "expired keys should be removed incrementally while processing input records"),
+        // Assert the state was actually removed, not merely that the incremental counter moved:
+        // the three original keys [10, 11, 12] must be gone, leaving only the recent keys. Reading
+        // the first-class numRowsRemoved metric (rather than the output) is what catches a
+        // regression that leaves state behind while still producing correct output.
+        AssertOnQuery(q => totalStateRowsRemoved(q) >= 3,
+          "expired keys must be removed from state, not just counted as incremental"),
+        // The surviving state is only the most recent keys; correctness is unchanged.
+        AddData(inputData, 10), // below watermark, dropped
+        CheckNewAnswer()
+      )
+    }
+  }
 }
+
+trait StreamingDeduplicationSuiteBase { self: StreamTest =>
+  import testImplicits._
+
+  protected def testPartitionKeyExtraction(
+      operatorName: String,
+      inputData: Seq[(String, Int)],
+      dedupeDF: Dataset[(String, Int)] => DataFrame,
+      keySchema: StructType,
+      valueSchema: StructType,
+      sqlConf: SQLConf): Unit = {
+    withTempDir { checkpointDir =>
+      // 1 partition to make verification easier
+      val conf = Map(SQLConf.SHUFFLE_PARTITIONS.key -> "1")
+
+      val inputStream = MemoryStream[(String, Int)]
+
+      // Run streaming query to populate state
+      testStream(dedupeDF(inputStream.toDS()), Append)(
+        StartStream(checkpointLocation = checkpointDir.getAbsolutePath, additionalConfs = conf),
+        AddData(inputStream, inputData: _*),
+        ProcessAllAvailable(),
+        StopStream
+      )
+
+      // Now access the state store to verify partition key extraction
+      val storeConf = new StateStoreConf(sqlConf)
+      val storeId = StateStoreId(checkpointDir.getAbsolutePath + "/state", 0, 0)
+      val storeProviderId = StateStoreProviderId(storeId, UUID.randomUUID())
+
+      val keyProjection = UnsafeProjection.create(keySchema)
+      def createExpectedKeyRow(inputKey: String) = {
+        val row = new GenericInternalRow(Array[Any](UTF8String.fromString(inputKey)))
+        keyProjection.apply(row).copy()
+      }
+
+      val store = StateStore.getReadOnly(
+        storeProviderId,
+        keySchema,
+        valueSchema,
+        NoPrefixKeyStateEncoderSpec(keySchema),
+        version = 1,
+        stateStoreCkptId = None,
+        stateSchemaBroadcast = None,
+        useColumnFamilies = false,
+        storeConf,
+        new Configuration
+      )
+
+      try {
+        val extractor = StatePartitionKeyExtractorFactory.create(
+          operatorName,
+          keySchema
+        )
+
+        // Verify partition key schema matches the key schema
+        assert(extractor.partitionKeySchema === keySchema,
+          "Partition key schema should match the dedup key schema")
+
+        // Get all state keys written by the dedup query
+        val stateKeys = store.iterator().map(_.key.copy()).toList
+        assert(stateKeys.length === inputData.length,
+          s"Should have ${inputData.length} unique keys, found ${stateKeys.length}")
+
+        // Extract partition keys
+        val partitionKeys = stateKeys.map(extractor.partitionKey(_).copy())
+        // Verify each partition key equals its corresponding state key (for dedup)
+        assert(partitionKeys === stateKeys,
+          "Partition keys should match state keys")
+
+        // Expected keys
+        inputData.foreach { case (key, _) =>
+          val keyRow = createExpectedKeyRow(key)
+          assert(partitionKeys.count(_ === keyRow) == 1, s"Should have 1 partition key for $key")
+        }
+      } finally {
+        store.abort()
+      }
+    }
+  }
+}
+
+@SlowSQLTest
+class RocksDBStateStoreStreamingDeduplicationSuite
+  extends StreamingDeduplicationSuite with RocksDBStateStoreTest

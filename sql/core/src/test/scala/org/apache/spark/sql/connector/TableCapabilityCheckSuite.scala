@@ -17,21 +17,25 @@
 
 package org.apache.spark.sql.connector
 
-import java.util
-
-import org.apache.spark.sql.{AnalysisException, DataFrame, SQLContext}
+import org.apache.spark.SparkUnsupportedOperationException
+import org.apache.spark.sql.{AnalysisException, SQLContext}
 import org.apache.spark.sql.catalyst.analysis.{AnalysisTest, NamedRelation}
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, EqualTo, Literal}
+import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.streaming.StreamingRelationV2
+import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
+import org.apache.spark.sql.classic.DataFrame
 import org.apache.spark.sql.connector.catalog.{Table, TableCapability}
 import org.apache.spark.sql.connector.catalog.TableCapability._
 import org.apache.spark.sql.execution.datasources.DataSource
-import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, TableCapabilityCheck}
-import org.apache.spark.sql.execution.streaming.{Offset, Source, StreamingRelation}
+import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, ExternalLookupRelation,
+  PrepareExternalLookupJoin, TableCapabilityCheck}
+import org.apache.spark.sql.execution.streaming.{Offset, Source}
+import org.apache.spark.sql.execution.streaming.runtime.StreamingRelation
 import org.apache.spark.sql.sources.StreamSourceProvider
 import org.apache.spark.sql.test.SharedSparkSession
-import org.apache.spark.sql.types.{LongType, StringType, StructType}
+import org.apache.spark.sql.types.{IntegerType, LongType, StringType, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 class TableCapabilityCheckSuite extends AnalysisTest with SharedSparkSession {
@@ -43,7 +47,7 @@ class TableCapabilityCheckSuite extends AnalysisTest with SharedSparkSession {
       "fake",
       table,
       CaseInsensitiveStringMap.empty(),
-      TableCapabilityCheckSuite.schema.toAttributes,
+      toAttributes(TableCapabilityCheckSuite.schema),
       None,
       None,
       v1Relation)
@@ -58,6 +62,39 @@ class TableCapabilityCheckSuite extends AnalysisTest with SharedSparkSession {
       TableCapabilityCheck.apply(
         DataSourceV2Relation.create(CapabilityTable(), None, None, emptyMap)
       )
+    }
+    assert(e.message.contains("does not support batch scan"))
+  }
+
+  test("batch scan: external lookup capability defers the batch read check to planning") {
+    val relation = DataSourceV2Relation.create(
+      CapabilityTable(EXTERNAL_LOOKUP), None, None, emptyMap)
+    TableCapabilityCheck.apply(relation)
+    val e = intercept[AnalysisException] {
+      PrepareExternalLookupJoin(relation)
+    }
+    assert(e.message.contains("does not support batch scan"))
+  }
+
+  test("external lookup relation: a lookup-only table passes the check") {
+    // Spark creates an external lookup relation only for a table that supports external lookup.
+    TableCapabilityCheck.apply(ExternalLookupRelation(DataSourceV2Relation.create(
+      CapabilityTable(EXTERNAL_LOOKUP), None, None, emptyMap)))
+  }
+
+  test("external lookup join: the lookup side still requires a read capability") {
+    val left = LocalRelation(AttributeReference("id", IntegerType)())
+    val lookupOnly = DataSourceV2Relation.create(
+      CapabilityTable(EXTERNAL_LOOKUP), None, None, emptyMap)
+    TableCapabilityCheck.apply(ExternalLookupJoin(
+      left, lookupOnly, Inner, Some(Literal(true)),
+      lookupOnly.output))
+
+    val noCapability = DataSourceV2Relation.create(CapabilityTable(), None, None, emptyMap)
+    val e = intercept[AnalysisException] {
+      TableCapabilityCheck.apply(ExternalLookupJoin(
+        left, noCapability, Inner, Some(Literal(true)),
+        noCapability.output))
     }
     assert(e.message.contains("does not support batch scan"))
   }
@@ -209,14 +246,14 @@ private object TableCapabilityCheckSuite {
 
 private case object TestRelation extends LeafNode with NamedRelation {
   override def name: String = "source_relation"
-  override def output: Seq[AttributeReference] = TableCapabilityCheckSuite.schema.toAttributes
+  override def output: Seq[AttributeReference] = toAttributes(TableCapabilityCheckSuite.schema)
 }
 
 private case class CapabilityTable(_capabilities: TableCapability*) extends Table {
   override def name(): String = "capability_test_table"
   override def schema(): StructType = TableCapabilityCheckSuite.schema
-  override def capabilities(): util.Set[TableCapability] = {
-    val set = util.EnumSet.noneOf(classOf[TableCapability])
+  override def capabilities(): java.util.Set[TableCapability] = {
+    val set = java.util.EnumSet.noneOf(classOf[TableCapability])
     _capabilities.foreach(set.add)
     set
   }
@@ -240,10 +277,10 @@ private class TestStreamSourceProvider extends StreamSourceProvider {
     new Source {
       override def schema: StructType = TableCapabilityCheckSuite.schema
       override def getOffset: Option[Offset] = {
-        throw new UnsupportedOperationException
+        throw SparkUnsupportedOperationException()
       }
       override def getBatch(start: Option[Offset], end: Offset): DataFrame = {
-        throw new UnsupportedOperationException
+        throw SparkUnsupportedOperationException()
       }
       override def stop(): Unit = {}
     }

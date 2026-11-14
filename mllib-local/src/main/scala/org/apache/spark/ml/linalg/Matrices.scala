@@ -19,7 +19,9 @@ package org.apache.spark.ml.linalg
 
 import java.util.{Arrays, Random}
 
+import scala.collection.immutable
 import scala.collection.mutable.{ArrayBuffer, ArrayBuilder => MArrayBuilder, HashSet => MHashSet}
+import scala.util.hashing.MurmurHash3
 
 import breeze.linalg.{CSCMatrix => BSM, DenseMatrix => BDM, Matrix => BM}
 
@@ -331,7 +333,21 @@ class DenseMatrix @Since("2.0.0") (
   }
 
   override def hashCode: Int = {
-    Seq(numRows, numCols, toArray).##
+    // Matches SparseMatrix.hashCode so that equal dense and sparse matrices have the same hash
+    // code. The shape is mixed first, and then the column major index and the value of each
+    // entry are mixed in column major order. The values with a zero hash code, such as 0.0 and
+    // -0.0, are skipped.
+    val data = if (isTransposed) toArray else values
+    var hash = MurmurHash3.mix(MurmurHash3.mix(43, numRows), numCols)
+    var i = 0
+    while (i < data.length) {
+      val valueHash = data(i).##
+      if (valueHash != 0) {
+        hash = MurmurHash3.mix(MurmurHash3.mix(hash, i), valueHash)
+      }
+      i += 1
+    }
+    hash
   }
 
   private[ml] def asBreeze: BM[Double] = {
@@ -357,7 +373,7 @@ class DenseMatrix @Since("2.0.0") (
     values(index(i, j)) = v
   }
 
-  override def copy: DenseMatrix = new DenseMatrix(numRows, numCols, values.clone())
+  override def copy: DenseMatrix = new DenseMatrix(numRows, numCols, values.clone(), isTransposed)
 
   private[spark] def map(f: Double => Double) = new DenseMatrix(numRows, numCols, values.map(f),
     isTransposed)
@@ -477,6 +493,22 @@ object DenseMatrix {
 
   private[ml] def unapply(dm: DenseMatrix): Option[(Int, Int, Array[Double], Boolean)] =
     Some((dm.numRows, dm.numCols, dm.values, dm.isTransposed))
+
+  private[ml] def fromVectors(vectors: Seq[Vector]): DenseMatrix = {
+    val numRows = vectors.length
+    val numCols = vectors.head.size
+    val values = Array.ofDim[Double](numRows * numCols)
+    var offset = 0
+    var j = 0
+    while (j < numRows) {
+      vectors(j).foreachNonZero { (i, v) =>
+        values(offset + i) = v
+      }
+      offset += numCols
+      j += 1
+    }
+    new DenseMatrix(numRows, numCols, values, true)
+  }
 
   /**
    * Generate a `DenseMatrix` consisting of zeros.
@@ -638,7 +670,24 @@ class SparseMatrix @Since("2.0.0") (
       rowIndices: Array[Int],
       values: Array[Double]) = this(numRows, numCols, colPtrs, rowIndices, values, false)
 
-  override def hashCode(): Int = asBreeze.hashCode()
+  override def hashCode(): Int = {
+    // Matches DenseMatrix.hashCode. The entries are visited in column major order.
+    val m = if (isTransposed) toSparseColMajor else this
+    var hash = MurmurHash3.mix(MurmurHash3.mix(43, numRows), numCols)
+    var j = 0
+    while (j < numCols) {
+      var k = m.colPtrs(j)
+      while (k < m.colPtrs(j + 1)) {
+        val valueHash = m.values(k).##
+        if (valueHash != 0) {
+          hash = MurmurHash3.mix(MurmurHash3.mix(hash, m.rowIndices(k) + j * numRows), valueHash)
+        }
+        k += 1
+      }
+      j += 1
+    }
+    hash
+  }
 
   override def equals(o: Any): Boolean = o match {
     case m: Matrix => asBreeze == m.asBreeze
@@ -680,7 +729,7 @@ class SparseMatrix @Since("2.0.0") (
   }
 
   override def copy: SparseMatrix = {
-    new SparseMatrix(numRows, numCols, colPtrs, rowIndices, values.clone())
+    new SparseMatrix(numRows, numCols, colPtrs, rowIndices, values.clone(), isTransposed)
   }
 
   private[spark] def map(f: Double => Double) =
@@ -832,6 +881,30 @@ object SparseMatrix {
   private[ml] def unapply(
        sm: SparseMatrix): Option[(Int, Int, Array[Int], Array[Int], Array[Double], Boolean)] =
     Some((sm.numRows, sm.numCols, sm.colPtrs, sm.rowIndices, sm.values, sm.isTransposed))
+
+  private[ml] def fromVectors(vectors: Seq[Vector]): SparseMatrix = {
+    val numRows = vectors.length
+    val numCols = vectors.head.size
+    val colIndices = MArrayBuilder.make[Int]
+    val values = MArrayBuilder.make[Double]
+    val rowPtrs = MArrayBuilder.make[Int]
+    var rowPtr = 0
+    rowPtrs += 0
+    var j = 0
+    while (j < numRows) {
+      var nnz = 0
+      vectors(j).foreachNonZero { (i, v) =>
+        colIndices += i
+        values += v
+        nnz += 1
+      }
+      rowPtr += nnz
+      rowPtrs += rowPtr
+      j += 1
+    }
+    new SparseMatrix(numRows, numCols, rowPtrs.result(),
+      colIndices.result(), values.result(), true)
+  }
 
   /**
    * Generate a `SparseMatrix` from Coordinate List (COO) format. Input must be an array of
@@ -1007,6 +1080,8 @@ object SparseMatrix {
 @Since("2.0.0")
 object Matrices {
 
+  private[ml] val empty = new DenseMatrix(0, 0, Array.emptyDoubleArray)
+
   private[ml] def fromVectors(vectors: Seq[Vector]): Matrix = {
     val numRows = vectors.length
     val numCols = vectors.head.size
@@ -1014,37 +1089,9 @@ object Matrices {
     val nnz = vectors.iterator.map(_.numNonzeros).sum
     val sparseSize = Matrices.getSparseSize(nnz, numRows + 1)
     if (denseSize < sparseSize) {
-      val values = Array.ofDim[Double](numRows * numCols)
-      var offset = 0
-      var j = 0
-      while (j < numRows) {
-        vectors(j).foreachNonZero { (i, v) =>
-          values(offset + i) = v
-        }
-        offset += numCols
-        j += 1
-      }
-      new DenseMatrix(numRows, numCols, values, true)
+      DenseMatrix.fromVectors(vectors)
     } else {
-      val colIndices = MArrayBuilder.make[Int]
-      val values = MArrayBuilder.make[Double]
-      val rowPtrs = MArrayBuilder.make[Int]
-      var rowPtr = 0
-      rowPtrs += 0
-      var j = 0
-      while (j < numRows) {
-        var nnz = 0
-        vectors(j).foreachNonZero { (i, v) =>
-          colIndices += i
-          values += v
-          nnz += 1
-        }
-        rowPtr += nnz
-        rowPtrs += rowPtr
-        j += 1
-      }
-      new SparseMatrix(numRows, numCols, rowPtrs.result(),
-        colIndices.result(), values.result(), true)
+      SparseMatrix.fromVectors(vectors)
     }
   }
 
@@ -1229,7 +1276,7 @@ object Matrices {
               cnt += 1
             }
             startCol += nCols
-            data.toSeq
+            immutable.ArraySeq.unsafeWrapArray(data)
           case dnMat: DenseMatrix =>
             val data = new ArrayBuffer[(Int, Int, Double)]()
             dnMat.foreachActive { (i, j, v) =>
@@ -1298,7 +1345,7 @@ object Matrices {
               cnt += 1
             }
             startRow += nRows
-            data.toSeq
+            immutable.ArraySeq.unsafeWrapArray(data)
           case dnMat: DenseMatrix =>
             val data = new ArrayBuffer[(Int, Int, Double)]()
             dnMat.foreachActive { (i, j, v) =>

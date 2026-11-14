@@ -18,18 +18,31 @@
 package org.apache.spark.sql.connector.catalog
 
 import java.util
-import java.util.Collections
+import java.util.{Collections, Locale}
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
-import org.apache.spark.sql.catalyst.analysis.{NamedRelation, NoSuchDatabaseException, NoSuchNamespaceException, NoSuchTableException}
-import org.apache.spark.sql.catalyst.plans.logical.{CreateTableAsSelectStatement, CreateTableStatement, ReplaceTableAsSelectStatement, ReplaceTableStatement, SerdeInfo}
+import org.apache.spark.{SparkException, SparkIllegalArgumentException}
+import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.catalyst.CurrentUserContext
+import org.apache.spark.sql.catalyst.analysis.{AsOfTimestamp, AsOfVersion, NamedRelation, NoSuchDatabaseException, NoSuchFunctionException, NoSuchTableException, RelationCache, TimeTravelSpec}
+import org.apache.spark.sql.catalyst.catalog.ClusterBySpec
+import org.apache.spark.sql.catalyst.expressions.{Expression, Literal, V2ExpressionUtils}
+import org.apache.spark.sql.catalyst.plans.logical.{SerdeInfo, TableSpec}
+import org.apache.spark.sql.catalyst.util.{GeneratedColumn, IdentityColumn}
+import org.apache.spark.sql.catalyst.util.FieldMetadataUtils.FIELD_ID_METADATA_KEY
+import org.apache.spark.sql.catalyst.util.ResolveDefaultColumns._
 import org.apache.spark.sql.connector.catalog.TableChange._
-import org.apache.spark.sql.connector.expressions.{AsOfTimestamp, AsOfVersion, TimeTravelSpec}
+import org.apache.spark.sql.connector.catalog.constraints.Constraint
+import org.apache.spark.sql.connector.catalog.functions.UnboundFunction
+import org.apache.spark.sql.connector.expressions.{ClusterByTransform, LiteralValue, Transform}
+import org.apache.spark.sql.errors.DataTypeErrors.toSQLId
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
-import org.apache.spark.sql.types.{ArrayType, MapType, StructField, StructType}
-import org.apache.spark.sql.util.CaseInsensitiveStringMap
-import org.apache.spark.util.Utils
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.{ArrayType, MapType, Metadata, MetadataBuilder, StructField, StructType}
+import org.apache.spark.sql.util.{CaseInsensitiveStringMap, SchemaUtils}
+import org.apache.spark.util.ArrayImplicits._
 
 private[sql] object CatalogV2Util {
   import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
@@ -45,9 +58,13 @@ private[sql] object CatalogV2Util {
    */
   val TABLE_RESERVED_PROPERTIES =
     Seq(TableCatalog.PROP_COMMENT,
+      TableCatalog.PROP_COLLATION,
       TableCatalog.PROP_LOCATION,
       TableCatalog.PROP_PROVIDER,
-      TableCatalog.PROP_OWNER)
+      TableCatalog.PROP_OWNER,
+      TableCatalog.PROP_EXTERNAL,
+      TableCatalog.PROP_IS_MANAGED_LOCATION,
+      TableCatalog.PROP_TABLE_TYPE)
 
   /**
    * The list of reserved namespace properties, which can not be removed or changed directly by
@@ -60,8 +77,23 @@ private[sql] object CatalogV2Util {
    */
   val NAMESPACE_RESERVED_PROPERTIES =
     Seq(SupportsNamespaces.PROP_COMMENT,
+      SupportsNamespaces.PROP_COLLATION,
       SupportsNamespaces.PROP_LOCATION,
       SupportsNamespaces.PROP_OWNER)
+
+  private val COMMON_COL_METADATA_KEYS = Seq("comment", FIELD_ID_METADATA_KEY)
+
+  private val DEFAULT_COL_METADATA_KEYS = Seq(
+    CURRENT_DEFAULT_COLUMN_METADATA_KEY,
+    EXISTS_DEFAULT_COLUMN_METADATA_KEY)
+
+  private val GENERATED_COL_METADATA_KEYS = Seq(
+    GeneratedColumn.GENERATION_EXPRESSION_METADATA_KEY)
+
+  private val IDENTITY_COL_METADATA_KEYS = Seq(
+    IdentityColumn.IDENTITY_INFO_START,
+    IdentityColumn.IDENTITY_INFO_STEP,
+    IdentityColumn.IDENTITY_INFO_ALLOW_EXPLICIT_INSERT)
 
   /**
    * Apply properties changes to a map and return the result.
@@ -126,71 +158,159 @@ private[sql] object CatalogV2Util {
   }
 
   /**
+   * Apply ClusterBy changes to a map and return the result.
+   */
+  def applyClusterByChanges(
+      properties: Map[String, String],
+      schema: StructType,
+      changes: Seq[TableChange]): Map[String, String] = {
+    applyClusterByChanges(properties.asJava, schema, changes).asScala.toMap
+  }
+
+  /**
+   * Apply ClusterBy changes to a Java map and return the result.
+   */
+  def applyClusterByChanges(
+      properties: util.Map[String, String],
+      schema: StructType,
+      changes: Seq[TableChange]): util.Map[String, String] = {
+    val newProperties = new util.HashMap[String, String](properties)
+
+    changes.foreach {
+      case clusterBy: ClusterBy =>
+        val clusterByProp =
+          ClusterBySpec.toProperty(
+            schema,
+            ClusterBySpec(clusterBy.clusteringColumns.toIndexedSeq),
+            conf.resolver)
+        newProperties.put(clusterByProp._1, clusterByProp._2)
+
+      case _ =>
+      // ignore non-property changes
+    }
+
+    Collections.unmodifiableMap(newProperties)
+  }
+
+  /**
+   * Apply ClusterBy changes to the partitioning transforms and return the result.
+   */
+  def applyClusterByChanges(
+     partitioning: Array[Transform],
+     schema: StructType,
+     changes: Seq[TableChange]): Array[Transform] = {
+
+    var newPartitioning = partitioning
+    // If there is a clusterBy change (only the first one), we overwrite the existing
+    // clustering columns.
+    val clusterByOpt = changes.collectFirst { case c: ClusterBy => c }
+    clusterByOpt.foreach { clusterBy =>
+      newPartitioning = partitioning.map {
+        case _: ClusterByTransform => ClusterBySpec.extractClusterByTransform(
+          schema, ClusterBySpec(clusterBy.clusteringColumns.toIndexedSeq), conf.resolver)
+        case other => other
+      }
+    }
+
+    newPartitioning
+  }
+
+  /**
    * Apply schema changes to a schema and return the result.
    */
-  def applySchemaChanges(schema: StructType, changes: Seq[TableChange]): StructType = {
+  def applySchemaChanges(
+      schema: StructType,
+      changes: Seq[TableChange],
+      tableProvider: Option[String],
+      statementType: String): StructType = {
     changes.foldLeft(schema) { (schema, change) =>
       change match {
         case add: AddColumn =>
           add.fieldNames match {
             case Array(name) =>
               val field = StructField(name, add.dataType, nullable = add.isNullable)
-              val newField = Option(add.comment).map(field.withComment).getOrElse(field)
-              addField(schema, newField, add.position())
-
+              val fieldWithDefault: StructField = encodeDefaultValue(add.defaultValue(), field)
+              val fieldWithComment: StructField =
+                Option(add.comment).map(fieldWithDefault.withComment).getOrElse(fieldWithDefault)
+              addField(schema, fieldWithComment, add.position(), tableProvider, statementType, true)
             case names =>
-              replace(schema, names.init, parent => parent.dataType match {
+              replace(schema, names.init.toImmutableArraySeq, parent => parent.dataType match {
                 case parentType: StructType =>
                   val field = StructField(names.last, add.dataType, nullable = add.isNullable)
-                  val newField = Option(add.comment).map(field.withComment).getOrElse(field)
-                  Some(parent.copy(dataType = addField(parentType, newField, add.position())))
-
+                  val fieldWithDefault: StructField = encodeDefaultValue(add.defaultValue(), field)
+                  val fieldWithComment: StructField =
+                    Option(add.comment).map(fieldWithDefault.withComment)
+                      .getOrElse(fieldWithDefault)
+                  Some(parent.copy(dataType =
+                    addField(parentType, fieldWithComment, add.position(), tableProvider,
+                      statementType, true)))
                 case _ =>
-                  throw new IllegalArgumentException(s"Not a struct: ${names.init.last}")
+                  throw new SparkIllegalArgumentException(
+                    errorClass = "_LEGACY_ERROR_TEMP_3229",
+                    messageParameters = Map("name" -> names.init.last))
               })
           }
 
         case rename: RenameColumn =>
-          replace(schema, rename.fieldNames, field =>
+          replace(schema, rename.fieldNames.toImmutableArraySeq, field =>
             Some(StructField(rename.newName, field.dataType, field.nullable, field.metadata)))
 
         case update: UpdateColumnType =>
-          replace(schema, update.fieldNames, field => {
+          replace(schema, update.fieldNames.toImmutableArraySeq, field => {
             Some(field.copy(dataType = update.newDataType))
           })
 
         case update: UpdateColumnNullability =>
-          replace(schema, update.fieldNames, field => {
+          replace(schema, update.fieldNames.toImmutableArraySeq, field => {
             Some(field.copy(nullable = update.nullable))
           })
 
         case update: UpdateColumnComment =>
-          replace(schema, update.fieldNames, field =>
-            Some(field.withComment(update.newComment)))
+          replace(schema, update.fieldNames.toImmutableArraySeq, field =>
+            if (update.newComment != null) {
+              Some(field.withComment(update.newComment))
+            } else {
+              Some(field.clearComment())
+            })
 
         case update: UpdateColumnPosition =>
           def updateFieldPos(struct: StructType, name: String): StructType = {
             val oldField = struct.fields.find(_.name == name).getOrElse {
-              throw new IllegalArgumentException("Field not found: " + name)
+              throw new SparkIllegalArgumentException(
+                errorClass = "_LEGACY_ERROR_TEMP_3230",
+                messageParameters = Map("name" -> name))
             }
             val withFieldRemoved = StructType(struct.fields.filter(_ != oldField))
-            addField(withFieldRemoved, oldField, update.position())
+            addField(withFieldRemoved, oldField, update.position(), tableProvider, statementType,
+              false)
           }
 
           update.fieldNames() match {
             case Array(name) =>
               updateFieldPos(schema, name)
             case names =>
-              replace(schema, names.init, parent => parent.dataType match {
+              replace(schema, names.init.toImmutableArraySeq, parent => parent.dataType match {
                 case parentType: StructType =>
                   Some(parent.copy(dataType = updateFieldPos(parentType, names.last)))
                 case _ =>
-                  throw new IllegalArgumentException(s"Not a struct: ${names.init.last}")
+                  throw new SparkIllegalArgumentException(
+                    errorClass = "_LEGACY_ERROR_TEMP_3229",
+                    messageParameters = Map("name" -> names.init.last))
               })
           }
 
+        case update: UpdateColumnDefaultValue =>
+          replace(schema, update.fieldNames.toImmutableArraySeq, field => {
+            val newDefault = update.newCurrentDefault()
+            if (newDefault != null) {
+              Some(field.withCurrentDefaultValue(newDefault.getSql))
+            } else {
+              Some(field.clearCurrentDefaultValue())
+            }
+          })
+
         case delete: DeleteColumn =>
-          replace(schema, delete.fieldNames, _ => None)
+          replace(schema, delete.fieldNames.toImmutableArraySeq, _ => None, delete.ifExists)
 
         case _ =>
           // ignore non-schema changes
@@ -199,11 +319,57 @@ private[sql] object CatalogV2Util {
     }
   }
 
+  /**
+   * Extracts and validates table constraints from a sequence of table changes.
+   */
+  def collectConstraintChanges(
+      table: Table,
+      changes: Seq[TableChange]): Array[Constraint] = {
+    val constraints = table.constraints()
+
+    def findExistingConstraint(name: String): Option[Constraint] = {
+      constraints.find(_.name.toLowerCase(Locale.ROOT) == name.toLowerCase(Locale.ROOT))
+    }
+
+    changes.foldLeft(constraints) { (constraints, change) =>
+      change match {
+        case add: AddConstraint =>
+          val newConstraint = add.constraint
+          val existingConstraint = findExistingConstraint(newConstraint.name)
+          if (existingConstraint.isDefined) {
+            throw new AnalysisException(
+              errorClass = "CONSTRAINT_ALREADY_EXISTS",
+              messageParameters =
+                Map("constraintName" -> existingConstraint.get.name,
+                  "oldConstraint" -> existingConstraint.get.toDDL))
+          }
+          constraints :+ newConstraint
+
+        case drop: DropConstraint =>
+          val existingConstraint = findExistingConstraint(drop.name)
+          if (existingConstraint.isEmpty && !drop.ifExists) {
+            throw new AnalysisException(
+              errorClass = "CONSTRAINT_DOES_NOT_EXIST",
+              messageParameters =
+                Map("constraintName" -> drop.name, "tableName" -> table.name()))
+          }
+          constraints.filterNot(_.name == drop.name)
+
+        case _ =>
+          // ignore non-constraint changes
+          constraints
+      }
+    }.toArray
+  }
+
   private def addField(
       schema: StructType,
       field: StructField,
-      position: ColumnPosition): StructType = {
-    if (position == null) {
+      position: ColumnPosition,
+      tableProvider: Option[String],
+      statementType: String,
+      addNewColumnToExistingTable: Boolean): StructType = {
+    val newSchema: StructType = if (position == null) {
       schema.add(field)
     } else if (position.isInstanceOf[First]) {
       StructType(field +: schema.fields)
@@ -211,60 +377,87 @@ private[sql] object CatalogV2Util {
       val afterCol = position.asInstanceOf[After].column()
       val fieldIndex = schema.fields.indexWhere(_.name == afterCol)
       if (fieldIndex == -1) {
-        throw new IllegalArgumentException("AFTER column not found: " + afterCol)
+        throw new SparkIllegalArgumentException(
+          errorClass = "_LEGACY_ERROR_TEMP_3228",
+          messageParameters = Map("afterCol" -> afterCol))
       }
       val (before, after) = schema.fields.splitAt(fieldIndex + 1)
       StructType(before ++ (field +: after))
     }
+    validateTableProviderForDefaultValue(
+      newSchema, tableProvider, statementType, addNewColumnToExistingTable)
+    newSchema
   }
 
   private def replace(
       struct: StructType,
       fieldNames: Seq[String],
-      update: StructField => Option[StructField]): StructType = {
+      update: StructField => Option[StructField],
+      ifExists: Boolean = false): StructType = {
 
-    val pos = struct.getFieldIndex(fieldNames.head)
-        .getOrElse(throw new IllegalArgumentException(s"Cannot find field: ${fieldNames.head}"))
+    val posOpt = struct.getFieldIndex(fieldNames.head)
+    if (posOpt.isEmpty) {
+      if (ifExists) {
+        // We couldn't find the column to replace, but with IF EXISTS, we will silence the error
+        // Currently only DROP COLUMN may pass down the IF EXISTS parameter
+        return struct
+      } else {
+        throw new SparkIllegalArgumentException(
+          errorClass = "FIELD_NOT_FOUND",
+          messageParameters = Map(
+            "fieldName" -> toSQLId(fieldNames.head),
+            "fields" -> struct.fields.map(f => toSQLId(f.name)).mkString(", "))
+        )
+      }
+    }
+
+    val pos = posOpt.get
     val field = struct.fields(pos)
     val replacement: Option[StructField] = (fieldNames.tail, field.dataType) match {
       case (Seq(), _) =>
         update(field)
 
       case (names, struct: StructType) =>
-        val updatedType: StructType = replace(struct, names, update)
+        val updatedType: StructType = replace(struct, names, update, ifExists)
         Some(StructField(field.name, updatedType, field.nullable, field.metadata))
 
       case (Seq("key"), map @ MapType(keyType, _, _)) =>
         val updated = update(StructField("key", keyType, nullable = false))
-            .getOrElse(throw new IllegalArgumentException(s"Cannot delete map key"))
+            .getOrElse(throw new SparkIllegalArgumentException("_LEGACY_ERROR_TEMP_3226"))
         Some(field.copy(dataType = map.copy(keyType = updated.dataType)))
 
       case (Seq("key", names @ _*), map @ MapType(keyStruct: StructType, _, _)) =>
-        Some(field.copy(dataType = map.copy(keyType = replace(keyStruct, names, update))))
+        Some(field.copy(dataType = map.copy(keyType = replace(keyStruct, names, update, ifExists))))
 
       case (Seq("value"), map @ MapType(_, mapValueType, isNullable)) =>
         val updated = update(StructField("value", mapValueType, nullable = isNullable))
-            .getOrElse(throw new IllegalArgumentException(s"Cannot delete map value"))
+            .getOrElse(throw new SparkIllegalArgumentException("_LEGACY_ERROR_TEMP_3225"))
         Some(field.copy(dataType = map.copy(
           valueType = updated.dataType,
           valueContainsNull = updated.nullable)))
 
       case (Seq("value", names @ _*), map @ MapType(_, valueStruct: StructType, _)) =>
-        Some(field.copy(dataType = map.copy(valueType = replace(valueStruct, names, update))))
+        Some(field.copy(dataType = map.copy(valueType =
+          replace(valueStruct, names, update, ifExists))))
 
       case (Seq("element"), array @ ArrayType(elementType, isNullable)) =>
         val updated = update(StructField("element", elementType, nullable = isNullable))
-            .getOrElse(throw new IllegalArgumentException(s"Cannot delete array element"))
+            .getOrElse(throw new SparkIllegalArgumentException("_LEGACY_ERROR_TEMP_3224"))
         Some(field.copy(dataType = array.copy(
           elementType = updated.dataType,
           containsNull = updated.nullable)))
 
       case (Seq("element", names @ _*), array @ ArrayType(elementStruct: StructType, _)) =>
-        Some(field.copy(dataType = array.copy(elementType = replace(elementStruct, names, update))))
+        Some(field.copy(dataType = array.copy(elementType =
+          replace(elementStruct, names, update, ifExists))))
 
       case (names, dataType) =>
-        throw new IllegalArgumentException(
-          s"Cannot find field: ${names.head} in ${dataType.simpleString}")
+        if (!ifExists) {
+          throw new SparkIllegalArgumentException(
+            errorClass = "_LEGACY_ERROR_TEMP_3223",
+            messageParameters = Map("name" -> names.head, "dataType" -> dataType.simpleString))
+        }
+        None
     }
 
     val newFields = struct.fields.zipWithIndex.flatMap {
@@ -280,48 +473,236 @@ private[sql] object CatalogV2Util {
   def loadTable(
       catalog: CatalogPlugin,
       ident: Identifier,
-      timeTravelSpec: Option[TimeTravelSpec] = None): Option[Table] =
+      timeTravelSpec: Option[TimeTravelSpec] = None,
+      writePrivilegesString: Option[String] = None,
+      options: CaseInsensitiveStringMap = CaseInsensitiveStringMap.empty()): Option[Table] = {
+    val stateOptions = extractTableStateOptions(catalog, options)
+    loadTableWithStateOptions(
+      catalog, ident, stateOptions, timeTravelSpec, writePrivilegesString)
+  }
+
+  /**
+   * Loads a table using table-state options already projected by the caller.
+   */
+  def loadTableWithStateOptions(
+      catalog: CatalogPlugin,
+      ident: Identifier,
+      stateOptions: CaseInsensitiveStringMap,
+      timeTravelSpec: Option[TimeTravelSpec] = None,
+      writePrivilegesString: Option[String] = None): Option[Table] =
     try {
-      if (timeTravelSpec.nonEmpty) {
-        timeTravelSpec.get match {
-          case v: AsOfVersion =>
-            Option(catalog.asTableCatalog.loadTable(ident, v.version))
-          case ts: AsOfTimestamp =>
-            Option(catalog.asTableCatalog.loadTable(ident, ts.timestamp))
-        }
-      } else {
-        Option(catalog.asTableCatalog.loadTable(ident))
-      }
+      Option(getTableWithStateOptions(
+        catalog, ident, stateOptions, timeTravelSpec, writePrivilegesString))
     } catch {
       case _: NoSuchTableException => None
       case _: NoSuchDatabaseException => None
-      case _: NoSuchNamespaceException => None
     }
+
+  /**
+   * Extracts the options that may select table state from a complete option map. These are the
+   * only options passed to `loadTable` and used to identify a pinned table state.
+   */
+  def extractTableStateOptions(
+      catalog: CatalogPlugin,
+      options: CaseInsensitiveStringMap): CaseInsensitiveStringMap = {
+    extractStateOptions(catalog.asTableCatalog.tableStateOptionKeys, options)
+  }
+
+  /**
+   * Extracts the options passed to `loadChangelog`. Together with the changelog context, these
+   * options identify changelog state independently of the complete options used to plan each scan.
+   */
+  def extractChangelogStateOptions(
+      catalog: CatalogPlugin,
+      options: CaseInsensitiveStringMap): CaseInsensitiveStringMap = {
+    extractStateOptions(catalog.asTableCatalog.changelogStateOptionKeys, options)
+  }
+
+  private def extractStateOptions(
+      keys: util.Set[String],
+      options: CaseInsensitiveStringMap): CaseInsensitiveStringMap = {
+    val stateKeys = keys.asScala.map(_.toLowerCase(Locale.ROOT)).toSet
+    // Preserve the effective value even if differently cased aliases have different values.
+    val projected = options.asCaseSensitiveMap().asScala.collect {
+      case (key, _) if stateKeys.contains(key.toLowerCase(Locale.ROOT)) => key -> options.get(key)
+    }.toMap
+    new CaseInsensitiveStringMap(projected.asJava)
+  }
+
+  /**
+   * Loads a table from the catalog. Callers may pass the complete option map, but only the keys the
+   * catalog declares via `tableStateOptionKeys()` are forwarded to `loadTable`, so the loaded table
+   * state stays independent of non-state options and of how many times the table is referenced.
+   */
+  def getTable(
+      catalog: CatalogPlugin,
+      ident: Identifier,
+      timeTravelSpec: Option[TimeTravelSpec] = None,
+      writePrivilegesString: Option[String] = None,
+      options: CaseInsensitiveStringMap = CaseInsensitiveStringMap.empty()): Table = {
+    val stateOptions = extractTableStateOptions(catalog, options)
+    getTableWithStateOptions(
+      catalog, ident, stateOptions, timeTravelSpec, writePrivilegesString)
+  }
+
+  /**
+   * Loads a table using table-state options already projected by the caller.
+   */
+  def getTableWithStateOptions(
+      catalog: CatalogPlugin,
+      ident: Identifier,
+      stateOptions: CaseInsensitiveStringMap,
+      timeTravelSpec: Option[TimeTravelSpec] = None,
+      writePrivilegesString: Option[String] = None): Table = {
+    val timeTravel: TimeTravel = timeTravelSpec match {
+      case Some(v: AsOfVersion) => new TimeTravel.AsOfVersion(v.version)
+      case Some(ts: AsOfTimestamp) => new TimeTravel.AsOfTimestamp(ts.timestamp)
+      case None => null
+    }
+    val context = new TableContext(timeTravel, parseWritePrivileges(writePrivilegesString))
+    catalog.asTableCatalog.loadTable(ident, context, stateOptions)
+  }
+
+  /**
+   * Loads a table for a write, forwarding the required privileges and only the write options that
+   * the catalog declares may affect table state. The complete option map remains on the write
+   * relation for write planning.
+   */
+  def loadTableForV2Write(
+      catalog: CatalogPlugin,
+      ident: Identifier,
+      writePrivileges: Set[TableWritePrivilege],
+      options: CaseInsensitiveStringMap): Table = {
+    rejectTimeTravelOptionsForWrite(catalog, ident, options)
+    loadTableForWrite(catalog, ident, writePrivileges, options)
+  }
+
+  /**
+   * Loads a table for a write without validating the complete write option map. This is used by
+   * callers that must inspect whether the loaded table falls back to V1 before applying V2-only
+   * option validation.
+   */
+  def loadTableForWrite(
+      catalog: CatalogPlugin,
+      ident: Identifier,
+      writePrivileges: Set[TableWritePrivilege],
+      options: CaseInsensitiveStringMap): Table = {
+    val context = new TableContext(null, writePrivileges.asJava)
+    val stateOptions = extractTableStateOptions(catalog, options)
+    catalog.asTableCatalog.loadTable(ident, context, stateOptions)
+  }
+
+  def rejectTimeTravelOptionsForWrite(
+      catalog: CatalogPlugin,
+      ident: Identifier,
+      options: CaseInsensitiveStringMap): Unit = {
+    if (containsTimeTravelOptions(options)) {
+      throw QueryCompilationErrors.timeTravelUnsupportedError(
+        toSQLId(ident.toQualifiedNameParts(catalog)))
+    }
+  }
+
+  def containsTimeTravelOptions(options: CaseInsensitiveStringMap): Boolean = {
+    val conf = SQLConf.get
+    Seq(
+      conf.getConf(SQLConf.TIME_TRAVEL_TIMESTAMP_KEY),
+      conf.getConf(SQLConf.TIME_TRAVEL_VERSION_KEY)).exists(options.containsKey)
+  }
+
+  /**
+   * Parses the comma-separated write-privileges string (as carried in the internal
+   * [[org.apache.spark.sql.catalyst.analysis.UnresolvedRelation.REQUIRED_WRITE_PRIVILEGES]]
+   * option) into a set of [[TableWritePrivilege]]. Returns an empty set when absent (a read).
+   */
+  private def parseWritePrivileges(
+      writePrivilegesString: Option[String]): util.Set[TableWritePrivilege] = {
+    writePrivilegesString match {
+      case Some(str) =>
+        str.split(",").map(_.trim).map(TableWritePrivilege.valueOf).toSet.asJava
+      case None =>
+        util.Set.of()
+    }
+  }
+
+  /**
+   * Search path for analysis errors for a V2 table identifier: catalog name, then either the
+   * identifier's namespace (if non-empty) or the catalog's default namespace.
+   */
+  def searchPathForTableIdentifier(catalog: TableCatalog, ident: Identifier): Seq[String] = {
+    catalog.name() +: (
+      if (ident.namespace().nonEmpty) ident.namespace().toSeq
+      else catalog.defaultNamespace().toSeq)
+  }
+
+  def loadFunction(catalog: CatalogPlugin, ident: Identifier): Option[UnboundFunction] = {
+    try {
+      Option(catalog.asFunctionCatalog.loadFunction(ident))
+    } catch {
+      case _: NoSuchFunctionException => None
+      case _: NoSuchDatabaseException => None
+    }
+  }
 
   def loadRelation(catalog: CatalogPlugin, ident: Identifier): Option[NamedRelation] = {
     loadTable(catalog, ident).map(DataSourceV2Relation.create(_, Some(catalog), Some(ident)))
+  }
+
+  /**
+   * Looks up a cached relation using table-state options already projected by the caller.
+   * Reusing the projection keeps table pinning and shared-cache lookup on the same state key.
+   */
+  def lookupCachedRelationWithStateOptions(
+      cache: RelationCache,
+      catalog: CatalogPlugin,
+      ident: Identifier,
+      table: Table,
+      stateOptions: CaseInsensitiveStringMap): Option[DataSourceV2Relation] = {
+    cache.lookup(catalog, ident, Some(table.id), stateOptions).collect {
+      case r: DataSourceV2Relation => r
+    }
   }
 
   def isSessionCatalog(catalog: CatalogPlugin): Boolean = {
     catalog.name().equalsIgnoreCase(CatalogManager.SESSION_CATALOG_NAME)
   }
 
-  def convertTableProperties(c: CreateTableStatement): Map[String, String] = {
-    convertTableProperties(
-      c.properties, c.options, c.serde, c.location, c.comment, c.provider, c.external)
+  /**
+   * Construct a [[View.Builder]] seeded from an existing view's metadata. Used by ALTER
+   * VIEW execs (SET / UNSET TBLPROPERTIES, ALTER VIEW ... WITH SCHEMA BINDING) -- override
+   * the one field that changes, then `build` to produce the replacement payload for
+   * [[ViewCatalog#replaceView]]. Every other field flows through unchanged so a metadata-only
+   * mutation does not perturb the view body.
+   */
+  def viewInfoBuilderFrom(existing: View): View.Builder = {
+    val builder = new View.Builder()
+    builder
+      .withSchema(existing.schema)
+      .withProperties(existing.properties)
+      .withQueryText(existing.queryText)
+      .withSqlConfigs(existing.sqlConfigs)
+      .withCurrentNamespace(existing.currentNamespace)
+      .withQueryColumnNames(existing.queryColumnNames)
+    Option(existing.currentCatalog).foreach(builder.withCurrentCatalog)
+    Option(existing.schemaMode).foreach(builder.withSchemaMode)
+    Option(existing.viewDependencies).foreach(builder.withViewDependencies)
+    builder
   }
 
-  def convertTableProperties(c: CreateTableAsSelectStatement): Map[String, String] = {
-    convertTableProperties(
-      c.properties, c.options, c.serde, c.location, c.comment, c.provider, c.external)
+  /** Returns redacted, non-reserved table properties with additional display-only metadata. */
+  def tablePropertiesForDisplay(
+      properties: util.Map[String, String],
+      displayProperties: util.Map[String, String],
+      conf: SQLConf): Map[String, String] = {
+    val merged = (displayProperties.asScala.toMap ++ properties.asScala)
+      .filterNot { case (key, _) => TABLE_RESERVED_PROPERTIES.contains(key) }
+    conf.redactOptions(merged)
   }
 
-  def convertTableProperties(r: ReplaceTableStatement): Map[String, String] = {
-    convertTableProperties(r.properties, r.options, r.serde, r.location, r.comment, r.provider)
-  }
-
-  def convertTableProperties(r: ReplaceTableAsSelectStatement): Map[String, String] = {
-    convertTableProperties(r.properties, r.options, r.serde, r.location, r.comment, r.provider)
+  def convertTableProperties(t: TableSpec): Map[String, String] = {
+    val props = convertTableProperties(
+      t.properties, t.options, t.serde, t.location, t.comment,
+      t.collation, t.provider, t.external)
+    withDefaultOwnership(props)
   }
 
   private def convertTableProperties(
@@ -330,6 +711,7 @@ private[sql] object CatalogV2Util {
       serdeInfo: Option[SerdeInfo],
       location: Option[String],
       comment: Option[String],
+      collation: Option[String],
       provider: Option[String],
       external: Boolean = false): Map[String, String] = {
     properties ++
@@ -339,6 +721,7 @@ private[sql] object CatalogV2Util {
       (if (external) Some(TableCatalog.PROP_EXTERNAL -> "true") else None) ++
       provider.map(TableCatalog.PROP_PROVIDER -> _) ++
       comment.map(TableCatalog.PROP_COMMENT -> _) ++
+      collation.map(TableCatalog.PROP_COLLATION -> _) ++
       location.map(TableCatalog.PROP_LOCATION -> _)
   }
 
@@ -349,7 +732,7 @@ private[sql] object CatalogV2Util {
    *  - ROW FORMAT SERDE: hive.serde
    *  - SERDEPROPERTIES: add "option." prefix
    */
-  private def convertToProperties(serdeInfo: Option[SerdeInfo]): Map[String, String] = {
+  def convertToProperties(serdeInfo: Option[SerdeInfo]): Map[String, String] = {
     serdeInfo match {
       case Some(s) =>
         s.formatClasses.map { f =>
@@ -366,7 +749,7 @@ private[sql] object CatalogV2Util {
   }
 
   def withDefaultOwnership(properties: Map[String, String]): Map[String, String] = {
-    properties ++ Map(TableCatalog.PROP_OWNER -> Utils.getCurrentUserName())
+    properties ++ Map(TableCatalog.PROP_OWNER -> CurrentUserContext.getCurrentUser)
   }
 
   def getTableProviderCatalog(
@@ -377,5 +760,206 @@ private[sql] object CatalogV2Util {
       .map(catalogManager.catalog)
       .getOrElse(catalogManager.v2SessionCatalog)
       .asTableCatalog
+  }
+
+  def toStructType(cols: Seq[MetadataColumn]): StructType = {
+    StructType(cols.map(toStructField))
+  }
+
+  private def toStructField(col: MetadataColumn): StructField = {
+    val metadata = Option(col.metadataInJSON).map(Metadata.fromJson).getOrElse(Metadata.empty)
+    var f = StructField(col.name, col.dataType, col.isNullable, metadata)
+    if (col.comment != null) {
+      f = f.withComment(col.comment)
+    }
+    f
+  }
+
+  def v2ColumnsToStructType(columns: Array[Column]): StructType = {
+    v2ColumnsToStructType(columns.toImmutableArraySeq)
+  }
+
+  /**
+   * Converts DS v2 columns to StructType, which encodes column comment, default value, and
+   * column ID to StructField metadata. This is mainly used to define the schema of v2 scan,
+   * w.r.t. the columns of the v2 table.
+   */
+  def v2ColumnsToStructType(columns: Seq[Column]): StructType = {
+    StructType(columns.map(v2ColumnToStructField))
+  }
+
+  private def v2ColumnToStructField(col: Column): StructField = {
+    val metadata = Option(col.metadataInJSON()).map(Metadata.fromJson).getOrElse(Metadata.empty)
+    var f = StructField(col.name(), col.dataType(), col.nullable(), metadata)
+    Option(col.comment()).foreach { comment =>
+      f = f.withComment(comment)
+    }
+    Option(col.defaultValue()).foreach { default =>
+      f = encodeDefaultValue(default, f)
+    }
+    Option(col.id()).foreach { id =>
+      f = f.withId(id)
+    }
+    Option(col.generationExpression()).foreach { genExpr =>
+      f = f.copy(metadata = new MetadataBuilder()
+        .withMetadata(f.metadata)
+        .putString(GeneratedColumn.GENERATION_EXPRESSION_METADATA_KEY, genExpr)
+        .build())
+    }
+    f
+  }
+
+  // For built-in file sources, we encode the default value in StructField metadata. An analyzer
+  // rule will check the special metadata and change the DML input plan to fill the default value.
+  private def encodeDefaultValue(defaultValue: ColumnDefaultValue, f: StructField): StructField = {
+    Option(defaultValue).map { default =>
+      // The "exists default" is used to back-fill the existing data when new columns are added, and
+      // should be a fixed value which was evaluated at the definition time. For example, if the
+      // default value is `current_date()`, the "exists default" should be the value of
+      // `current_date()` when the column was defined/altered, instead of when back-fall happens.
+      // Note: the back-fill here is a logical concept. The data source can keep the existing
+      //       data unchanged and let the data reader to return "exists default" for missing
+      //       columns.
+      // The "exists default" may not be present if the data source has its own way for back-fill.
+      val existsDefault = extractExistsDefault(default)
+      val (sql, expr) = extractCurrentDefault(default)
+      var metadataBuilder = new MetadataBuilder().withMetadata(f.metadata)
+      existsDefault.foreach { ed =>
+        metadataBuilder = metadataBuilder.putString(EXISTS_DEFAULT_COLUMN_METADATA_KEY, ed)
+      }
+      val metadata = metadataBuilder
+        .putExpression(CURRENT_DEFAULT_COLUMN_METADATA_KEY, sql, expr)
+        .build()
+      f.copy(metadata = metadata)
+    }.getOrElse(f)
+  }
+
+  private def extractExistsDefault(default: ColumnDefaultValue): Option[String] = {
+    Option(default.getValue).map { literal =>
+      Literal(literal.value, literal.dataType).sql
+    }
+  }
+
+  private def extractCurrentDefault(default: ColumnDefaultValue): (String, Option[Expression]) = {
+    val expr = Option(default.getExpression).flatMap(V2ExpressionUtils.toCatalyst)
+    val sql = Option(default.getSql).orElse(expr.map(_.sql)).getOrElse {
+      throw SparkException.internalError(
+        s"Can't generate SQL for $default. The connector expression couldn't be " +
+        "converted to Catalyst and there is no provided SQL representation.")
+    }
+    (sql, expr)
+  }
+
+  /**
+   * Converts a StructType to DS v2 columns, which decodes the StructField metadata to v2 column
+   * comment, default value or generation expression, and column ID. This is mainly used to
+   * generate DS v2 columns from table schema in DDL commands, so that Spark can pass DS v2
+   * columns to DS v2 createTable and related APIs.
+   */
+  def structTypeToV2Columns(
+      schema: StructType,
+      keepIds: Boolean = true): Array[Column] = {
+    schema.fields.map(structFieldToV2Column(_, keepIds))
+  }
+
+  def clearIds(columns: Array[Column]): Array[Column] = {
+    columns.map(col => Column.builderFrom(col).clearIds().build())
+  }
+
+  private def structFieldToV2Column(f: StructField, keepIds: Boolean): Column = {
+    def metadataAsJson(metadata: Metadata): String = {
+      if (metadata == Metadata.empty) {
+        null
+      } else {
+        metadata.json
+      }
+    }
+    def metadataWithKeysRemoved(keys: Seq[String]): Metadata = {
+      keys.foldLeft(new MetadataBuilder().withMetadata(f.metadata)) {
+        (builder, key) => builder.remove(key)
+      }.build()
+    }
+
+    val id = if (keepIds) f.id.orNull else null
+    val dataType = if (keepIds) f.dataType else SchemaUtils.clearFieldIds(f.dataType)
+    val comment = f.getComment().orNull
+
+    val isDefaultColumn = f.getCurrentDefaultValue().isDefined
+    val isGeneratedColumn = GeneratedColumn.isGeneratedColumn(f)
+    val isIdentityColumn = IdentityColumn.isIdentityColumn(f)
+    if (isDefaultColumn) {
+      checkDefaultColumnConflicts(f)
+
+      val existsDefault = if (f.getExistenceDefaultValue().isDefined) {
+        val e = analyze(
+          f,
+          statementType = "Column analysis",
+          metadataKey = EXISTS_DEFAULT_COLUMN_METADATA_KEY)
+
+        assert(e.resolved && e.foldable,
+          "The existence default value must be a simple SQL string that is resolved and " +
+            "foldable, but got: " + f.getExistenceDefaultValue().get)
+        LiteralValue(e.eval(), dataType)
+      } else {
+        null
+      }
+      val defaultValue = new ColumnDefaultValue(f.getCurrentDefaultValue().get, existsDefault)
+      val removedMetaKeys = COMMON_COL_METADATA_KEYS ++ DEFAULT_COL_METADATA_KEYS
+      Column.builderFor(f.name, dataType)
+        .nullable(f.nullable)
+        .comment(comment)
+        .defaultValue(defaultValue)
+        .metadata(metadataAsJson(metadataWithKeysRemoved(removedMetaKeys)))
+        .id(id)
+        .build()
+    } else if (isGeneratedColumn) {
+      val removedMetaKeys = COMMON_COL_METADATA_KEYS ++ GENERATED_COL_METADATA_KEYS
+      Column.builderFor(f.name, dataType)
+        .nullable(f.nullable)
+        .comment(comment)
+        .generationExpression(GeneratedColumn.getGenerationExpression(f).get)
+        .metadata(metadataAsJson(metadataWithKeysRemoved(removedMetaKeys)))
+        .id(id)
+        .build()
+    } else if (isIdentityColumn) {
+      val removedMetaKeys = COMMON_COL_METADATA_KEYS ++ IDENTITY_COL_METADATA_KEYS
+      Column.builderFor(f.name, dataType)
+        .nullable(f.nullable)
+        .comment(comment)
+        .identityColumnSpec(IdentityColumn.getIdentityInfo(f).get)
+        .metadata(metadataAsJson(metadataWithKeysRemoved(removedMetaKeys)))
+        .id(id)
+        .build()
+    } else {
+      Column.builderFor(f.name, dataType)
+        .nullable(f.nullable)
+        .comment(comment)
+        .metadata(metadataAsJson(metadataWithKeysRemoved(COMMON_COL_METADATA_KEYS)))
+        .id(id)
+        .build()
+    }
+  }
+
+  private def checkDefaultColumnConflicts(f: StructField): Unit = {
+    if (GeneratedColumn.isGeneratedColumn(f)) {
+      throw new AnalysisException(
+        errorClass = "GENERATED_COLUMN_WITH_DEFAULT_VALUE",
+        messageParameters = Map(
+          "colName" -> f.name,
+          "defaultValue" -> f.getCurrentDefaultValue().get,
+          "genExpr" -> GeneratedColumn.getGenerationExpression(f).get
+        )
+      )
+    }
+    if (IdentityColumn.isIdentityColumn(f)) {
+      throw new AnalysisException(
+        errorClass = "IDENTITY_COLUMN_WITH_DEFAULT_VALUE",
+        messageParameters = Map(
+          "colName" -> f.name,
+          "defaultValue" -> f.getCurrentDefaultValue().get,
+          "identityColumnSpec" -> IdentityColumn.getIdentityInfo(f).get.toString
+        )
+      )
+    }
   }
 }

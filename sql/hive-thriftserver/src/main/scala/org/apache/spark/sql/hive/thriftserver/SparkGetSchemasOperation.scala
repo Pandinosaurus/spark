@@ -26,18 +26,20 @@ import org.apache.hive.service.cli.operation.MetadataOperation.DEFAULT_HIVE_CATA
 import org.apache.hive.service.cli.session.HiveSession
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.SQLContext
+import org.apache.spark.internal.LogKeys._
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.connector.catalog.{CatalogManager, SupportsNamespaces}
 
 /**
  * Spark's own GetSchemasOperation
  *
- * @param sqlContext SQLContext to use
+ * @param session SparkSession to use
  * @param parentSession a HiveSession from SessionManager
  * @param catalogName catalog name. null if not applicable.
  * @param schemaName database name, null or a concrete database name
  */
 private[hive] class SparkGetSchemasOperation(
-    val sqlContext: SQLContext,
+    val session: SparkSession,
     parentSession: HiveSession,
     catalogName: String,
     schemaName: String)
@@ -45,16 +47,18 @@ private[hive] class SparkGetSchemasOperation(
   with SparkOperation
   with Logging {
 
-  override def runInternal(): Unit = {
+  override def runInternal(): Unit = withClassLoader { _ =>
     // Do not change cmdStr. It's used for Hive auditing and authorization.
     val cmdStr = s"catalog : $catalogName, schemaPattern : $schemaName"
     val logMsg = s"Listing databases '$cmdStr'"
-    logInfo(s"$logMsg with $statementId")
-    setState(OperationState.RUNNING)
-    // Always use the latest class loader provided by executionHive's state.
-    val executionHiveClassLoader = sqlContext.sharedState.jarClassLoader
-    Thread.currentThread().setContextClassLoader(executionHiveClassLoader)
 
+    val catalogNameStr = if (catalogName == null) "null" else catalogName
+    val schemaNameStr = if (schemaName == null) "null" else schemaName
+    logInfo(log"Listing databases 'catalog : ${MDC(CATALOG_NAME, catalogNameStr)}, " +
+      log"schemaPattern : ${MDC(DATABASE_NAME, schemaNameStr)}' " +
+      log"with ${MDC(STATEMENT_ID, statementId)}")
+
+    setState(OperationState.RUNNING)
     if (isAuthV2Enabled) {
       authorizeMetaGets(HiveOperationType.GET_TABLES, null, cmdStr)
     }
@@ -68,15 +72,51 @@ private[hive] class SparkGetSchemasOperation(
 
     try {
       val schemaPattern = convertSchemaPattern(schemaName)
-      sqlContext.sessionState.catalog.listDatabases(schemaPattern).foreach { dbName =>
-        rowSet.addRow(Array[AnyRef](dbName, DEFAULT_HIVE_CATALOG))
-      }
-
-      val globalTempViewDb = sqlContext.sessionState.catalog.globalTempViewManager.database
-      val databasePattern = Pattern.compile(CLIServiceUtils.patternToRegex(schemaName))
-      if (schemaName == null || schemaName.isEmpty ||
-          databasePattern.matcher(globalTempViewDb).matches()) {
-        rowSet.addRow(Array[AnyRef](globalTempViewDb, DEFAULT_HIVE_CATALOG))
+      if (isCatalogMetadataEnabled) {
+        // The JDBC catalogName parameter is intentionally not used for filtering;
+        // resolution always uses the current catalog (SPARK-57518; per-catalog
+        // filtering deferred).
+        val resolvedCatalog = catalogManager.currentCatalog
+        val catalogNameValue = resolvedCatalog.name()
+        if (catalogNameValue == CatalogManager.SESSION_CATALOG_NAME) {
+          // For spark_catalog, use the V1 SessionCatalog directly (transparent delegation)
+          catalog.listDatabases(schemaPattern).foreach { dbName =>
+            rowSet.addRow(Array[AnyRef](dbName, catalogNameValue))
+          }
+          // Global temp view database is only relevant for spark_catalog
+          val globalTempViewDb = catalog.globalTempDatabase
+          val databasePattern = Pattern.compile(CLIServiceUtils.patternToRegex(schemaName))
+          if (schemaName == null || schemaName.isEmpty ||
+              databasePattern.matcher(globalTempViewDb).matches()) {
+            rowSet.addRow(Array[AnyRef](globalTempViewDb, catalogNameValue))
+          }
+        } else {
+          resolvedCatalog match {
+            case nsCatalog: SupportsNamespaces =>
+              val databasePattern = Pattern.compile(
+                CLIServiceUtils.patternToRegex(schemaName))
+              nsCatalog.listNamespaces().foreach { ns =>
+                // Only top-level namespaces (depth=1) are exposed as JDBC schemas.
+                val nsName = ns.head
+                if (schemaName == null || schemaName.isEmpty ||
+                    databasePattern.matcher(nsName).matches()) {
+                  rowSet.addRow(Array[AnyRef](nsName, catalogNameValue))
+                }
+              }
+            case _ =>
+              // Catalog doesn't support namespaces -- return empty
+          }
+        }
+      } else {
+        catalog.listDatabases(schemaPattern).foreach { dbName =>
+          rowSet.addRow(Array[AnyRef](dbName, DEFAULT_HIVE_CATALOG))
+        }
+        val globalTempViewDb = catalog.globalTempDatabase
+        val databasePattern = Pattern.compile(CLIServiceUtils.patternToRegex(schemaName))
+        if (schemaName == null || schemaName.isEmpty ||
+            databasePattern.matcher(globalTempViewDb).matches()) {
+          rowSet.addRow(Array[AnyRef](globalTempViewDb, DEFAULT_HIVE_CATALOG))
+        }
       }
       setState(OperationState.FINISHED)
     } catch onError()

@@ -21,8 +21,8 @@ from pyspark.sql.types import DoubleType, IntegerType
 from pyspark.testing.mlutils import (
     MockDataset,
     MockEstimator,
-    MockUnaryTransformer,
     MockTransformer,
+    MockUnaryTransformer,
     SparkSessionTestCase,
 )
 
@@ -85,12 +85,6 @@ class EstimatorTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.test_base import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

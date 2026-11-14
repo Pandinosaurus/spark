@@ -20,7 +20,6 @@ package org.apache.spark.sql.sources
 import java.io.File
 
 import org.apache.spark.SparkException
-import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogTableType}
 import org.apache.spark.sql.catalyst.parser.ParseException
@@ -31,7 +30,6 @@ import org.apache.spark.util.Utils
 class CreateTableAsSelectSuite extends DataSourceTest with SharedSparkSession {
   import testImplicits._
 
-  protected override lazy val sql = spark.sql _
   private var path: File = null
 
   override def beforeAll(): Unit = {
@@ -155,18 +153,23 @@ class CreateTableAsSelectSuite extends DataSourceTest with SharedSparkSession {
 
   test("disallows CREATE TEMPORARY TABLE ... USING ... AS query") {
     withTable("t") {
-      val error = intercept[ParseException] {
-        sql(
-          s"""
-             |CREATE TEMPORARY TABLE t USING PARQUET
-             |OPTIONS (PATH '${path.toURI}')
-             |PARTITIONED BY (a)
-             |AS SELECT 1 AS a, 2 AS b
-           """.stripMargin
-        )
-      }.getMessage
-      assert(error.contains("Operation not allowed") &&
-        error.contains("CREATE TEMPORARY TABLE"))
+      val pathUri = path.toURI.toString
+      val sqlText =
+        s"""CREATE TEMPORARY TABLE t USING PARQUET
+           |OPTIONS (PATH '$pathUri')
+           |PARTITIONED BY (a)
+           |AS SELECT 1 AS a, 2 AS b""".stripMargin
+      checkError(
+        exception = intercept[ParseException] {
+          sql(sqlText)
+        },
+        condition = "_LEGACY_ERROR_TEMP_0035",
+        parameters = Map(
+          "message" -> "CREATE TEMPORARY TABLE ... AS ..., use CREATE TEMPORARY VIEW instead"),
+        context = ExpectedContext(
+          fragment = sqlText,
+          start = 0,
+          stop = 99 + pathUri.length))
     }
   }
 
@@ -219,7 +222,7 @@ class CreateTableAsSelectSuite extends DataSourceTest with SharedSparkSession {
   test("create table using as select - with invalid number of buckets") {
     withTable("t") {
       Seq(0, 100001).foreach(numBuckets => {
-        val e = intercept[AnalysisException] {
+        val e = intercept[ParseException] {
           sql(
             s"""
                |CREATE TABLE t USING PARQUET
@@ -260,7 +263,7 @@ class CreateTableAsSelectSuite extends DataSourceTest with SharedSparkSession {
 
       // Over the new limit
       withTable("t") {
-        val e = intercept[AnalysisException](
+        val e = intercept[ParseException](
           sql(createTableSql(path.toURI.toString, maxNrBuckets + 1)))
         assert(
           e.getMessage.contains("Number of buckets should be greater than 0 but less than "))
@@ -282,10 +285,18 @@ class CreateTableAsSelectSuite extends DataSourceTest with SharedSparkSession {
 
   test("specifying the column list for CTAS") {
     withTable("t") {
-      val e = intercept[ParseException] {
-        sql("CREATE TABLE t (a int, b int) USING parquet AS SELECT 1, 2")
-      }.getMessage
-      assert(e.contains("Schema may not be specified in a Create Table As Select (CTAS)"))
+      val sqlText = "CREATE TABLE t (a int, b int) USING parquet AS SELECT 1, 2"
+      checkError(
+        exception = intercept[ParseException] {
+          sql(sqlText)
+        },
+        condition = "_LEGACY_ERROR_TEMP_0035",
+        parameters = Map(
+          "message" -> "Schema may not be specified in a Create Table As Select (CTAS) statement"),
+        context = ExpectedContext(
+          fragment = sqlText,
+          start = 0,
+          stop = 57))
     }
   }
 }

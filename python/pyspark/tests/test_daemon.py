@@ -24,18 +24,21 @@ from pyspark.serializers import read_int
 
 class DaemonTests(unittest.TestCase):
     def connect(self, port):
-        from socket import socket, AF_INET, SOCK_STREAM
+        from socket import AF_INET, AF_INET6, SOCK_STREAM, socket
 
-        sock = socket(AF_INET, SOCK_STREAM)
-        sock.connect(("127.0.0.1", port))
+        family, host = AF_INET, "127.0.0.1"
+        if os.environ.get("SPARK_PREFER_IPV6", "false").lower() == "true":
+            family, host = AF_INET6, "::1"
+        sock = socket(family, SOCK_STREAM)
+        sock.connect((host, port))
         # send a split index of -1 to shutdown the worker
-        sock.send(b"\xFF\xFF\xFF\xFF")
+        sock.send(b"\xff\xff\xff\xff")
         sock.close()
         return True
 
     def do_termination_test(self, terminator):
-        from subprocess import Popen, PIPE
         from errno import ECONNREFUSED
+        from subprocess import PIPE, Popen
 
         # start daemon
         daemon_path = os.path.join(os.path.dirname(__file__), "..", "daemon.py")
@@ -75,12 +78,6 @@ class DaemonTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.tests.test_daemon import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

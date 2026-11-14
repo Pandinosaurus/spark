@@ -17,15 +17,24 @@
 
 package org.apache.spark.sql.hive.execution
 
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, DataOutputStream, File}
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.sql.{Date, Timestamp}
 
+import org.apache.hadoop.fs.Path
+import org.apache.hadoop.hive.ql.io.{DelegateSymlinkTextInputFormat, SymlinkTextInputFormat}
+import org.apache.hadoop.mapred.FileSplit;
+import org.apache.spark.internal.config.HADOOP_RDD_IGNORE_EMPTY_SPLITS
 import org.apache.spark.sql.{QueryTest, Row}
-import org.apache.spark.sql.hive.HiveUtils.{CONVERT_METASTORE_ORC, CONVERT_METASTORE_PARQUET}
+import org.apache.spark.sql.hive.HiveUtils.{CONVERT_METASTORE_ORC, CONVERT_METASTORE_PARQUET, USE_DELEGATE_FOR_SYMLINK_TEXT_INPUT_FORMAT}
 import org.apache.spark.sql.hive.test.TestHiveSingleton
-import org.apache.spark.sql.internal.SQLConf.ORC_IMPLEMENTATION
-import org.apache.spark.sql.test.SQLTestUtils
+import org.apache.spark.sql.internal.SQLConf.{ORC_IMPLEMENTATION, TIMESTAMP_TYPE}
+import org.apache.spark.sql.types.{StructType, TimestampType}
+import org.apache.spark.tags.SlowHiveTest
 
-class HiveSerDeReadWriteSuite extends QueryTest with SQLTestUtils with TestHiveSingleton {
+@SlowHiveTest
+class HiveSerDeReadWriteSuite extends QueryTest with TestHiveSingleton {
 
   private var originalConvertMetastoreParquet = CONVERT_METASTORE_PARQUET.defaultValueString
   private var originalConvertMetastoreORC = CONVERT_METASTORE_ORC.defaultValueString
@@ -35,7 +44,7 @@ class HiveSerDeReadWriteSuite extends QueryTest with SQLTestUtils with TestHiveS
     super.beforeAll()
     originalConvertMetastoreParquet = spark.conf.get(CONVERT_METASTORE_PARQUET.key)
     originalConvertMetastoreORC = spark.conf.get(CONVERT_METASTORE_ORC.key)
-    originalORCImplementation = spark.conf.get(ORC_IMPLEMENTATION)
+    originalORCImplementation = spark.conf.get(ORC_IMPLEMENTATION.key)
 
     spark.conf.set(CONVERT_METASTORE_PARQUET.key, "false")
     spark.conf.set(CONVERT_METASTORE_ORC.key, "false")
@@ -98,9 +107,10 @@ class HiveSerDeReadWriteSuite extends QueryTest with SQLTestUtils with TestHiveS
     withTable("hive_serde") {
       hiveClient.runSqlHive(s"CREATE TABLE hive_serde (c1 CHAR(10)) STORED AS $fileFormat")
       hiveClient.runSqlHive("INSERT INTO TABLE hive_serde values('s')")
-      checkAnswer(spark.table("hive_serde"), Row("s" + " " * 9))
+      checkAnswer(spark.table("hive_serde"), Row("s" + " ".repeat(9)))
       spark.sql(s"INSERT INTO TABLE hive_serde values('s3')")
-      checkAnswer(spark.table("hive_serde"), Seq(Row("s" + " " * 9), Row("s3" + " " * 8)))
+      checkAnswer(spark.table("hive_serde"),
+        Seq(Row("s" + " ".repeat(9)), Row("s3" + " ".repeat(8))))
     }
   }
 
@@ -214,6 +224,156 @@ class HiveSerDeReadWriteSuite extends QueryTest with SQLTestUtils with TestHiveS
 
       hiveClient.runSqlHive("INSERT INTO t1 SELECT array('SPARK-34512', 'HIVE-24797')")
       checkAnswer(spark.table("t1"), Seq(Row(Array("SPARK-34512", "HIVE-24797"))))
+    }
+  }
+
+  test("SPARK-40815: DelegateSymlinkTextInputFormat serialization") {
+    def assertSerDe(split: DelegateSymlinkTextInputFormat.DelegateSymlinkTextInputSplit): Unit = {
+      val buf = new ByteArrayOutputStream()
+      val out = new DataOutputStream(buf)
+      try {
+        split.write(out)
+      } finally {
+        out.close()
+      }
+
+      val res = new DelegateSymlinkTextInputFormat.DelegateSymlinkTextInputSplit()
+      val in = new DataInputStream(new ByteArrayInputStream(buf.toByteArray()))
+      try {
+        res.readFields(in)
+      } finally {
+        in.close()
+      }
+
+      assert(split.getPath == res.getPath)
+      assert(split.getStart == res.getStart)
+      assert(split.getLength == res.getLength)
+      assert(split.getLocations.toSeq == res.getLocations.toSeq)
+      assert(split.getTargetPath == res.getTargetPath)
+    }
+
+    assertSerDe(
+      new DelegateSymlinkTextInputFormat.DelegateSymlinkTextInputSplit(
+        new SymlinkTextInputFormat.SymlinkTextInputSplit(
+          new Path("file:/tmp/symlink"),
+          new FileSplit(new Path("file:/tmp/file"), 1L, 2L, Array[String]())
+        )
+      )
+    )
+  }
+
+  test("SPARK-40815: Read SymlinkTextInputFormat") {
+    withTable("t") {
+      withTempDir { root =>
+        val dataPath = new File(root, "data")
+        val symlinkPath = new File(root, "symlink")
+
+        spark.range(10).selectExpr("cast(id as string) as value")
+          .repartition(4).write.text(dataPath.getAbsolutePath)
+
+        // Generate symlink manifest file.
+        val files = dataPath.listFiles().filter(_.getName.endsWith(".txt"))
+        assert(files.length > 0)
+
+        symlinkPath.mkdir()
+        Files.write(
+          new File(symlinkPath, "symlink.txt").toPath,
+          files.mkString("\n").getBytes(StandardCharsets.UTF_8)
+        )
+
+        sql(s"""
+          CREATE TABLE t (id bigint)
+          STORED AS
+            INPUTFORMAT 'org.apache.hadoop.hive.ql.io.SymlinkTextInputFormat'
+            OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+          LOCATION '${symlinkPath.getAbsolutePath}';
+        """)
+
+        checkAnswer(
+          sql("SELECT id FROM t ORDER BY id ASC"),
+          (0 until 10).map(Row(_))
+        )
+
+        // Verify limit since we bypass ExecMapper.getDone().
+        checkAnswer(
+          sql("SELECT id FROM t ORDER BY id ASC LIMIT 2"),
+          (0 until 2).map(Row(_))
+        )
+
+        // Verify that with the flag disabled, we use the original SymlinkTextInputFormat
+        // which has the empty splits issue and therefore the result should be empty.
+        withSQLConf(
+          HADOOP_RDD_IGNORE_EMPTY_SPLITS.key -> "true",
+          USE_DELEGATE_FOR_SYMLINK_TEXT_INPUT_FORMAT.key -> "false") {
+
+          checkAnswer(
+            sql("SELECT id FROM t ORDER BY id ASC"),
+            Seq.empty[Row]
+          )
+        }
+      }
+    }
+  }
+
+  test("SPARK-60424: Hive TIMESTAMP is TIMESTAMP_LTZ regardless of spark.sql.timestampType") {
+    Seq(
+      "TEXTFILE" -> Nil,
+      "ORC" -> Nil,
+      "ORC" -> Seq(CONVERT_METASTORE_ORC.key -> "true"),
+      "ORC" -> Seq(CONVERT_METASTORE_ORC.key -> "true", ORC_IMPLEMENTATION.key -> "native"),
+      "PARQUET" -> Nil,
+      "PARQUET" -> Seq(CONVERT_METASTORE_PARQUET.key -> "true")
+    ).foreach { case (fileFormat, confs) =>
+      withTable("hive_serde") {
+        spark.sql(s"CREATE TABLE hive_serde (c1 TIMESTAMP) STORED AS $fileFormat")
+        hiveClient.runSqlHive("INSERT INTO TABLE hive_serde values('2019-04-11 15:50:00')")
+        withSQLConf(confs :+ (TIMESTAMP_TYPE.key -> "TIMESTAMP_NTZ"): _*) {
+          assert(spark.table("hive_serde").schema === new StructType().add("c1", TimestampType))
+          spark.sql("INSERT INTO TABLE hive_serde VALUES (TIMESTAMP_LTZ'2019-04-12 15:50:00')")
+          checkAnswer(
+            spark.table("hive_serde"),
+            Seq(Row(Timestamp.valueOf("2019-04-11 15:50:00")),
+              Row(Timestamp.valueOf("2019-04-12 15:50:00"))))
+        }
+        assert(hiveClient.runSqlHive("SELECT c1 FROM hive_serde ORDER BY c1") ===
+          Seq("2019-04-11 15:50:00", "2019-04-12 15:50:00"))
+      }
+    }
+  }
+
+  test("SPARK-60565: Read and write collated strings in Hive serde tables") {
+    Seq("SEQUENCEFILE", "TEXTFILE", "RCFILE", "ORC", "PARQUET", "AVRO").foreach { fileFormat =>
+      withTable("hive_serde", "hive_serde_ctas") {
+        spark.sql(
+          s"""
+             |CREATE TABLE hive_serde (
+             |  c1 STRING COLLATE UNICODE_CI,
+             |  c2 ARRAY<STRING COLLATE UNICODE_CI>,
+             |  c3 STRUCT<f: STRING COLLATE UTF8_LCASE>,
+             |  c4 MAP<STRING, STRING COLLATE UNICODE_CI>,
+             |  c5 CHAR(3) COLLATE UTF8_LCASE,
+             |  c6 VARCHAR(3) COLLATE UNICODE_CI)
+             |STORED AS $fileFormat
+             |""".stripMargin)
+        hiveClient.runSqlHive("INSERT INTO TABLE hive_serde SELECT " +
+          "'a', ARRAY('b'), NAMED_STRUCT('f', 'c'), MAP('k', 'd'), 'e', 'f' FROM (SELECT 1) t")
+        spark.sql("INSERT INTO TABLE hive_serde " +
+          "SELECT 'A', ARRAY('B'), NAMED_STRUCT('f', 'C'), MAP('k', 'D'), 'E', 'F'")
+        val expected = Seq(
+          Row("a", Seq("b"), Row("c"), Map("k" -> "d"), "e  ", "f"),
+          Row("A", Seq("B"), Row("C"), Map("k" -> "D"), "E  ", "F"))
+        checkAnswer(spark.table("hive_serde"), expected)
+        // The collations are kept when Spark reads the table.
+        checkAnswer(
+          spark.sql("SELECT count(*) FROM hive_serde WHERE c1 = 'a' AND c2[0] = 'b' " +
+            "AND c3.f = 'c' AND c4['k'] = 'd' AND c5 = 'e' AND c6 = 'f'"),
+          Row(2))
+        assert(hiveClient.runSqlHive("SELECT c1 FROM hive_serde ORDER BY c1") === Seq("A", "a"))
+
+        spark.sql(s"CREATE TABLE hive_serde_ctas STORED AS $fileFormat AS SELECT * FROM hive_serde")
+        assert(spark.table("hive_serde_ctas").schema === spark.table("hive_serde").schema)
+        checkAnswer(spark.table("hive_serde_ctas"), expected)
+      }
     }
   }
 }

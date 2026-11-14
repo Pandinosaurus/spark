@@ -16,11 +16,17 @@
  */
 package org.apache.spark.sql.vectorized;
 
+import scala.PartialFunction;
+
 import org.apache.spark.annotation.Evolving;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.Decimal;
+import org.apache.spark.sql.types.UserDefinedType;
+import org.apache.spark.unsafe.types.BinaryView;
 import org.apache.spark.unsafe.types.CalendarInterval;
+import org.apache.spark.unsafe.types.TimestampNanosVal;
 import org.apache.spark.unsafe.types.UTF8String;
+import org.apache.spark.unsafe.types.VariantVal;
 
 /**
  * An interface representing in-memory columnar data in Spark. This interface defines the main APIs
@@ -65,6 +71,18 @@ public abstract class ColumnVector implements AutoCloseable {
    */
   @Override
   public abstract void close();
+
+  /**
+   * Cleans up memory for this column vector if it's resources are freeable between batches.
+   * The column vector is not usable after this.
+   *
+   * If this is a writable column vector or constant column vector, it is a no-op.
+   */
+  public void closeIfFreeable() {
+    // By default, we just call close() for all column vectors. If a column vector is writable or
+    // constant, it should override this method and do nothing.
+    close();
+  }
 
   /**
    * Returns true if this column vector contains any null values.
@@ -273,6 +291,16 @@ public abstract class ColumnVector implements AutoCloseable {
   public abstract byte[] getBinary(int rowId);
 
   /**
+   * Returns the opaque-bytes physical value at {@code rowId} as a {@link BinaryView}. Used by
+   * logical types whose physical representation is "an opaque chunk of bytes" - currently
+   * GEOMETRY and GEOGRAPHY. Returns {@code null} if the slot is null.
+   */
+  public BinaryView getBinaryView(int rowId) {
+    byte[] bytes = getBinary(rowId);
+    return (bytes == null) ? null : BinaryView.fromBytes(bytes);
+  }
+
+  /**
    * Returns the calendar interval type value for {@code rowId}. If the slot for
    * {@code rowId} is null, it should return null.
    * <p>
@@ -287,13 +315,49 @@ public abstract class ColumnVector implements AutoCloseable {
    * containing all the day values of all the interval values in this vector. The third child vector
    * is a long type vector, containing all the microsecond values of all the interval values in this
    * vector.
+   * Note that the ArrowColumnVector leverages its built-in IntervalMonthDayNanoVector instead of
+   * above-mentioned protocol.
    */
-  public final CalendarInterval getInterval(int rowId) {
+  public CalendarInterval getInterval(int rowId) {
     if (isNullAt(rowId)) return null;
     final int months = getChild(0).getInt(rowId);
     final int days = getChild(1).getInt(rowId);
     final long microseconds = getChild(2).getLong(rowId);
     return new CalendarInterval(months, days, microseconds);
+  }
+
+  /**
+   * Returns the nanosecond NTZ timestamp value for {@code rowId}, or null if the slot is null.
+   * <p>
+   * To support this type, implementations must implement {@link #getChild(int)} and define 2 child
+   * vectors: child 0 is a long vector holding {@code epochMicros}; child 1 is a short vector
+   * holding {@code nanosWithinMicro} (values in [0, 999]).
+   */
+  public TimestampNanosVal getTimestampNTZNanos(int rowId) {
+    if (isNullAt(rowId)) return null;
+    return TimestampNanosVal.fromTrustedRowBytes(
+      getChild(0).getLong(rowId), getChild(1).getShort(rowId));
+  }
+
+  /**
+   * Returns the nanosecond LTZ timestamp value for {@code rowId}, or null if the slot is null.
+   * <p>
+   * Storage layout is identical to {@link #getTimestampNTZNanos(int)}.
+   */
+  public TimestampNanosVal getTimestampLTZNanos(int rowId) {
+    if (isNullAt(rowId)) return null;
+    return TimestampNanosVal.fromTrustedRowBytes(
+      getChild(0).getLong(rowId), getChild(1).getShort(rowId));
+  }
+
+  /**
+   * Returns the Variant value for {@code rowId}. Similar to {@link #getInterval(int)}, the
+   * implementation must implement {@link #getChild(int)} and define 2 child vectors of binary type
+   * for the Variant value and metadata.
+   */
+  public final VariantVal getVariant(int rowId) {
+    if (isNullAt(rowId)) return null;
+    return new VariantVal(getChild(0).getBinary(rowId), getChild(1).getBinary(rowId));
   }
 
   /**
@@ -310,6 +374,21 @@ public abstract class ColumnVector implements AutoCloseable {
    * Sets up the data type of this column vector.
    */
   protected ColumnVector(DataType type) {
-    this.type = type;
+    this.type = type == null ? null : type.transformRecursively(
+      new PartialFunction<DataType, DataType>() {
+        @Override
+        public boolean isDefinedAt(DataType x) {
+          return x instanceof UserDefinedType<?>;
+        }
+
+        @Override
+        public DataType apply(DataType t) {
+          if (t instanceof UserDefinedType<?> udt) {
+            return udt.sqlType();
+          } else {
+            return t;
+          }
+        }
+      });
   }
 }

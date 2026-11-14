@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-from typing import TypeVar, TYPE_CHECKING, Iterator, Iterable
+from typing import TYPE_CHECKING, Iterable, Iterator, TypeVar
 
 if TYPE_CHECKING:
     from pyspark._typing import SizedIterable
@@ -27,7 +27,6 @@ T = TypeVar("T")
 
 
 class ResultIterable(Iterable[T]):
-
     """
     A special result iterable. This is used because the standard
     iterator can not be pickled

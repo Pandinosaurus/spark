@@ -15,10 +15,9 @@
 # limitations under the License.
 #
 
-from collections import namedtuple
 import os
 import traceback
-
+from collections import namedtuple
 
 CallSite = namedtuple("CallSite", "function file linenum")
 
@@ -46,12 +45,12 @@ def first_spark_call():
     return CallSite(function=sfun, file=ufile, linenum=uline)
 
 
-class SCCallSiteSync(object):
+class SCCallSiteSync:
     """
     Helper for setting the spark context call site.
 
     Example usage:
-    from pyspark.context import SCCallSiteSync
+    from pyspark.core.context import SCCallSiteSync
     with SCCallSiteSync(<relevant SparkContext>) as css:
         <a Spark call>
     """

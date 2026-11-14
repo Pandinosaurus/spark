@@ -18,13 +18,18 @@
 package org.apache.spark.sql.catalyst.optimizer
 
 import scala.annotation.tailrec
+import scala.util.control.NonFatal
 
+import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys.{HASH_JOIN_KEYS, JOIN_CONDITION}
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.planning.ExtractFiltersAndInnerJoins
+import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
+import org.apache.spark.sql.catalyst.planning.{ExtractEquiJoinKeys, ExtractFiltersAndInnerJoins, ExtractSingleColumnNullAwareAntiJoin}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
 import org.apache.spark.sql.catalyst.trees.TreePattern._
+import org.apache.spark.sql.catalyst.util.UnsafeRowUtils
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.Utils
@@ -126,9 +131,26 @@ object ReorderJoin extends Rule[LogicalPlan] with PredicateHelper {
  * - full outer -> left outer if only the left side has such predicates
  * - full outer -> right outer if only the right side has such predicates
  *
- * 2. Removes outer join if it only has distinct on streamed side
+ * 2. Removes outer join if aggregate is from streamed side and duplicate agnostic
+ *
  * {{{
  *   SELECT DISTINCT f1 FROM t1 LEFT JOIN t2 ON t1.id = t2.id  ==>  SELECT DISTINCT f1 FROM t1
+ * }}}
+ *
+ * {{{
+ *   SELECT t1.c1, max(t1.c2) FROM t1 LEFT JOIN t2 ON t1.c1 = t2.c1 GROUP BY t1.c1  ==>
+ *   SELECT t1.c1, max(t1.c2) FROM t1 GROUP BY t1.c1
+ * }}}
+ *
+ * 3. Remove outer join if:
+ *   - For a left outer join with only left-side columns being selected and the right side join
+ *     keys are unique.
+ *   - For a right outer join with only right-side columns being selected and the left side join
+ *     keys are unique.
+ *
+ * {{{
+ *   SELECT t1.* FROM t1 LEFT JOIN (SELECT DISTINCT c1 as c1 FROM t) t2 ON t1.c1 = t2.c1  ==>
+ *   SELECT t1.* FROM t1
  * }}}
  *
  * This rule should be executed before pushing down the Filter
@@ -143,9 +165,18 @@ object EliminateOuterJoin extends Rule[LogicalPlan] with PredicateHelper {
     val attributes = e.references.toSeq
     val emptyRow = new GenericInternalRow(attributes.length)
     val boundE = BindReferences.bindReference(e, attributes)
-    if (boundE.find(_.isInstanceOf[Unevaluable]).isDefined) return false
-    val v = boundE.eval(emptyRow)
-    v == null || v == false
+    if (boundE.exists(_.isInstanceOf[Unevaluable])) return false
+
+    // some expressions, like map(), may throw an exception when dealing with null values.
+    // therefore, we need to handle exceptions.
+    try {
+      val v = boundE.eval(emptyRow)
+      v == null || v == false
+    } catch {
+      case NonFatal(e) =>
+        // cannot filter out null if `where` expression throws an exception with null input
+        false
+    }
   }
 
   private def buildNewJoinType(filter: Filter, join: Join): JoinType = {
@@ -166,24 +197,43 @@ object EliminateOuterJoin extends Rule[LogicalPlan] with PredicateHelper {
     }
   }
 
+  private def allDuplicateAgnostic(a: Aggregate): Boolean = {
+    a.groupOnly || a.aggregateExpressions.flatMap { e =>
+      e.collect {
+        case ae: AggregateExpression => ae
+      }
+    }.forall(ae => ae.isDistinct || EliminateDistinct.isDuplicateAgnostic(ae.aggregateFunction))
+  }
+
   def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
     _.containsPattern(OUTER_JOIN), ruleId) {
     case f @ Filter(condition, j @ Join(_, _, RightOuter | LeftOuter | FullOuter, _, _)) =>
       val newJoinType = buildNewJoinType(f, j)
       if (j.joinType == newJoinType) f else Filter(condition, j.copy(joinType = newJoinType))
 
-    case a @ Aggregate(_, _, Join(left, _, LeftOuter, _, _))
-        if a.groupOnly && a.references.subsetOf(left.outputSet) =>
+    case a @ Aggregate(_, _, Join(left, _, LeftOuter, _, _), _)
+        if a.references.subsetOf(left.outputSet) && allDuplicateAgnostic(a) =>
       a.copy(child = left)
-    case a @ Aggregate(_, _, Join(_, right, RightOuter, _, _))
-        if a.groupOnly && a.references.subsetOf(right.outputSet) =>
+    case a @ Aggregate(_, _, Join(_, right, RightOuter, _, _), _)
+        if a.references.subsetOf(right.outputSet) && allDuplicateAgnostic(a) =>
       a.copy(child = right)
-    case a @ Aggregate(_, _, p @ Project(_, Join(left, _, LeftOuter, _, _)))
-        if a.groupOnly && p.references.subsetOf(left.outputSet) =>
+    case a @ Aggregate(_, _, p @ Project(projectList, Join(left, _, LeftOuter, _, _)), _)
+        if projectList.forall(_.deterministic) && p.references.subsetOf(left.outputSet) &&
+          allDuplicateAgnostic(a) =>
       a.copy(child = p.copy(child = left))
-    case a @ Aggregate(_, _, p @ Project(_, Join(_, right, RightOuter, _, _)))
-        if a.groupOnly && p.references.subsetOf(right.outputSet) =>
+    case a @ Aggregate(_, _, p @ Project(projectList, Join(_, right, RightOuter, _, _)), _)
+        if projectList.forall(_.deterministic) && p.references.subsetOf(right.outputSet) &&
+          allDuplicateAgnostic(a) =>
       a.copy(child = p.copy(child = right))
+
+    case p @ Project(_, ExtractEquiJoinKeys(LeftOuter, _, rightKeys, _, _, left, right, _))
+        if right.distinctKeys.exists(_.subsetOf(ExpressionSet(rightKeys))) &&
+          p.references.subsetOf(left.outputSet) =>
+      p.copy(child = left)
+    case p @ Project(_, ExtractEquiJoinKeys(RightOuter, leftKeys, _, _, _, left, right, _))
+        if left.distinctKeys.exists(_.subsetOf(ExpressionSet(leftKeys))) &&
+          p.references.subsetOf(right.outputSet) =>
+      p.copy(child = right)
   }
 }
 
@@ -195,9 +245,9 @@ object EliminateOuterJoin extends Rule[LogicalPlan] with PredicateHelper {
 object ExtractPythonUDFFromJoinCondition extends Rule[LogicalPlan] with PredicateHelper {
 
   private def hasUnevaluablePythonUDF(expr: Expression, j: Join): Boolean = {
-    expr.find { e =>
+    expr.exists { e =>
       PythonUDF.isScalarPythonUDF(e) && !canEvaluate(e, j.left) && !canEvaluate(e, j.right)
-    }.isDefined
+    }
   }
 
   override def apply(plan: LogicalPlan): LogicalPlan = plan.transformUpWithPruning(
@@ -215,8 +265,9 @@ object ExtractPythonUDFFromJoinCondition extends Rule[LogicalPlan] with Predicat
       // the new join conditions.
       val (udf, rest) = splitConjunctivePredicates(cond).partition(hasUnevaluablePythonUDF(_, j))
       val newCondition = if (rest.isEmpty) {
-        logWarning(s"The join condition:$cond of the join plan contains PythonUDF only," +
-          s" it will be moved out and the join plan will be turned to cross join.")
+        logWarning(log"The join condition:${MDC(JOIN_CONDITION, cond)} " +
+          log"of the join plan contains PythonUDF only," +
+          log" it will be moved out and the join plan will be turned to cross join.")
         None
       } else {
         Some(rest.reduceLeft(And))
@@ -236,62 +287,150 @@ case object BuildRight extends BuildSide
 
 case object BuildLeft extends BuildSide
 
-trait JoinSelectionHelper {
+trait JoinSelectionHelper extends Logging {
 
   def getBroadcastBuildSide(
-      left: LogicalPlan,
-      right: LogicalPlan,
-      joinType: JoinType,
-      hint: JoinHint,
+      join: Join,
       hintOnly: Boolean,
       conf: SQLConf): Option[BuildSide] = {
-    val buildLeft = if (hintOnly) {
-      hintToBroadcastLeft(hint)
-    } else {
-      canBroadcastBySize(left, conf) && !hintToNotBroadcastLeft(hint)
+    def shouldBuildLeft(): Boolean = {
+      if (hintOnly) {
+        hintToBroadcastLeft(join.hint)
+      } else {
+        canBroadcastBySize(join.left, conf) && !hintToNotBroadcastLeft(join.hint)
+      }
     }
-    val buildRight = if (hintOnly) {
-      hintToBroadcastRight(hint)
-    } else {
-      canBroadcastBySize(right, conf) && !hintToNotBroadcastRight(hint)
+    def shouldBuildRight(): Boolean = {
+      if (hintOnly) {
+        hintToBroadcastRight(join.hint)
+      } else {
+        canBroadcastBySize(join.right, conf) && !hintToNotBroadcastRight(join.hint)
+      }
     }
     getBuildSide(
-      canBuildBroadcastLeft(joinType) && buildLeft,
-      canBuildBroadcastRight(joinType) && buildRight,
-      left,
-      right
+      canBuildBroadcastLeft(join.joinType) && shouldBuildLeft(),
+      canBuildBroadcastRight(join.joinType) && shouldBuildRight(),
+      join.left,
+      join.right
     )
   }
 
   def getShuffleHashJoinBuildSide(
-      left: LogicalPlan,
-      right: LogicalPlan,
-      joinType: JoinType,
-      hint: JoinHint,
+      join: Join,
       hintOnly: Boolean,
       conf: SQLConf): Option[BuildSide] = {
-    val buildLeft = if (hintOnly) {
-      hintToShuffleHashJoinLeft(hint)
-    } else {
-      hintToPreferShuffleHashJoinLeft(hint) ||
-        (!conf.preferSortMergeJoin && canBuildLocalHashMapBySize(left, conf) &&
-          muchSmaller(left, right, conf)) ||
-        forceApplyShuffledHashJoin(conf)
+    def shouldBuildLeft(): Boolean = {
+      if (hintOnly) {
+        hintToShuffleHashJoinLeft(join.hint)
+      } else {
+        (!conf.preferSortMergeJoin && canBuildLocalHashMapBySize(join.left, conf) &&
+          muchSmaller(join.left, join.right, conf)) || forceApplyShuffledHashJoin(conf)
+      }
     }
-    val buildRight = if (hintOnly) {
-      hintToShuffleHashJoinRight(hint)
-    } else {
-      hintToPreferShuffleHashJoinRight(hint) ||
-        (!conf.preferSortMergeJoin && canBuildLocalHashMapBySize(right, conf) &&
-          muchSmaller(right, left, conf)) ||
-        forceApplyShuffledHashJoin(conf)
+    def shouldBuildRight(): Boolean = {
+      if (hintOnly) {
+        hintToShuffleHashJoinRight(join.hint)
+      } else {
+        (!conf.preferSortMergeJoin && canBuildLocalHashMapBySize(join.right, conf) &&
+          muchSmaller(join.right, join.left, conf)) || forceApplyShuffledHashJoin(conf)
+      }
     }
     getBuildSide(
-      canBuildShuffledHashJoinLeft(joinType) && buildLeft,
-      canBuildShuffledHashJoinRight(joinType) && buildRight,
-      left,
-      right
+      canBuildShuffledHashJoinLeft(join.joinType) && shouldBuildLeft(),
+      canBuildShuffledHashJoinRight(join.joinType) && shouldBuildRight(),
+      join.left,
+      join.right
     )
+  }
+
+  def getBroadcastNestedLoopJoinBuildSide(hint: JoinHint, joinType: JoinType): Option[BuildSide] = {
+    if (hintToNotBroadcastAndReplicateLeft(hint) || joinType == LeftSingle) {
+      Some(BuildRight)
+    } else if (hintToNotBroadcastAndReplicateRight(hint)) {
+      Some(BuildLeft)
+    } else {
+      None
+    }
+  }
+
+  /**
+   * How `JoinSelection` plans `join` when it has no equi-join keys and
+   * `canPlanAsBroadcastHashJoin(join, conf)` is false: the side a broadcast nested loop join
+   * builds, or `None` for a Cartesian product. Rules that need to know or price the plan a non-equi
+   * join gets can share it. Without equi-join keys, only a single-column null-aware anti join can
+   * be a broadcast hash join.
+   *
+   * With hints, it builds a broadcast-hinted side, or else plans a Cartesian product under a
+   * shuffle-replicate hint. Otherwise, or if no hint applies, it builds a side small enough to
+   * broadcast, or else plans a Cartesian product for an inner join, or else builds the side the
+   * join requires or prefers, however large. A side hinted NO_BROADCAST_AND_REPLICATION is never
+   * broadcast by size, and the hint rules out a Cartesian product, so the other side is built. Of
+   * two candidate sides, it builds the smaller for an inner or full join, the left for a right
+   * join, and the right for a left join. A LeftSingle join, though, always builds its right side,
+   * the only side `BroadcastNestedLoopJoinExec` can build for it, whatever the hints and sizes.
+   */
+  def getNonEquiJoinBuildSide(join: Join, conf: SQLConf): Option[BuildSide] = {
+    val Join(left, right, joinType, _, hint) = join
+    val desiredBuildSide = if (joinType.isInstanceOf[InnerLike] || joinType == FullOuter) {
+      getSmallerSide(left, right)
+    } else {
+      // For perf reasons, `BroadcastNestedLoopJoinExec` prefers to broadcast left side if
+      // it's a right join, and broadcast right side if it's a left join.
+      // TODO: revisit it. If left side is much smaller than the right side, it may be better
+      // to broadcast the left side even if it's a left join.
+      if (canBuildBroadcastLeft(joinType)) BuildLeft else BuildRight
+    }
+
+    // The side to broadcast by hint, or by size, if any. `BroadcastNestedLoopJoinExec` can't build
+    // the left side of a LeftSingle join, so that side never qualifies.
+    // TODO: teach `BroadcastNestedLoopJoinExec` to build the left side of a LeftSingle join by
+    // detecting more than one match per left row, so a small outer side can be broadcast instead
+    // of a large subquery side.
+    def broadcastSide(onlyLookingAtHint: Boolean): Option[BuildSide] = {
+      val buildLeft = if (joinType == LeftSingle) {
+        false
+      } else if (onlyLookingAtHint) {
+        hintToBroadcastLeft(hint)
+      } else {
+        canBroadcastBySize(left, conf) && !hintToNotBroadcastAndReplicateLeft(hint)
+      }
+      val buildRight = if (onlyLookingAtHint) {
+        hintToBroadcastRight(hint)
+      } else {
+        canBroadcastBySize(right, conf) && !hintToNotBroadcastAndReplicateRight(hint)
+      }
+      if (buildLeft && buildRight) {
+        Some(desiredBuildSide)
+      } else if (buildLeft) {
+        Some(BuildLeft)
+      } else if (buildRight) {
+        Some(BuildRight)
+      } else {
+        None
+      }
+    }
+
+    val cartesianProduct =
+      joinType.isInstanceOf[InnerLike] && !hintToNotBroadcastAndReplicate(hint)
+    // The last resort could be very slow or OOM. It builds the desired side unless the join
+    // requires a particular build side (e.g. NO_BROADCAST_AND_REPLICATION hint).
+    def withoutHint: Option[BuildSide] = broadcastSide(onlyLookingAtHint = false).orElse {
+      if (cartesianProduct) {
+        None
+      } else {
+        Some(getBroadcastNestedLoopJoinBuildSide(hint, joinType).getOrElse(desiredBuildSide))
+      }
+    }
+
+    if (hint.isEmpty) {
+      withoutHint
+    } else {
+      broadcastSide(onlyLookingAtHint = true) match {
+        case hinted @ Some(_) => hinted
+        case None if hintToShuffleReplicateNL(hint) && cartesianProduct => None
+        case None => withoutHint
+      }
+    }
   }
 
   def getSmallerSide(left: LogicalPlan, right: LogicalPlan): BuildSide = {
@@ -320,31 +459,98 @@ trait JoinSelectionHelper {
 
   def canBuildBroadcastRight(joinType: JoinType): Boolean = {
     joinType match {
-      case _: InnerLike | LeftOuter | LeftSemi | LeftAnti | _: ExistenceJoin => true
+      case _: InnerLike | LeftOuter | LeftSingle | LeftSemi | LeftAnti | _: ExistenceJoin => true
       case _ => false
     }
   }
 
   def canBuildShuffledHashJoinLeft(joinType: JoinType): Boolean = {
     joinType match {
-      case _: InnerLike | RightOuter | FullOuter => true
+      case _: InnerLike | LeftOuter | FullOuter | RightOuter => true
       case _ => false
     }
   }
 
   def canBuildShuffledHashJoinRight(joinType: JoinType): Boolean = {
     joinType match {
-      case _: InnerLike | LeftOuter | FullOuter |
+      case _: InnerLike | LeftOuter | LeftSingle | FullOuter | RightOuter |
            LeftSemi | LeftAnti | _: ExistenceJoin => true
       case _ => false
     }
   }
 
-  def canPlanAsBroadcastHashJoin(join: Join, conf: SQLConf): Boolean = {
-    getBroadcastBuildSide(join.left, join.right, join.joinType,
-      join.hint, hintOnly = true, conf).isDefined ||
-      getBroadcastBuildSide(join.left, join.right, join.joinType,
-        join.hint, hintOnly = false, conf).isDefined
+  protected def hashJoinSupported
+      (leftKeys: Seq[Expression], rightKeys: Seq[Expression]): Boolean = {
+    val result = leftKeys.concat(rightKeys).forall(e => UnsafeRowUtils.isBinaryStable(e.dataType))
+    if (!result) {
+      val keysNotSupportingHashJoin = leftKeys.concat(rightKeys).filterNot(
+        e => UnsafeRowUtils.isBinaryStable(e.dataType))
+      logWarning(log"Hash based joins are not supported due to joining on keys that don't " +
+        log"support binary equality. Keys not supporting hash joins: " +
+        log"${
+          MDC(HASH_JOIN_KEYS, keysNotSupportingHashJoin.map(
+            e => e.toString + " due to DataType: " + e.dataType.typeName).mkString(", "))
+        }")
+    }
+    result
+  }
+
+  /**
+   * The build side a broadcast hash join would use, or `None` when one is ruled out by the join
+   * shape, a hint, or its size.
+   *
+   * For equi-joins, `Some` does not promise the planner picks a broadcast hash join: other hints,
+   * unsupported join keys, or AQE can select another strategy. For a single-column null-aware anti
+   * join, the dedicated and automatic broadcast thresholds determine eligibility before hints.
+   * Callers that only need to know whether a broadcast hash join is possible should use
+   * `canPlanAsBroadcastHashJoin`.
+   */
+  def getBroadcastHashJoinBuildSide(join: Join, conf: SQLConf): Option[BuildSide] = join match {
+    case ExtractEquiJoinKeys(_, leftKeys, rightKeys, _, _, _, _, _) =>
+      // A shuffle hash hint outranks a size-based broadcast, so it vetoes one. Keys no hash join
+      // supports cannot honor that hint either, so it does not veto here; the sizes then still
+      // produce an answer, which over-approximates `JoinSelection` (it falls through to a sort
+      // merge join). That over-approximation predates this method and is kept deliberately, so
+      // that `canPlanAsBroadcastHashJoin` keeps its truth table. `hashJoinSupported` comes last,
+      // as it logs a warning for keys that no hash join supports.
+      val noShufflePlannedBefore =
+        getShuffleHashJoinBuildSide(join, hintOnly = true, conf).isEmpty ||
+          !hashJoinSupported(leftKeys, rightKeys)
+      getBroadcastBuildSide(join, hintOnly = true, conf).orElse {
+        if (noShufflePlannedBefore) getBroadcastBuildSide(join, hintOnly = false, conf) else None
+      }
+    // `JoinSelection` always builds from the right for this shape. The applicable automatic
+    // broadcast threshold floors a nonnegative dedicated threshold. As before, threshold
+    // eligibility takes precedence over join hints. This same decision intentionally controls
+    // aggregate pushdown. If neither threshold admits the hash join, regular planning may still
+    // broadcast the right side for a nested-loop join. The thresholds limit hash relation
+    // construction, not all broadcasts.
+    case j @ ExtractSingleColumnNullAwareAntiJoin(_, _) =>
+      val dedicatedThreshold = conf.nullAwareAntiJoinBroadcastThreshold
+      val canBroadcast = dedicatedThreshold < 0 ||
+        (dedicatedThreshold > 0 && {
+          val rightSize = j.right.stats.sizeInBytes
+          rightSize >= 0 && rightSize <= dedicatedThreshold
+        }) || canBroadcastBySize(j.right, conf)
+      if (canBroadcast) {
+        Some(BuildRight)
+      } else {
+        None
+      }
+    case _ => None
+  }
+
+  def canPlanAsBroadcastHashJoin(join: Join, conf: SQLConf): Boolean =
+    getBroadcastHashJoinBuildSide(join, conf).isDefined
+
+  def canPruneLeft(joinType: JoinType): Boolean = joinType match {
+    case Inner | LeftSemi | RightOuter => true
+    case _ => false
+  }
+
+  def canPruneRight(joinType: JoinType): Boolean = joinType match {
+    case Inner | LeftSemi | LeftOuter => true
+    case _ => false
   }
 
   def hintToBroadcastLeft(hint: JoinHint): Boolean = {
@@ -356,11 +562,19 @@ trait JoinSelectionHelper {
   }
 
   def hintToNotBroadcastLeft(hint: JoinHint): Boolean = {
-    hint.leftHint.exists(_.strategy.contains(NO_BROADCAST_HASH))
+    hint.leftHint.flatMap(_.strategy).exists {
+      case NO_BROADCAST_HASH => true
+      case NO_BROADCAST_AND_REPLICATION => true
+      case _ => false
+    }
   }
 
   def hintToNotBroadcastRight(hint: JoinHint): Boolean = {
-    hint.rightHint.exists(_.strategy.contains(NO_BROADCAST_HASH))
+    hint.rightHint.flatMap(_.strategy).exists {
+      case NO_BROADCAST_HASH => true
+      case NO_BROADCAST_AND_REPLICATION => true
+      case _ => false
+    }
   }
 
   def hintToShuffleHashJoinLeft(hint: JoinHint): Boolean = {
@@ -369,18 +583,6 @@ trait JoinSelectionHelper {
 
   def hintToShuffleHashJoinRight(hint: JoinHint): Boolean = {
     hint.rightHint.exists(_.strategy.contains(SHUFFLE_HASH))
-  }
-
-  def hintToPreferShuffleHashJoinLeft(hint: JoinHint): Boolean = {
-    hint.leftHint.exists(_.strategy.contains(PREFER_SHUFFLE_HASH))
-  }
-
-  def hintToPreferShuffleHashJoinRight(hint: JoinHint): Boolean = {
-    hint.rightHint.exists(_.strategy.contains(PREFER_SHUFFLE_HASH))
-  }
-
-  def hintToPreferShuffleHashJoin(hint: JoinHint): Boolean = {
-    hintToPreferShuffleHashJoinLeft(hint) || hintToPreferShuffleHashJoinRight(hint)
   }
 
   def hintToShuffleHashJoin(hint: JoinHint): Boolean = {
@@ -395,6 +597,18 @@ trait JoinSelectionHelper {
   def hintToShuffleReplicateNL(hint: JoinHint): Boolean = {
     hint.leftHint.exists(_.strategy.contains(SHUFFLE_REPLICATE_NL)) ||
       hint.rightHint.exists(_.strategy.contains(SHUFFLE_REPLICATE_NL))
+  }
+
+  def hintToNotBroadcastAndReplicate(hint: JoinHint): Boolean = {
+    hintToNotBroadcastAndReplicateLeft(hint) || hintToNotBroadcastAndReplicateRight(hint)
+  }
+
+  def hintToNotBroadcastAndReplicateLeft(hint: JoinHint): Boolean = {
+    hint.leftHint.exists(_.strategy.contains(NO_BROADCAST_AND_REPLICATION))
+  }
+
+  def hintToNotBroadcastAndReplicateRight(hint: JoinHint): Boolean = {
+    hint.rightHint.exists(_.strategy.contains(NO_BROADCAST_AND_REPLICATION))
   }
 
   private def getBuildSide(
@@ -446,4 +660,3 @@ trait JoinSelectionHelper {
       conf.getConfString("spark.sql.join.forceApplyShuffledHashJoin", "false") == "true"
   }
 }
-

@@ -17,6 +17,9 @@
 
 package org.apache.spark.sql.execution.columnar
 
+import scala.collection.AbstractIterator
+
+import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
@@ -26,8 +29,17 @@ import org.apache.spark.unsafe.types.CalendarInterval
 
 /**
  * An Iterator to walk through the InternalRows from a CachedBatch
+ *
+ * Extends `AbstractIterator` rather than mixing in `Iterator` directly. A subclass of this type
+ * is produced by runtime codegen, and javac (the alternative codegen backend) cannot subclass a
+ * scalac-compiled class that fixes a trait's type parameter while mixing the trait in directly:
+ * the mixin forwarders scalac emits on such a class are raw, carrying no `Signature` attribute,
+ * so javac sees e.g. `Object minBy(Function1, Ordering)` clash with `IterableOnceOps`'
+ * `<B> A minBy(Function1<A, B>, Ordering<B>)`. `AbstractIterator` stays generic in its element
+ * type, so its forwarders keep their signatures and no clash arises. Janino does not perform
+ * this check, so the direct form worked there.
  */
-abstract class ColumnarIterator extends Iterator[InternalRow] {
+abstract class ColumnarIterator extends AbstractIterator[InternalRow] {
   def initialize(input: Iterator[DefaultCachedBatch], columnTypes: Array[DataType],
     columnIndexes: Array[Int]): Unit
 }
@@ -51,16 +63,16 @@ class MutableUnsafeRow(val writer: UnsafeRowWriter) extends BaseGenericInternalR
 
   // the writer will be used directly to avoid creating wrapper objects
   override def setDecimal(i: Int, v: Decimal, precision: Int): Unit =
-    throw new UnsupportedOperationException
+    throw SparkUnsupportedOperationException()
 
   override def setInterval(i: Int, value: CalendarInterval): Unit =
-    throw new UnsupportedOperationException
+    throw SparkUnsupportedOperationException()
 
-  override def update(i: Int, v: Any): Unit = throw new UnsupportedOperationException
+  override def update(i: Int, v: Any): Unit = throw SparkUnsupportedOperationException()
 
   // all other methods inherited from GenericMutableRow are not need
-  override protected def genericGet(ordinal: Int): Any = throw new UnsupportedOperationException
-  override def numFields: Int = throw new UnsupportedOperationException
+  override protected def genericGet(ordinal: Int): Any = throw SparkUnsupportedOperationException()
+  override def numFields: Int = throw SparkUnsupportedOperationException()
 }
 
 /**
@@ -81,13 +93,16 @@ object GenerateColumnAccessor extends CodeGenerator[Seq[DataType], ColumnarItera
         case ByteType => classOf[ByteColumnAccessor].getName
         case ShortType => classOf[ShortColumnAccessor].getName
         case IntegerType | DateType | _: YearMonthIntervalType => classOf[IntColumnAccessor].getName
-        case LongType | TimestampType | TimestampNTZType | _: DayTimeIntervalType =>
+        case LongType | TimestampType | TimestampNTZType | _: DayTimeIntervalType | _: TimeType =>
           classOf[LongColumnAccessor].getName
         case FloatType => classOf[FloatColumnAccessor].getName
         case DoubleType => classOf[DoubleColumnAccessor].getName
-        case StringType => classOf[StringColumnAccessor].getName
+        case _: StringType => classOf[StringColumnAccessor].getName
         case BinaryType => classOf[BinaryColumnAccessor].getName
         case CalendarIntervalType => classOf[IntervalColumnAccessor].getName
+        case VariantType => classOf[VariantColumnAccessor].getName
+        case _: TimestampNTZNanosType => classOf[TimestampNTZNanosColumnAccessor].getName
+        case _: TimestampLTZNanosType => classOf[TimestampLTZNanosColumnAccessor].getName
         case dt: DecimalType if dt.precision <= Decimal.MAX_LONG_DIGITS =>
           classOf[CompactDecimalColumnAccessor].getName
         case dt: DecimalType => classOf[DecimalColumnAccessor].getName
@@ -100,7 +115,8 @@ object GenerateColumnAccessor extends CodeGenerator[Seq[DataType], ColumnarItera
       val createCode = dt match {
         case t if CodeGenerator.isPrimitiveType(dt) =>
           s"$accessorName = new $accessorCls(ByteBuffer.wrap(buffers[$index]).order(nativeOrder));"
-        case NullType | StringType | BinaryType =>
+        case NullType | BinaryType | CalendarIntervalType | VariantType |
+            _: TimestampNTZNanosType | _: TimestampLTZNanosType =>
           s"$accessorName = new $accessorCls(ByteBuffer.wrap(buffers[$index]).order(nativeOrder));"
         case other =>
           s"""$accessorName = new $accessorCls(ByteBuffer.wrap(buffers[$index]).order(nativeOrder),
@@ -160,7 +176,6 @@ object GenerateColumnAccessor extends CodeGenerator[Seq[DataType], ColumnarItera
       import java.nio.ByteOrder;
       import scala.collection.Iterator;
       import org.apache.spark.sql.types.DataType;
-      import org.apache.spark.sql.catalyst.expressions.codegen.BufferHolder;
       import org.apache.spark.sql.catalyst.expressions.codegen.UnsafeRowWriter;
       import org.apache.spark.sql.execution.columnar.MutableUnsafeRow;
 

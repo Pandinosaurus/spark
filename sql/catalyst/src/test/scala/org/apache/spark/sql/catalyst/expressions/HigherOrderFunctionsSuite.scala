@@ -17,8 +17,13 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.{SparkException, SparkFunSuite, SparkRuntimeException}
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
+import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.DataTypeMismatch
+import org.apache.spark.sql.catalyst.expressions.Cast._
+import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodegenFallback}
+import org.apache.spark.sql.catalyst.util.GenericArrayData
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
@@ -147,6 +152,7 @@ class HigherOrderFunctionsSuite extends SparkFunSuite with ExpressionEvalHelper 
 
     val plusOne: Expression => Expression = x => x + 1
     val plusIndex: (Expression, Expression) => Expression = (x, i) => x + i
+    val plusOneFallback: Expression => Expression = x => CodegenFallbackExpr(x + 1)
 
     checkEvaluation(transform(ai0, plusOne), Seq(2, 3, 4))
     checkEvaluation(transform(ai0, plusIndex), Seq(1, 3, 5))
@@ -155,6 +161,8 @@ class HigherOrderFunctionsSuite extends SparkFunSuite with ExpressionEvalHelper 
     checkEvaluation(transform(ai1, plusIndex), Seq(1, null, 5))
     checkEvaluation(transform(transform(ai1, plusIndex), plusOne), Seq(2, null, 6))
     checkEvaluation(transform(ain, plusOne), null)
+
+    checkEvaluation(transform(ai0, plusOneFallback), Seq(2, 3, 4))
 
     val as0 = Literal.create(Seq("a", "b", "c"), ArrayType(StringType, containsNull = false))
     val as1 = Literal.create(Seq("a", null, "c"), ArrayType(StringType, containsNull = true))
@@ -179,6 +187,16 @@ class HigherOrderFunctionsSuite extends SparkFunSuite with ExpressionEvalHelper 
       Seq("[2, 3, 4]", null, "[5, 6]"))
     checkEvaluation(transform(aai, array => Cast(transform(array, plusIndex), StringType)),
       Seq("[1, 3, 5]", null, "[4, 6]"))
+  }
+
+  test("ArrayTransform codegen rebinds fallback lambda variables by expression ID") {
+    val input = Literal.create(Seq(1, 2, 3), ArrayType(IntegerType, containsNull = false))
+    val arg = NamedLambdaVariable("arg", IntegerType, nullable = false)
+    val detachedArg = arg.copy(value = new java.util.concurrent.atomic.AtomicReference[Any]())
+    val function = LambdaFunction(CodegenFallbackExpr(detachedArg + 1), Seq(arg))
+    val expr = ArrayTransform(input, function).bind(validateBinding)
+
+    checkEvaluation(expr, Seq(2, 3, 4))
   }
 
   test("ArraySort") {
@@ -275,6 +293,7 @@ class HigherOrderFunctionsSuite extends SparkFunSuite with ExpressionEvalHelper 
     val isEven: Expression => Expression = x => x % 2 === 0
     val isNullOrOdd: Expression => Expression = x => x.isNull || x % 2 === 1
     val indexIsEven: (Expression, Expression) => Expression = { case (_, idx) => idx % 2 === 0 }
+    val isEvenFallback: Expression => Expression = x => CodegenFallbackExpr(x % 2 === 0)
 
     checkEvaluation(filter(ai0, isEven), Seq(2))
     checkEvaluation(filter(ai0, isNullOrOdd), Seq(1, 3))
@@ -283,6 +302,8 @@ class HigherOrderFunctionsSuite extends SparkFunSuite with ExpressionEvalHelper 
     checkEvaluation(filter(ai1, isNullOrOdd), Seq(1, null, 3))
     checkEvaluation(filter(ain, isEven), null)
     checkEvaluation(filter(ain, isNullOrOdd), null)
+
+    checkEvaluation(filter(ai0, isEvenFallback), Seq(2))
 
     val as0 =
       Literal.create(Seq("a0", "b1", "a2", "c3"), ArrayType(StringType, containsNull = false))
@@ -305,6 +326,33 @@ class HigherOrderFunctionsSuite extends SparkFunSuite with ExpressionEvalHelper 
       Seq(Seq(1, 3), null, Seq(4)))
   }
 
+  test("ArrayFilter treats null predicate results as false in generated code") {
+    val input = new GenericArrayData(Array[Any](null)) {
+      override def isNullAt(ordinal: Int): Boolean = true
+      override def getBoolean(ordinal: Int): Boolean = true
+    }
+    val expr = filter(Literal(input, ArrayType(BooleanType, containsNull = true)), x => x)
+
+    checkEvaluation(expr, Seq.empty)
+  }
+
+  test("array higher order functions preserve null complex elements in generated code") {
+    val nestedType = ArrayType(IntegerType, containsNull = false)
+    val inputType = ArrayType(nestedType, containsNull = true)
+    val input = new GenericArrayData(Array[Any](
+      new GenericArrayData(Array[Any](9)),
+      new GenericArrayData(Array[Any](1)))) {
+      override def isNullAt(ordinal: Int): Boolean = ordinal == 0 || super.isNullAt(ordinal)
+      override def get(ordinal: Int, dataType: DataType): AnyRef = {
+        if (ordinal == 0) null else super.get(ordinal, dataType)
+      }
+    }
+    val literal = Literal(input, inputType)
+
+    checkEvaluation(transform(literal, x => x), Seq(null, Seq(1)))
+    checkEvaluation(filter(literal, x => x.isNull), Seq(null))
+  }
+
   test("ArrayExists") {
     def exists(expr: Expression, f: Expression => Expression): Expression = {
       val ArrayType(et, cn) = expr.dataType
@@ -319,6 +367,7 @@ class HigherOrderFunctionsSuite extends SparkFunSuite with ExpressionEvalHelper 
     val isNullOrOdd: Expression => Expression = x => x.isNull || x % 2 === 1
     val alwaysFalse: Expression => Expression = _ => Literal.FalseLiteral
     val alwaysNull: Expression => Expression = _ => Literal(null, BooleanType)
+    val isEvenFallback: Expression => Expression = x => CodegenFallbackExpr(x % 2 === 0)
 
     for (followThreeValuedLogic <- Seq(false, true)) {
       withSQLConf(SQLConf.LEGACY_ARRAY_EXISTS_FOLLOWS_THREE_VALUED_LOGIC.key
@@ -335,6 +384,7 @@ class HigherOrderFunctionsSuite extends SparkFunSuite with ExpressionEvalHelper 
         checkEvaluation(exists(ain, isNullOrOdd), null)
         checkEvaluation(exists(ain, alwaysFalse), null)
         checkEvaluation(exists(ain, alwaysNull), null)
+        checkEvaluation(exists(ai0, isEvenFallback), true)
       }
     }
 
@@ -381,6 +431,7 @@ class HigherOrderFunctionsSuite extends SparkFunSuite with ExpressionEvalHelper 
     val isNullOrOdd: Expression => Expression = x => x.isNull || x % 2 === 1
     val alwaysFalse: Expression => Expression = _ => Literal.FalseLiteral
     val alwaysNull: Expression => Expression = _ => Literal(null, BooleanType)
+    val isEvenFallback: Expression => Expression = x => CodegenFallbackExpr(x % 2 === 0)
 
     checkEvaluation(forall(ai0, isEven), true)
     checkEvaluation(forall(ai0, isNullOrOdd), false)
@@ -398,6 +449,8 @@ class HigherOrderFunctionsSuite extends SparkFunSuite with ExpressionEvalHelper 
     checkEvaluation(forall(ain, isNullOrOdd), null)
     checkEvaluation(forall(ain, alwaysFalse), null)
     checkEvaluation(forall(ain, alwaysNull), null)
+
+    checkEvaluation(forall(ai0, isEvenFallback), true)
 
     val as0 =
       Literal.create(Seq("a0", "a1", "a2", "a3"), ArrayType(StringType, containsNull = false))
@@ -425,6 +478,10 @@ class HigherOrderFunctionsSuite extends SparkFunSuite with ExpressionEvalHelper 
     checkEvaluation(aggregate(ai0, 0, (acc, elem) => acc + elem, acc => acc * 10), 60)
     checkEvaluation(aggregate(ai1, 0, (acc, elem) => acc + coalesce(elem, 0), acc => acc * 10), 40)
     checkEvaluation(aggregate(ai2, 0, (acc, elem) => acc + elem, acc => acc * 10), 0)
+    checkEvaluation(
+      aggregate(ai2, Literal.create(null, IntegerType),
+        (acc, elem) => coalesce(acc, 0) + elem, acc => acc.isNull),
+      true)
     checkEvaluation(aggregate(ain, 0, (acc, elem) => acc + elem, acc => acc * 10), null)
 
     val as0 = Literal.create(Seq("a", "b", "c"), ArrayType(StringType, containsNull = false))
@@ -467,8 +524,13 @@ class HigherOrderFunctionsSuite extends SparkFunSuite with ExpressionEvalHelper 
       transformKeys(transformKeys(ai0, plusOne), plusValue),
       create_map(3 -> 1, 5 -> 2, 7 -> 3, 9 -> 4))
 
-    checkExceptionInExpression[RuntimeException](
-      transformKeys(ai0, modKey), "Duplicate map key")
+    checkErrorInExpression[SparkRuntimeException](
+      transformKeys(ai0, modKey),
+      condition = "DUPLICATED_MAP_KEY",
+      parameters = Map(
+        "key" -> "1",
+        "mapKeyDedupPolicy" -> "\"spark.sql.mapKeyDedupPolicy\"")
+    )
     withSQLConf(SQLConf.MAP_KEY_DEDUP_POLICY.key -> SQLConf.MapKeyDedupPolicy.LAST_WIN.toString) {
       // Duplicated map keys will be removed w.r.t. the last wins policy.
       checkEvaluation(transformKeys(ai0, modKey), create_map(1 -> 4, 2 -> 2, 0 -> 3))
@@ -524,8 +586,9 @@ class HigherOrderFunctionsSuite extends SparkFunSuite with ExpressionEvalHelper 
     val map = transformKeys(ai0, makeMap)
     map.checkInputDataTypes() match {
       case TypeCheckResult.TypeCheckSuccess => fail("should not allow map as map key")
-      case TypeCheckResult.TypeCheckFailure(msg) =>
-        assert(msg.contains("The key of map cannot be/contain map"))
+      case TypeCheckResult.DataTypeMismatch(errorSubClass, messageParameters) =>
+        assert(errorSubClass == "INVALID_MAP_KEY_TYPE")
+        assert(messageParameters === Map("keyType" -> "\"MAP<INT, INT>\""))
     }
   }
 
@@ -833,9 +896,148 @@ class HigherOrderFunctionsSuite extends SparkFunSuite with ExpressionEvalHelper 
     assert(!mapFilter2_1.semanticEquals(mapFilter2_3))
   }
 
-  test("SPARK-36740: ArraySort should handle NaN greater then non-NaN value") {
+  test("SPARK-60508: semanticEquals between higher-order functions capturing lambda variables") {
+    val ys = Literal.create(Seq(1, 2, 3, 4, 5), ArrayType(IntegerType, containsNull = true))
+    // Variables of an enclosing lambda function with the same data type and nullability, like
+    // `x1` and `x2` of `zip_with(xs1, xs2, (x1, x2) -> ...)`.
+    val x1 = NamedLambdaVariable("x1", IntegerType, nullable = true)
+    val x2 = NamedLambdaVariable("x2", IntegerType, nullable = true)
+
+    // Every call binds fresh lambda variables, so the functions below differ in the exprIds of
+    // their own variables, which `semanticEquals` ignores, unlike the variables they capture.
+    val filter1 = filter(ys, y => y > x1)
+    assert(filter1.semanticEquals(filter(ys, y => y > x1)))
+    assert(!filter1.semanticEquals(filter(ys, y => y > x2)))
+
+    val nested1 = transform(ys, y => filter(ys, z => z > y + x1))
+    assert(nested1.semanticEquals(transform(ys, y => filter(ys, z => z > y + x1))))
+    assert(!nested1.semanticEquals(transform(ys, y => filter(ys, z => z > y + x2))))
+    assert(!nested1.semanticEquals(transform(ys, y => filter(ys, z => z > z + x1))))
+
+    // The optimizer works on a fresh copy of the plan, where every occurrence of a lambda variable
+    // has its own value.
+    Seq(filter1, nested1).foreach { e =>
+      val copied = e.freshCopyIfContainsStatefulExpression()
+      assert(copied.semanticEquals(e))
+      assert(copied.semanticHash() == e.semanticHash())
+    }
+
+    // Canonicalizing the enclosing function numbers its own variables too, without colliding with
+    // the variables of the nested functions.
+    def zipWith(f: (Expression, Expression) => Expression): Expression =
+      ZipWith(ys, ys, createLambda(IntegerType, true, IntegerType, true, f)).bind(validateBinding)
+    val zip1 = zipWith((a, b) => If(a > b, filter(ys, y => y > a), filter(ys, y => y > b)))
+    assert(zip1.semanticEquals(
+      zipWith((a, b) => If(a > b, filter(ys, y => y > a), filter(ys, y => y > b)))))
+    assert(!zip1.semanticEquals(
+      zipWith((a, b) => If(a > b, filter(ys, y => y > b), filter(ys, y => y > a)))))
+    assert(!zipWith((a, _) => transform(ys, y => y + a)).semanticEquals(
+      zipWith((_, _) => transform(ys, y => y + y))))
+    assert(zip1.canonicalized.references.isEmpty)
+
+    // The canonical exprIds of the variables bound by each lambda function, outermost first.
+    def canonicalIds(e: Expression): Seq[Seq[ExprId]] = e.canonicalized.collect {
+      case f: LambdaFunction => f.arguments.map(_.exprId)
+    }
+
+    // A free variable never equals a renamed bound variable, even with the same name and exprId.
+    val Seq(abIds) = canonicalIds(zipWith((a, _) => a + x1))
+    assert(canonicalIds(zipWith((_, b) => x1 + b)) == Seq(abIds))
+    val Seq(noneA, noneB) =
+      abIds.map(id => NamedLambdaVariable("none", IntegerType, nullable = true, exprId = id))
+    assert(!zipWith((a, _) => a + noneB).semanticEquals(zipWith((_, b) => noneA + b)))
+
+    // A free variable keeps its exprId, even when it is the canonical exprId of a variable bound
+    // by a nested function, like `y` below.
+    val Seq(_, Seq(yId)) = canonicalIds(zipWith((_, _) => filter(ys, y => y > x1)))
+    val x = NamedLambdaVariable("x", IntegerType, nullable = true, exprId = yId)
+    val zip2 = zipWith((_, _) => filter(ys, y => y > x))
+    assert(canonicalIds(zip2).last == Seq(yId))
+    assert(zip2.canonicalized.collect {
+      case l: NamedLambdaVariable if l.name == "x" => l.exprId
+    } == Seq(yId))
+  }
+
+  test("SPARK-36740: ArraySort should handle NaN greater than non-NaN value") {
     checkEvaluation(arraySort(
       Literal.create(Seq(Double.NaN, 1d, 2d, null), ArrayType(DoubleType))),
       Seq(1d, 2d, Double.NaN, null))
   }
+
+  test("SPARK-39419: ArraySort should throw an exception when the comparator returns null") {
+    val comparator = {
+      val comp = ArraySort.comparator _
+      (left: Expression, right: Expression) =>
+        If(comp(left, right) === 0, Literal.create(null, IntegerType), comp(left, right))
+    }
+
+    withSQLConf(
+        SQLConf.LEGACY_ALLOW_NULL_COMPARISON_RESULT_IN_ARRAY_SORT.key -> "false") {
+      checkErrorInExpression[SparkException](
+        expression = arraySort(Literal.create(Seq(3, 1, 1, 2)), comparator),
+        condition = "COMPARATOR_RETURNS_NULL",
+        parameters = Map("firstValue" -> "1", "secondValue" -> "1")
+      )
+    }
+
+    withSQLConf(
+        SQLConf.LEGACY_ALLOW_NULL_COMPARISON_RESULT_IN_ARRAY_SORT.key -> "true") {
+      checkEvaluation(arraySort(Literal.create(Seq(3, 1, 1, 2)), comparator),
+        Seq(1, 1, 2, 3))
+    }
+  }
+
+  test("Return type of the given function has to be IntegerType") {
+    val comparator = {
+      val comp = ArraySort.comparator _
+      (left: Expression, right: Expression) => Literal.create("hello", StringType)
+    }
+
+    val result = arraySort(Literal.create(Seq(3, 1, 1, 2)), comparator).checkInputDataTypes()
+    assert(result == DataTypeMismatch(
+      errorSubClass = "UNEXPECTED_RETURN_TYPE",
+      messageParameters = Map(
+        "functionName" -> toSQLId("lambdafunction"),
+        "expectedType" -> toSQLType(IntegerType),
+        "actualType" -> toSQLType(StringType)
+      )))
+  }
+
+  test("NamedLambdaVariable is stateful and produces a fresh copy") {
+    val lv = NamedLambdaVariable("x", IntegerType, nullable = false)
+    assert(lv.stateful, "NamedLambdaVariable.stateful should be true")
+    val copy = lv.freshCopyIfContainsStatefulExpression()
+    assert(copy ne lv,
+      "freshCopyIfContainsStatefulExpression should return a new instance for NamedLambdaVariable")
+    assert(copy.asInstanceOf[NamedLambdaVariable].value ne lv.value,
+      "fresh copy should have an independent AtomicReference value")
+  }
+
+  test("SPARK-60760: The generated code does not hold the names of lambda variables") {
+    val name = "lambdaName*/b"
+    def v(): NamedLambdaVariable = NamedLambdaVariable(name, IntegerType, nullable = false)
+    val array = Literal.create(Seq(1, 2), ArrayType(IntegerType, containsNull = false))
+    val (e1, i1, e2, i2, e3, e4, e5, acc1, acc2) = (v(), v(), v(), v(), v(), v(), v(), v(), v())
+    Seq[(Expression, Any)](
+      ArrayTransform(array, LambdaFunction(e1 + i1, Seq(e1, i1))) -> Seq(1, 3),
+      ArrayFilter(array, LambdaFunction(e2 > i2, Seq(e2, i2))) -> Seq(1, 2),
+      ArrayExists(array, LambdaFunction(e3 > 1, Seq(e3))) -> true,
+      ArrayForAll(array, LambdaFunction(e4 > 0, Seq(e4))) -> true,
+      ArrayAggregate(array, Literal(0), LambdaFunction(acc1 + e5, Seq(acc1, e5)),
+        LambdaFunction(acc2, Seq(acc2))) -> 3
+    ).foreach { case (expr, expected) =>
+      checkEvaluation(expr, expected)
+      val code = expr.genCode(new CodegenContext).code.toString
+      assert(!code.contains("lambdaName"))
+    }
+  }
+}
+
+case class CodegenFallbackExpr(child: Expression) extends UnaryExpression with CodegenFallback {
+  override def nullable: Boolean = child.nullable
+  override def dataType: DataType = child.dataType
+  override lazy val resolved = child.resolved
+  override def eval(input: InternalRow): Any = child.eval(input)
+  override protected def withNewChildInternal(newChild: Expression): CodegenFallbackExpr =
+    copy(child = newChild)
 }

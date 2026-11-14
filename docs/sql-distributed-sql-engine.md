@@ -40,23 +40,23 @@ specify Hive properties. You may run `./sbin/start-thriftserver.sh --help` for a
 all available options. By default, the server listens on localhost:10000. You may override this
 behaviour via either environment variables, i.e.:
 
-{% highlight bash %}
+```bash
 export HIVE_SERVER2_THRIFT_PORT=<listening-port>
 export HIVE_SERVER2_THRIFT_BIND_HOST=<listening-host>
 ./sbin/start-thriftserver.sh \
   --master <master-uri> \
   ...
-{% endhighlight %}
+```
 
 or system properties:
 
-{% highlight bash %}
+```bash
 ./sbin/start-thriftserver.sh \
   --hiveconf hive.server2.thrift.port=<listening-port> \
   --hiveconf hive.server2.thrift.bind.host=<listening-host> \
-  --master <master-uri>
+  --master <master-uri> \
   ...
-{% endhighlight %}
+```
 
 Now you can use beeline to test the Thrift JDBC/ODBC server:
 
@@ -83,19 +83,22 @@ Use the following setting to enable HTTP mode as system property or in `hive-sit
 
 To test, use beeline to connect to the JDBC/ODBC server in http mode with:
 
-    beeline> !connect jdbc:hive2://<host>:<port>/<database>?hive.server2.transport.mode=http;hive.server2.thrift.http.path=<http_endpoint>
+    beeline> !connect jdbc:hive2://<host>:<port>/<database>;transportMode=http;httpPath=<http_endpoint>
 
-If you closed a session and do CTAS, you must set `fs.%s.impl.disable.cache` to true in `hive-site.xml`.
-See more details in [[SPARK-21067]](https://issues.apache.org/jira/browse/SPARK-21067).
+If you closed a session and do CTAS, you must set `fs.<scheme>.impl.disable.cache` to `true` in `hive-site.xml`. `<scheme>` is the Hadoop filesystem you are using, like `hdfs`, `s3a`, etc. For example:
+
+    fs.hdfs.impl.disable.cache=true
+
+See more details in [SPARK-21067](https://issues.apache.org/jira/browse/SPARK-21067).
+
+To stop the Thrift JDBC/ODBC server, run:
+
+    ./sbin/stop-thriftserver.sh
 
 ## Running the Spark SQL CLI
 
-The Spark SQL CLI is a convenient tool to run the Hive metastore service in local mode and execute
-queries input from the command line. Note that the Spark SQL CLI cannot talk to the Thrift JDBC server.
-
-To start the Spark SQL CLI, run the following in the Spark directory:
+To use the Spark SQL command line interface (CLI) from the shell:
 
     ./bin/spark-sql
 
-Configuration of Hive is done by placing your `hive-site.xml`, `core-site.xml` and `hdfs-site.xml` files in `conf/`.
-You may run `./bin/spark-sql --help` for a complete list of all available options.
+For details, please refer to [Spark SQL CLI](sql-distributed-sql-engine-spark-sql-cli.html).

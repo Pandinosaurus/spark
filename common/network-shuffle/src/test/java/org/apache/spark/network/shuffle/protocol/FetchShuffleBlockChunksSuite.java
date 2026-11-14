@@ -19,10 +19,12 @@ package org.apache.spark.network.shuffle.protocol;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
 
-import static org.junit.Assert.*;
+import static org.junit.jupiter.api.Assertions.*;
+
+import org.apache.spark.network.protocol.Encoders;
 
 public class FetchShuffleBlockChunksSuite {
 
@@ -30,13 +32,26 @@ public class FetchShuffleBlockChunksSuite {
   public void testFetchShuffleBlockChunksEncodeDecode() {
     FetchShuffleBlockChunks shuffleBlockChunks =
       new FetchShuffleBlockChunks("app0", "exec1", 0, 0, new int[] {0}, new int[][] {{0, 1}});
-    Assert.assertEquals(2, shuffleBlockChunks.getNumBlocks());
+    Assertions.assertEquals(2, shuffleBlockChunks.getNumBlocks());
     int len = shuffleBlockChunks.encodedLength();
-    Assert.assertEquals(49, len);
+    Assertions.assertEquals(49, len);
     ByteBuf buf = Unpooled.buffer(len);
     shuffleBlockChunks.encode(buf);
 
     FetchShuffleBlockChunks decoded = FetchShuffleBlockChunks.decode(buf);
     assertEquals(shuffleBlockChunks, decoded);
+  }
+
+  @Test
+  public void testDecodeRejectsCountExceedingReceivedBytes() {
+    // Decode must reject the count rather than allocate an array of the claimed size.
+    ByteBuf buf = Unpooled.buffer(64);
+    Encoders.Strings.encode(buf, "app0");
+    Encoders.Strings.encode(buf, "exec1");
+    buf.writeInt(0); // shuffleId
+    buf.writeInt(0); // shuffleMergeId
+    Encoders.IntArrays.encode(buf, new int[] {0});
+    buf.writeInt(Integer.MAX_VALUE); // chunkIds count
+    assertThrows(IndexOutOfBoundsException.class, () -> FetchShuffleBlockChunks.decode(buf));
   }
 }

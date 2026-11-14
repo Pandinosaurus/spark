@@ -17,10 +17,9 @@
 
 package org.apache.spark.sql.catalyst.optimizer
 
-import org.apache.spark.sql.catalyst.analysis.PullOutNondeterministic
-import org.apache.spark.sql.catalyst.expressions.{AliasHelper, AttributeSet}
+import org.apache.spark.sql.catalyst.expressions.{AliasHelper, Attribute, AttributeSet, Expression, ExpressionSet}
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, LogicalPlan}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.AGGREGATE
 
@@ -31,31 +30,22 @@ import org.apache.spark.sql.catalyst.trees.TreePattern.AGGREGATE
 object RemoveRedundantAggregates extends Rule[LogicalPlan] with AliasHelper {
   def apply(plan: LogicalPlan): LogicalPlan = plan.transformUpWithPruning(
     _.containsPattern(AGGREGATE), ruleId) {
-    case upper @ Aggregate(_, _, lower: Aggregate) if isLowerRedundant(upper, lower) =>
-      val aliasMap = getAliasMap(lower)
-
-      val newAggregate = upper.copy(
-        child = lower.child,
-        groupingExpressions = upper.groupingExpressions.map(replaceAlias(_, aliasMap)),
-        aggregateExpressions = upper.aggregateExpressions.map(
-          replaceAliasButKeepName(_, aliasMap))
-      )
-
-      // We might have introduces non-deterministic grouping expression
-      if (newAggregate.groupingExpressions.exists(!_.deterministic)) {
-        PullOutNondeterministic.applyLocally.applyOrElse(newAggregate, identity[LogicalPlan])
-      } else {
-        newAggregate
-      }
+    case upper @ Aggregate(_, _, lower: Aggregate, _) if isLowerRedundant(upper, lower) =>
+      val projectList = lower.aggregateExpressions.filter(upper.references.contains(_))
+      upper.copy(child = Project(projectList, lower.child))
+    case agg @ Aggregate(groupingExps, _, child, _)
+        if agg.groupOnly && child.distinctKeys.exists(_.subsetOf(ExpressionSet(groupingExps))) &&
+          !NormalizeFloatingNumbers.readsNormalizedKeys(agg, agg.aggregateExpressions) =>
+      Project(agg.aggregateExpressions, child)
   }
 
   private def isLowerRedundant(upper: Aggregate, lower: Aggregate): Boolean = {
     val upperHasNoDuplicateSensitiveAgg = upper
       .aggregateExpressions
-      .forall(expr => expr.find {
+      .forall(expr => !expr.exists {
         case ae: AggregateExpression => isDuplicateSensitive(ae)
-        case e => AggregateExpression.isAggregate(e)
-      }.isEmpty)
+        case _ => false
+      })
 
     lazy val upperRefsOnlyDeterministicNonAgg = upper.references.subsetOf(AttributeSet(
       lower
@@ -65,7 +55,35 @@ object RemoveRedundantAggregates extends Rule[LogicalPlan] with AliasHelper {
         .map(_.toAttribute)
     ))
 
-    upperHasNoDuplicateSensitiveAgg && upperRefsOnlyDeterministicNonAgg
+    // If the lower aggregation is global, it is not redundant because a project with
+    // non-aggregate expressions is different with global aggregation in semantics.
+    // E.g., if the input relation is empty, a project might be optimized to an empty
+    // relation, while a global aggregation will return a single row.
+    lazy val lowerIsGlobalAgg = lower.groupingExpressions.isEmpty
+
+    // The lower aggregation outputs its float/double grouping keys normalized, so it is not
+    // redundant if the upper aggregation would read them raw without it: through an output computed
+    // from a key, or inside an aggregate function or a computed grouping expression. A key the
+    // upper aggregation groups by directly is normalized by it. Streaming plans keep the previous
+    // behavior, see NormalizeFloatingNumbers.readsNormalizedKeys.
+    lazy val upperReadsNormalizedKeys = !lower.isStreaming && {
+      val keys = NormalizeFloatingNumbers.normalizedKeys(lower)
+      val (keyOutputs, otherOutputs) = lower.aggregateExpressions
+        .filter(upper.references.contains(_))
+        .partition(output => keys.exists(_.semanticEquals(trimAliases(output))))
+      val keyAttributes = AttributeSet(keyOutputs.map(_.toAttribute))
+      def readsKey(e: Expression): Boolean = e.references.intersect(keyAttributes).nonEmpty
+      NormalizeFloatingNumbers.readsNormalizedKeys(lower, otherOutputs) ||
+        keyAttributes.nonEmpty && (
+          upper.groupingExpressions.exists(g => !g.isInstanceOf[Attribute] && readsKey(g)) ||
+          upper.aggregateExpressions.exists(_.exists {
+            case ae: AggregateExpression => readsKey(ae)
+            case _ => false
+          }))
+    }
+
+    upperHasNoDuplicateSensitiveAgg && upperRefsOnlyDeterministicNonAgg && !lowerIsGlobalAgg &&
+      !upperReadsNormalizedKeys
   }
 
   private def isDuplicateSensitive(ae: AggregateExpression): Boolean = {

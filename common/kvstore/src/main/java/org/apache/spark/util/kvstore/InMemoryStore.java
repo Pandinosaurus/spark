@@ -24,6 +24,7 @@ import java.util.Iterator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.function.BiConsumer;
@@ -31,10 +32,8 @@ import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import com.google.common.base.Objects;
-import com.google.common.base.Preconditions;
-
 import org.apache.spark.annotation.Private;
+import org.apache.spark.network.util.JavaUtils;
 
 /**
  * Implementation of KVStore that keeps data deserialized in memory. This store does not index
@@ -66,11 +65,19 @@ public class InMemoryStore implements KVStore {
   @Override
   public long count(Class<?> type, String index, Object indexedValue) throws Exception {
     InstanceList<?> list = inMemoryLists.get(type);
+    if (list == null) {
+      // The type has never been written, so there are no matching entities. Still validate
+      // the index name (via reflection on the type) before returning, so that an unknown
+      // index fails the same way it does for a populated type and for the LevelDB/RocksDB
+      // stores, instead of being silently swallowed.
+      new KVTypeInfo(type).getAccessor(index);
+      return 0;
+    }
     int count = 0;
     Object comparable = asKey(indexedValue);
     KVTypeInfo.Accessor accessor = list.getIndexAccessor(index);
     for (Object o : view(type)) {
-      if (Objects.equal(comparable, asKey(accessor.get(o)))) {
+      if (Objects.equals(comparable, asKey(accessor.get(o)))) {
         count++;
       }
     }
@@ -242,7 +249,10 @@ public class InMemoryStore implements KVStore {
         // delete them from `data`.
         for (Object indexValue : indexValues) {
           Comparable<Object> parentKey = asKey(indexValue);
-          NaturalKeys children = parentToChildrenMap.getOrDefault(parentKey, new NaturalKeys());
+          NaturalKeys children = parentToChildrenMap.get(parentKey);
+          if (children == null) {
+            continue;
+          }
           for (Comparable<Object> naturalKey : children.keySet()) {
             data.remove(naturalKey);
             count ++;
@@ -406,7 +416,10 @@ public class InMemoryStore implements KVStore {
           // If there is a parent index for the natural index and the parent of `index` happens to
           // be it, Spark can use the `parentToChildrenMap` to get the related natural keys, and
           // then copy them from `data`.
-          NaturalKeys children = parentToChildrenMap.getOrDefault(parentKey, new NaturalKeys());
+          NaturalKeys children = parentToChildrenMap.get(parentKey);
+          if (children == null) {
+            return new ArrayList<>();
+          }
           ArrayList<T> elements = new ArrayList<>();
           for (Comparable<Object> naturalKey : children.keySet()) {
             data.computeIfPresent(naturalKey, (k, v) -> {
@@ -419,7 +432,7 @@ public class InMemoryStore implements KVStore {
           // Go through all the values in `data` and collect all the objects has certain parent
           // value. This can be slow when there is a large number of entries in `data`.
           KVTypeInfo.Accessor parentGetter = ti.getParentAccessor(index);
-          Preconditions.checkArgument(parentGetter != null, "Parent filter for non-child index.");
+          JavaUtils.checkArgument(parentGetter != null, "Parent filter for non-child index.");
           return data.values().stream()
             .filter(e -> compare(e, parentGetter, parentKey) == 0)
             .collect(Collectors.toList());
@@ -466,11 +479,6 @@ public class InMemoryStore implements KVStore {
     @Override
     public T next() {
       return iter.next();
-    }
-
-    @Override
-    public void remove() {
-      throw new UnsupportedOperationException();
     }
 
     @Override

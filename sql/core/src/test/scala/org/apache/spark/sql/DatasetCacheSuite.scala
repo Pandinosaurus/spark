@@ -17,18 +17,25 @@
 
 package org.apache.spark.sql
 
+import java.time.LocalTime
+
 import org.scalatest.concurrent.TimeLimits
 import org.scalatest.time.SpanSugar._
 
+import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.sql.catalyst.plans.physical.ClusteredDistribution
+import org.apache.spark.sql.execution.ColumnarToRowExec
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.columnar.{InMemoryRelation, InMemoryTableScanExec}
 import org.apache.spark.sql.functions._
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.types.Metadata
 import org.apache.spark.storage.StorageLevel
+import org.apache.spark.tags.SlowSQLTest
 
-
-class DatasetCacheSuite extends QueryTest
-  with SharedSparkSession
+@SlowSQLTest
+class DatasetCacheSuite extends SharedSparkSession
   with TimeLimits
   with AdaptiveSparkPlanHelper {
   import testImplicits._
@@ -250,7 +257,7 @@ class DatasetCacheSuite extends QueryTest
       case i: InMemoryRelation => i.cacheBuilder.cachedPlan
     }
     assert(df2LimitInnerPlan.isDefined &&
-      df2LimitInnerPlan.get.find(_.isInstanceOf[InMemoryTableScanExec]).isEmpty)
+      !df2LimitInnerPlan.get.exists(_.isInstanceOf[InMemoryTableScanExec]))
   }
 
   test("SPARK-27739 Save stats from optimized plan") {
@@ -271,5 +278,128 @@ class DatasetCacheSuite extends QueryTest
             df.sparkSession.sessionState.conf.defaultSizeInBytes)
       }
     }
+  }
+
+  test("SPARK-44653: non-trivial DataFrame unions should not break caching") {
+    val df1 = Seq(1 -> 1).toDF("i", "j")
+    val df2 = Seq(2 -> 2).toDF("i", "j")
+    val df3 = Seq(3 -> 3).toDF("i", "j")
+
+    withSQLConf(SQLConf.CAN_CHANGE_CACHED_PLAN_OUTPUT_PARTITIONING.key -> "false") {
+      withClue("positive: union by position") {
+        val unionDf = df1.union(df2).select($"i")
+        unionDf.cache()
+        val finalDf = unionDf.union(df3.select($"i"))
+        assert(finalDf.queryExecution.executedPlan.exists(_.isInstanceOf[InMemoryTableScanExec]))
+      }
+
+      withClue("positive: union by name") {
+        val unionDf = df1.unionByName(df2).select($"i")
+        unionDf.cache()
+        val finalDf = unionDf.unionByName(df3.select($"i"))
+        assert(finalDf.queryExecution.executedPlan.exists(_.isInstanceOf[InMemoryTableScanExec]))
+      }
+
+      withClue("negative: union by position") {
+        val unionDf = df1.union(df2)
+        unionDf.cache()
+        val finalDf = unionDf.union(df3)
+        // It's by design to break caching here.
+        assert(!finalDf.queryExecution.executedPlan.exists(_.isInstanceOf[InMemoryTableScanExec]))
+      }
+
+      withClue("negative: union by name") {
+        val unionDf = df1.unionByName(df2)
+        unionDf.cache()
+        val finalDf = unionDf.unionByName(df3)
+        // It's by design to break caching here.
+        assert(!finalDf.queryExecution.executedPlan.exists(_.isInstanceOf[InMemoryTableScanExec]))
+      }
+    }
+  }
+
+  test("SPARK-50682: inner Alias should be canonicalized") {
+    // Put a metadata in the Alias so that it won't be removed by the analyzer.
+    val metadata = Metadata.fromJson("""{"k": "v"}""")
+    val df1 = spark.range(5).select(struct($"id".as("name", metadata)))
+    df1.cache()
+    // This is exactly the same as df1.
+    val df2 = spark.range(5).select(struct($"id".as("name", metadata)))
+    assert(df2.queryExecution.executedPlan.exists(_.isInstanceOf[InMemoryTableScanExec]))
+
+    val metadata2 = Metadata.fromJson("""{"k2": "v2"}""")
+    // Same with df1 except for the Alias metadata
+    val df3 = spark.range(5).select(struct($"id".as("name", metadata2)))
+    assert(!df3.queryExecution.executedPlan.exists(_.isInstanceOf[InMemoryTableScanExec]))
+  }
+
+  test("SPARK-53418: Handle TimeType in ColumnAccessor") {
+    val plan = spark.sql("SELECT TIME '13:33:33'").cache().queryExecution.sparkPlan
+    val value = ColumnarToRowExec(plan).executeCollectPublic().head.get(0)
+    assert(value == LocalTime.of(13, 33, 33))
+  }
+
+  test("SPARK-54812: SHOW TABLES should be a no-op.") {
+    val t1 = "show_tables_test_t1"
+    val t2 = "show_tables_test_t2"
+    withTable(t1, t2) {
+      // Create initial table
+      sql(s"CREATE TABLE $t1 (c1 int) USING parquet")
+
+      // Run SHOW TABLES and save to a DataFrame
+      val showTablesDf = sql("SHOW TABLES")
+
+      // Add another table after creating the DataFrame
+      sql(s"CREATE TABLE $t2 (c1 int) USING parquet")
+
+      // Cache the DataFrame - this should reflect the latest state
+      showTablesDf.cache()
+
+      // Verify cached result reflects the latest state (includes t2)
+      val cachedTables = showTablesDf.select("tableName").collect().map(_.getString(0)).toSet
+      assert(cachedTables.contains(t1))
+      assert(!cachedTables.contains(t2))
+
+      // A fresh SHOW TABLES call should also show both tables
+      val freshShowTablesDf = sql("SHOW TABLES")
+      val freshTables = freshShowTablesDf.select("tableName").collect().map(_.getString(0)).toSet
+      assert(freshTables.contains(t1))
+      assert(freshTables.contains(t2))
+    }
+  }
+
+  test("SPARK-61326: cache should not report the partitioning and the ordering over the columns " +
+      "it does not output") {
+    val src = spark.range(0, 16, 1, 4)
+    // A typed `map` reports the partitioning of its input, which is not in its output.
+    val c1 = src.as[Long].map(x => x).toDF().cache()
+    val agg = broadcast(src).join(c1, src("id") % 2 === c1("value") % 2)
+      .groupBy(src("id")).count()
+    checkAnswer(agg, (0L until 16L).map(Row(_, 8L)))
+
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+      // A scan of a cached join pruned to `b` reports the partitioning and the ordering over `a`
+      // as well, so the cache of that scan does.
+      val a = src.select($"id".as("a"))
+      val b = src.select($"id".as("b"))
+      val c2 = a.join(b, $"a" === $"b").cache().select($"b").cache()
+      c2.collect()
+      val scan = collectFirst(c2.queryExecution.executedPlan) {
+        case s: InMemoryTableScanExec => s
+      }.get
+      assert(scan.outputPartitioning.satisfies(ClusteredDistribution(scan.output)))
+      assert(scan.outputPartitioning.asInstanceOf[Expression].references === scan.outputSet)
+      assert(scan.outputOrdering.map(_.references) === Seq(scan.outputSet))
+    }
+
+    // A scan of a cache sorted by `a` and `b` pruned to `b` reports the ordering by `a` and `b`,
+    // which the cache of that scan cannot report even partially.
+    val c3 = src.select($"id".as("a"), ($"id" % 2).as("b"))
+      .sortWithinPartitions("a", "b").cache().select($"b").cache()
+    c3.collect()
+    val ordering = collectFirst(c3.queryExecution.executedPlan) {
+      case s: InMemoryTableScanExec => s.outputOrdering
+    }.get
+    assert(ordering.isEmpty)
   }
 }

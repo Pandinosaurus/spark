@@ -31,6 +31,18 @@ import org.apache.spark.internal.config.Tests.TEST_NO_STAGE_RETRY
 
 class BarrierTaskContextSuite extends SparkFunSuite with LocalSparkContext with Eventually {
 
+  // Upper bound (in millis) on the wall-clock skew we tolerate between tasks right after a
+  // `barrier()` / `allGather()` global sync returns. The sync releases all tasks together, but
+  // each task only observes the release the next time `BarrierTaskContext.runBarrier` wakes from
+  // its `Thread.sleep(1000)` polling loop, so two tasks can record `System.currentTimeMillis()`
+  // up to ~1s apart from the poll granularity alone -- before adding thread-scheduling and GC
+  // jitter on a busy CI host. The historical `<= 1000` bound left no room for that and flaked on
+  // slower runners (e.g. macOS 26 arm64 observed 1078ms; SPARK-49983 earlier observed 1038ms).
+  // Use twice the poll interval plus a jitter allowance; the test still asserts the two rounds
+  // stay loosely in lockstep (a task cannot race a whole extra sync ahead) without coupling to a
+  // razor-thin wall-clock margin.
+  private val maxSyncSkewMs = 3000
+
   def initLocalClusterSparkContext(numWorker: Int = 4, conf: SparkConf = new SparkConf()): Unit = {
     conf
       // Init local cluster here so each barrier task runs in a separated process, thus `barrier()`
@@ -55,7 +67,7 @@ class BarrierTaskContextSuite extends SparkFunSuite with LocalSparkContext with 
 
     val times = rdd2.collect()
     // All the tasks shall finish global sync within a short time slot.
-    assert(times.max - times.min <= 1000)
+    assert(times.max - times.min <= maxSyncSkewMs)
   }
 
   test("share messages with allGather() call") {
@@ -81,7 +93,7 @@ class BarrierTaskContextSuite extends SparkFunSuite with LocalSparkContext with 
     val rdd = sc.makeRDD(1 to 10, 4)
     val rdd2 = rdd.barrier().mapPartitions { it =>
       val context = BarrierTaskContext.get()
-      val partitionId = context.partitionId
+      val partitionId = context.partitionId()
       if (partitionId == 0) {
         context.barrier()
       } else {
@@ -101,7 +113,7 @@ class BarrierTaskContextSuite extends SparkFunSuite with LocalSparkContext with 
     val rdd2 = rdd.barrier().mapPartitions { it =>
       val context = BarrierTaskContext.get()
       // Sleep for a random time before global sync.
-      Thread.sleep(Random.nextInt(1000))
+      Thread.sleep(Random.nextInt(500))
       context.barrier()
       val time1 = System.currentTimeMillis()
       // Sleep for a random time before global sync.
@@ -115,11 +127,11 @@ class BarrierTaskContextSuite extends SparkFunSuite with LocalSparkContext with 
     val times = rdd2.collect()
     // All the tasks shall finish the first round of global sync within a short time slot.
     val times1 = times.map(_._1)
-    assert(times1.max - times1.min <= 1000)
+    assert(times1.max - times1.min <= maxSyncSkewMs)
 
     // All the tasks shall finish the second round of global sync within a short time slot.
     val times2 = times.map(_._2)
-    assert(times2.max - times2.min <= 1000)
+    assert(times2.max - times2.min <= maxSyncSkewMs)
   }
 
   test("support multiple barrier() call within a single task") {
@@ -141,11 +153,11 @@ class BarrierTaskContextSuite extends SparkFunSuite with LocalSparkContext with 
     val times = rdd2.collect()
     // All the tasks shall finish the first round of global sync within a short time slot.
     val times1 = times.map(_._1)
-    assert(times1.max - times1.min <= 1000)
+    assert(times1.max - times1.min <= maxSyncSkewMs)
 
     // All the tasks shall finish the second round of global sync within a short time slot.
     val times2 = times.map(_._2)
-    assert(times2.max - times2.min <= 1000)
+    assert(times2.max - times2.min <= maxSyncSkewMs)
   }
 
   test("throw exception on barrier() call timeout") {
@@ -155,7 +167,7 @@ class BarrierTaskContextSuite extends SparkFunSuite with LocalSparkContext with 
     val rdd2 = rdd.barrier().mapPartitions { it =>
       val context = BarrierTaskContext.get()
       // Task 3 shall sleep 2000ms to ensure barrier() call timeout
-      if (context.taskAttemptId == 3) {
+      if (context.taskAttemptId() == 3) {
         Thread.sleep(2000)
       }
       context.barrier()
@@ -175,7 +187,7 @@ class BarrierTaskContextSuite extends SparkFunSuite with LocalSparkContext with 
     val rdd = sc.makeRDD(1 to 10, 4)
     val rdd2 = rdd.barrier().mapPartitions { it =>
       val context = BarrierTaskContext.get()
-      if (context.taskAttemptId != 0) {
+      if (context.taskAttemptId() != 0) {
         context.barrier()
       }
       it
@@ -195,7 +207,7 @@ class BarrierTaskContextSuite extends SparkFunSuite with LocalSparkContext with 
     val rdd2 = rdd.barrier().mapPartitions { it =>
       val context = BarrierTaskContext.get()
       try {
-        if (context.taskAttemptId == 0) {
+        if (context.taskAttemptId() == 0) {
           // Due to some non-obvious reason, the code can trigger an Exception and skip the
           // following statements within the try ... catch block, including the first barrier()
           // call.
@@ -367,4 +379,27 @@ class BarrierTaskContextSuite extends SparkFunSuite with LocalSparkContext with 
     // double check we kill task success
     assert(System.currentTimeMillis() - startTime < 5000)
   }
+
+  test("SPARK-40932, messages of allGather should not been overridden " +
+    "by the following barrier APIs") {
+
+    sc = new SparkContext(new SparkConf().setAppName("test").setMaster("local[2]"))
+    sc.setLogLevel("INFO")
+    val rdd = sc.makeRDD(1 to 10, 2)
+    val rdd2 = rdd.barrier().mapPartitions { it =>
+      val context = BarrierTaskContext.get()
+      // Sleep for a random time before global sync.
+      Thread.sleep(Random.nextInt(1000))
+      // Pass partitionId message in
+      val message: String = context.partitionId().toString
+      val messages: Array[String] = context.allGather(message)
+      context.barrier()
+      Iterator.single(messages.toList)
+    }
+    val messages = rdd2.collect()
+    // All the task partitionIds are shared across all tasks
+    assert(messages.length === 2)
+    assert(messages.forall(_ == List("0", "1")))
+  }
+
 }

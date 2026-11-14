@@ -20,6 +20,7 @@ package org.apache.spark.sql.catalyst.expressions.aggregate
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.trees.UnaryLike
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.catalyst.util.HyperLogLogPlusPlusHelper
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.types._
@@ -49,6 +50,12 @@ import org.apache.spark.sql.types._
   usage = """
     _FUNC_(expr[, relativeSD]) - Returns the estimated cardinality by HyperLogLog++.
       `relativeSD` defines the maximum relative standard deviation allowed.""",
+  arguments = """
+    Arguments:
+      * expr - An expression of any type whose distinct values are counted.
+      * relativeSD - An optional double literal for the maximum relative standard
+          deviation allowed. Defaults to 0.05.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(col1) FROM VALUES (1), (1), (2), (2), (3) tab(col1);
@@ -87,7 +94,7 @@ case class HyperLogLogPlusPlus(
 
   override def dataType: DataType = LongType
 
-  override def aggBufferSchema: StructType = StructType.fromAttributes(aggBufferAttributes)
+  override def aggBufferSchema: StructType = DataTypeUtils.fromAttributes(aggBufferAttributes)
 
   override def defaultResult: Option[Literal] = Option(Literal.create(0L, dataType))
 
@@ -148,6 +155,6 @@ object HyperLogLogPlusPlus {
     case Literal(d: Double, DoubleType) => d
     case Literal(dec: Decimal, _) => dec.toDouble
     case _ =>
-      throw QueryCompilationErrors.secondArgumentNotDoubleLiteralError
+      throw QueryCompilationErrors.secondArgumentNotDoubleLiteralError()
   }
 }

@@ -18,8 +18,7 @@
 from typing import List
 
 
-class ResourceInformation(object):
-
+class ResourceInformation:
     """
     Class to hold information about a type of Resource. A resource could be a GPU, FPGA, etc.
     The array of addresses are resource specific and its up to the user to interpret the address.
@@ -33,11 +32,15 @@ class ResourceInformation(object):
     name : str
         the name of the resource
     addresses : list
-        an array of strings describing the addresses of the resource
+        a list of strings describing the addresses of the resource
 
     Notes
     -----
     This API is evolving.
+
+    See Also
+    --------
+    :class:`pyspark.resource.ResourceProfile`
     """
 
     def __init__(self, name: str, addresses: List[str]):
@@ -46,8 +49,20 @@ class ResourceInformation(object):
 
     @property
     def name(self) -> str:
+        """
+        Returns
+        -------
+        str
+            the name of the resource
+        """
         return self._name
 
     @property
     def addresses(self) -> List[str]:
+        """
+        Returns
+        -------
+        list
+            a list of strings describing the addresses of the resource
+        """
         return self._addresses

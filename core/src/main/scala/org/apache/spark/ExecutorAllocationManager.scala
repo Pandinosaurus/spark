@@ -21,11 +21,13 @@ import java.util.concurrent.TimeUnit
 
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
-import scala.util.control.{ControlThrowable, NonFatal}
+import scala.concurrent.duration.FiniteDuration
+import scala.util.control.NonFatal
 
 import com.codahale.metrics.{Counter, Gauge, MetricRegistry}
 
 import org.apache.spark.internal.{config, Logging}
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.DECOMMISSION_ENABLED
 import org.apache.spark.internal.config.Tests.TEST_DYNAMIC_ALLOCATION_SCHEDULE_ENABLED
@@ -67,7 +69,9 @@ import org.apache.spark.util.{Clock, SystemClock, ThreadUtils, Utils}
  * blocks will be removed if it has been idle for more than L seconds.
  *
  * There is no retry logic in either case because we make the assumption that the cluster manager
- * will eventually fulfill all requests it receives asynchronously.
+ * will eventually fulfill all requests it receives asynchronously. The one exception is the
+ * deferred target push used while the executors are held (see `targetSyncPending`), which
+ * retries until the cluster manager acknowledges the current targets.
  *
  * The relevant Spark properties are below. Each of these properties applies separately to
  * every ResourceProfile. So if you set a minimum number of executors, that is a minimum
@@ -103,7 +107,8 @@ private[spark] class ExecutorAllocationManager(
     conf: SparkConf,
     cleaner: Option[ContextCleaner] = None,
     clock: Clock = new SystemClock(),
-    resourceProfileManager: ResourceProfileManager)
+    resourceProfileManager: ResourceProfileManager,
+    reliableShuffleStorage: Boolean)
   extends Logging {
 
   allocationManager =>
@@ -172,6 +177,28 @@ private[spark] class ExecutorAllocationManager(
   //   (2) an executor idle timeout has elapsed.
   @volatile private var initializing: Boolean = true
 
+  // Whether allocation is suspended because the executors are held. While this is true,
+  // `schedule()` is a no-op so that pending tasks do not bring up new executors.
+  // See `SparkContext.holdExecutors()`.
+  private var suspended: Boolean = false
+
+  // Whether the current executor targets still have to be pushed to the cluster manager. Set
+  // when a push from `suspend()`/`resume()` fails or is rejected (e.g. before the YARN AM has
+  // registered), and by `reset()`, which may run inside a cluster manager RPC handler where a
+  // synchronous request would self-deadlock (e.g. YARN's RegisterClusterManager). The push is
+  // performed from the allocation thread in `schedule()` and retried until acknowledged, with
+  // an exponential backoff: the conditions under which it retries (an AM restart, an
+  // unreachable cluster manager) resolve on a timescale far above the allocation tick.
+  private var targetSyncPending: Boolean = false
+
+  // Ticks to wait before the next deferred push attempt, and the delay to arm after another
+  // failure. Zero keeps the first attempt after arming `targetSyncPending` immediate.
+  private var ticksUntilTargetSync: Int = 0
+  private var targetSyncBackoffTicks: Int = 0
+
+  // Upper bound of the deferred push backoff, in ticks (10 seconds with the 100ms interval).
+  private val maxTargetSyncBackoffTicks = 100
+
   // Number of locality aware tasks for each ResourceProfile, used for executor placement.
   private var numLocalityAwareTasksPerResourceProfileId = new mutable.HashMap[Int, Int]
   numLocalityAwareTasksPerResourceProfileId(defaultProfileId) = 0
@@ -203,18 +230,30 @@ private[spark] class ExecutorAllocationManager(
       throw new SparkException(
         s"s${DYN_ALLOCATION_SUSTAINED_SCHEDULER_BACKLOG_TIMEOUT.key} must be > 0!")
     }
-    if (!conf.get(config.SHUFFLE_SERVICE_ENABLED)) {
-      // If dynamic allocation shuffle tracking or worker decommissioning along with
-      // storage shuffle decommissioning is enabled we have *experimental* support for
-      // decommissioning without a shuffle service.
-      if (conf.get(config.DYN_ALLOCATION_SHUFFLE_TRACKING_ENABLED) ||
-          (decommissionEnabled &&
-            conf.get(config.STORAGE_DECOMMISSION_SHUFFLE_BLOCKS_ENABLED))) {
-        logWarning("Dynamic allocation without a shuffle service is an experimental feature.")
+    val shuffleTrackingEnabled = conf.get(config.DYN_ALLOCATION_SHUFFLE_TRACKING_ENABLED)
+    val shuffleDecommissionEnabled = decommissionEnabled &&
+      conf.get(config.STORAGE_DECOMMISSION_SHUFFLE_BLOCKS_ENABLED)
+    if (!conf.get(config.SHUFFLE_SERVICE_ENABLED) && !reliableShuffleStorage) {
+      if (shuffleTrackingEnabled) {
+        logInfo("Dynamic allocation is enabled without a shuffle service.")
+      } else if (shuffleDecommissionEnabled) {
+        logInfo("Shuffle data decommission is enabled without a shuffle service.")
       } else if (!testing) {
-        throw new SparkException("Dynamic allocation of executors requires the external " +
-          "shuffle service. You may enable this through spark.shuffle.service.enabled.")
+        throw new SparkException("Dynamic allocation of executors requires one of the " +
+          "following conditions: 1) enabling external shuffle service through " +
+          s"${config.SHUFFLE_SERVICE_ENABLED.key}. 2) enabling shuffle tracking through " +
+          s"${DYN_ALLOCATION_SHUFFLE_TRACKING_ENABLED.key}. 3) enabling shuffle blocks " +
+          s"decommission through ${DECOMMISSION_ENABLED.key} and " +
+          s"${STORAGE_DECOMMISSION_SHUFFLE_BLOCKS_ENABLED.key}. 4) (Experimental) " +
+          s"configuring ${SHUFFLE_IO_PLUGIN_CLASS.key} to use a custom ShuffleDataIO who's " +
+          "ShuffleDriverComponents supports reliable storage.")
       }
+    }
+
+    if (shuffleTrackingEnabled && (shuffleDecommissionEnabled || reliableShuffleStorage)) {
+      logWarning("You are enabling both shuffle tracking and other DA supported mechanism, " +
+        "which will cause idle executors not to be released in a timely, " +
+        "please check the configurations.")
     }
 
     if (executorAllocationRatio > 1.0 || executorAllocationRatio <= 0.0) {
@@ -233,16 +272,7 @@ private[spark] class ExecutorAllocationManager(
     cleaner.foreach(_.attachListener(executorMonitor))
 
     val scheduleTask = new Runnable() {
-      override def run(): Unit = {
-        try {
-          schedule()
-        } catch {
-          case ct: ControlThrowable =>
-            throw ct
-          case t: Throwable =>
-            logWarning(s"Uncaught exception in thread ${Thread.currentThread().getName}", t)
-        }
-      }
+      override def run(): Unit = Utils.tryLog(schedule())
     }
 
     if (!testing || conf.get(TEST_DYNAMIC_ALLOCATION_SCHEDULE_ENABLED)) {
@@ -263,8 +293,7 @@ private[spark] class ExecutorAllocationManager(
    * Stop the allocation manager.
    */
   def stop(): Unit = {
-    executor.shutdown()
-    executor.awaitTermination(10, TimeUnit.SECONDS)
+    ThreadUtils.shutdown(executor, FiniteDuration(10, TimeUnit.SECONDS))
   }
 
   /**
@@ -277,12 +306,107 @@ private[spark] class ExecutorAllocationManager(
   def reset(): Unit = synchronized {
     addTime = 0L
     numExecutorsTargetPerResourceProfileId.keys.foreach { rpId =>
-      numExecutorsTargetPerResourceProfileId(rpId) = initialNumExecutors
+      numExecutorsTargetPerResourceProfileId(rpId) = if (suspended) 0 else initialNumExecutors
     }
     numExecutorsToAddPerResourceProfileId.keys.foreach { rpId =>
       numExecutorsToAddPerResourceProfileId(rpId) = 1
     }
     executorMonitor.reset()
+    if (suspended) {
+      // A restarted cluster manager AM may have allocated executors on its own, so the zero
+      // targets have to be pushed again. Leave that to `schedule()`: this method may run
+      // inside the cluster manager's RPC handler, where a synchronous request would
+      // self-deadlock.
+      targetSyncPending = true
+      ticksUntilTargetSync = 0
+      targetSyncBackoffTicks = 0
+    }
+  }
+
+  /**
+   * Push the current executor targets to the cluster manager and report whether the request
+   * was acknowledged, arming the `schedule()` retry otherwise.
+   */
+  private def syncTargetsWithClient(): Boolean = {
+    val acknowledged = try {
+      client.requestTotalExecutors(
+        numExecutorsTargetPerResourceProfileId.toMap,
+        numLocalityAwareTasksPerResourceProfileId.toMap,
+        rpIdToHostToLocalTaskCount)
+    } catch {
+      case NonFatal(e) =>
+        // Use INFO level to be consistent with `doUpdateRequest`: errors here are more
+        // commonly caused by YARN AM restarts, which is a recoverable issue.
+        logInfo("Error reaching cluster manager.", e)
+        false
+    }
+    if (acknowledged) {
+      targetSyncPending = false
+      ticksUntilTargetSync = 0
+      targetSyncBackoffTicks = 0
+    } else {
+      targetSyncPending = true
+      ticksUntilTargetSync = targetSyncBackoffTicks
+      targetSyncBackoffTicks =
+        math.min(maxTargetSyncBackoffTicks, math.max(1, targetSyncBackoffTicks * 2))
+    }
+    acknowledged
+  }
+
+  /**
+   * Suspend allocation and lower the executor targets of all resource profiles to zero, so that
+   * pending tasks do not bring up new executors while the executors are held. Target updates
+   * are a no-op in `schedule()` until [[resume()]] is called.
+   *
+   * @return whether the zero targets were acknowledged by the cluster manager. When false, the
+   *         push is retried from `schedule()` until acknowledged.
+   */
+  def suspend(): Boolean = synchronized {
+    if (!suspended) {
+      suspended = true
+      numExecutorsTargetPerResourceProfileId.keys.foreach { rpId =>
+        numExecutorsTargetPerResourceProfileId(rpId) = 0
+      }
+      numExecutorsToAddPerResourceProfileId.keys.foreach { rpId =>
+        numExecutorsToAddPerResourceProfileId(rpId) = 1
+      }
+      syncTargetsWithClient()
+    } else {
+      true
+    }
+  }
+
+  /**
+   * Resume allocation suspended by [[suspend()]]. The executor targets are recomputed from the
+   * current load on the next `schedule()` run.
+   *
+   * @return whether the restored targets were acknowledged by the cluster manager. When false,
+   *         the push is retried from `schedule()` until acknowledged.
+   */
+  def resume(): Boolean = synchronized {
+    if (suspended) {
+      suspended = false
+      // Restore at least the lower bound of the target: the initial warm-up requested by
+      // `start()` when no stage has been submitted yet (`updateAndSyncNumExecutorsTarget`
+      // skips it while initializing), and `minNumExecutors` otherwise, so that an idle
+      // application does not stay below the minimum until the next backlog.
+      val floor = if (initializing) initialNumExecutors else minNumExecutors
+      numExecutorsTargetPerResourceProfileId.keys.foreach { rpId =>
+        numExecutorsTargetPerResourceProfileId(rpId) =
+          math.max(numExecutorsTargetPerResourceProfileId(rpId), floor)
+      }
+      val acknowledged = syncTargetsWithClient()
+      if (!initializing && numExecutorsTargetPerResourceProfileId.keys
+          .exists(maxNumExecutorsNeededPerResourceProfile(_) > 0)) {
+        // Trigger an immediate ramp-up for the load that built up while suspended. Do not
+        // touch `addTime` otherwise: nothing resets it to NOT_SET while idle, and a stale
+        // value would let a much later backlog skip the scheduler backlog timeout.
+        addTime = clock.nanoTime()
+      }
+      acknowledged
+    } else {
+      true
+    }
   }
 
   /**
@@ -324,10 +448,6 @@ private[spark] class ExecutorAllocationManager(
     }
   }
 
-  private def totalRunningTasksPerResourceProfile(id: Int): Int = synchronized {
-    listener.totalRunningTasksPerResourceProfile(id)
-  }
-
   /**
    * This is called at a fixed interval to regulate the number of pending executor requests
    * and number of executors running.
@@ -338,6 +458,21 @@ private[spark] class ExecutorAllocationManager(
    * This is factored out into its own method for testing.
    */
   private def schedule(): Unit = synchronized {
+    if (targetSyncPending) {
+      if (ticksUntilTargetSync <= 0) {
+        // Deferred target push, retried with a backoff until acknowledged: an earlier push
+        // was rejected or failed (e.g. before the YARN AM registered), or `reset()` ran
+        // inside a cluster manager RPC handler where a synchronous request would
+        // self-deadlock. No `testing` short-circuit here: tests assert on this call through
+        // the mocked client.
+        syncTargetsWithClient()
+      } else {
+        ticksUntilTargetSync -= 1
+      }
+    }
+    if (suspended) {
+      return
+    }
     val executorIdsToBeRemoved = executorMonitor.timedOutExecutors()
     if (executorIdsToBeRemoved.nonEmpty) {
       initializing = false
@@ -424,7 +559,7 @@ private[spark] class ExecutorAllocationManager(
       updates: Map[Int, ExecutorAllocationManager.TargetNumUpdates],
       now: Long): Int = {
     // Only call cluster manager if target has changed.
-    if (updates.size > 0) {
+    if (updates.nonEmpty) {
       val requestAcknowledged = try {
         logDebug("requesting updates: " + updates)
         testing ||
@@ -447,10 +582,12 @@ private[spark] class ExecutorAllocationManager(
           val delta = targetNum.delta
           totalDelta += delta
           if (delta > 0) {
-            val executorsString = "executor" + { if (delta > 1) "s" else "" }
-            logInfo(s"Requesting $delta new $executorsString because tasks are backlogged " +
-              s"(new desired total will be ${numExecutorsTargetPerResourceProfileId(rpId)} " +
-              s"for resource profile id: ${rpId})")
+            val executorsString = log" new executor" + { if (delta > 1) log"s" else log"" }
+            logInfo(log"Requesting ${MDC(TARGET_NUM_EXECUTOR_DELTA, delta)}" +
+              executorsString + log" because tasks are backlogged " +
+              log"(new desired total will be" +
+              log" ${MDC(TARGET_NUM_EXECUTOR, numExecutorsTargetPerResourceProfileId(rpId))} " +
+              log"for resource profile id: ${MDC(RESOURCE_PROFILE_ID, rpId)})")
             numExecutorsToAddPerResourceProfileId(rpId) =
               if (delta == numExecutorsToAddPerResourceProfileId(rpId)) {
                 numExecutorsToAddPerResourceProfileId(rpId) * 2
@@ -544,8 +681,8 @@ private[spark] class ExecutorAllocationManager(
         if (testing) {
           throw new SparkException("ResourceProfile Id was UNKNOWN, this is not expected")
         }
-        logWarning(s"Not removing executor $executorIdToBeRemoved because the " +
-          "ResourceProfile was UNKNOWN!")
+        logWarning(log"Not removing executor ${MDC(EXECUTOR_IDS, executorIdToBeRemoved)} " +
+          log"because the ResourceProfile was UNKNOWN!")
       } else {
         // get the running total as we remove or initialize it to the count - pendingRemoval
         val newExecutorTotal = numExecutorsTotalPerRpId.getOrElseUpdate(rpId,
@@ -579,12 +716,11 @@ private[spark] class ExecutorAllocationManager(
       // We don't want to change our target number of executors, because we already did that
       // when the task backlog decreased.
       if (decommissionEnabled) {
-        val executorIdsWithoutHostLoss = executorIdsToBeRemoved.toSeq.map(
+        val executorIdsWithoutHostLoss = executorIdsToBeRemoved.map(
           id => (id, ExecutorDecommissionInfo("spark scale down"))).toArray
-        client.decommissionExecutors(
+        client.decommissionExecutorsIfIdle(
           executorIdsWithoutHostLoss,
-          adjustTargetNumExecutors = false,
-          triggeredByExecutor = false)
+          adjustTargetNumExecutors = false)
       } else {
         client.killExecutors(executorIdsToBeRemoved.toSeq, adjustTargetNumExecutors = false,
           countFailures = false, force = false)
@@ -605,11 +741,13 @@ private[spark] class ExecutorAllocationManager(
       } else {
         executorMonitor.executorsKilled(executorsRemoved.toSeq)
       }
-      logInfo(s"Executors ${executorsRemoved.mkString(",")} removed due to idle timeout.")
+      logInfo(log"Executors ${MDC(EXECUTOR_IDS, executorsRemoved.mkString(","))} " +
+        log"removed due to idle timeout.")
       executorsRemoved.toSeq
     } else {
-      logWarning(s"Unable to reach the cluster manager to kill executor/s " +
-        s"${executorIdsToBeRemoved.mkString(",")} or no executor eligible to kill!")
+      logWarning(log"Unable to reach the cluster manager to kill executor/s " +
+        log"${MDC(EXECUTOR_IDS, executorIdsToBeRemoved.mkString(","))} " +
+        log"or no executor eligible to kill!")
       Seq.empty[String]
     }
   }
@@ -634,7 +772,7 @@ private[spark] class ExecutorAllocationManager(
   private def onSchedulerQueueEmpty(): Unit = synchronized {
     logDebug("Clearing timer to add executors because there are no more pending tasks")
     addTime = NOT_SET
-    numExecutorsToAddPerResourceProfileId.transform { case (_, _) => 1 }
+    numExecutorsToAddPerResourceProfileId.mapValuesInPlace { case (_, _) => 1 }
   }
 
   private case class StageAttempt(stageId: Int, stageAttemptId: Int) {
@@ -654,10 +792,12 @@ private[spark] class ExecutorAllocationManager(
     // Should be 0 when no stages are active.
     private val stageAttemptToNumRunningTask = new mutable.HashMap[StageAttempt, Int]
     private val stageAttemptToTaskIndices = new mutable.HashMap[StageAttempt, mutable.HashSet[Int]]
-    // Number of speculative tasks pending/running in each stageAttempt
-    private val stageAttemptToNumSpeculativeTasks = new mutable.HashMap[StageAttempt, Int]
-    // The speculative tasks started in each stageAttempt
+    // Map from each stageAttempt to a set of running speculative task indexes
+    // TODO(SPARK-41192): We simply need an Int for this.
     private val stageAttemptToSpeculativeTaskIndices =
+      new mutable.HashMap[StageAttempt, mutable.HashSet[Int]]()
+    // Map from each stageAttempt to a set of pending speculative task indexes
+    private val stageAttemptToPendingSpeculativeTasks =
       new mutable.HashMap[StageAttempt, mutable.HashSet[Int]]
 
     private val resourceProfileIdToStageAttempt =
@@ -711,8 +851,11 @@ private[spark] class ExecutorAllocationManager(
         updateExecutorPlacementHints()
 
         if (!numExecutorsTargetPerResourceProfileId.contains(profId)) {
-          numExecutorsTargetPerResourceProfileId.put(profId, initialNumExecutors)
-          if (initialNumExecutors > 0) {
+          // While suspended, a new resource profile must start at a zero target so that the
+          // hold is not bypassed; the target is recomputed on resume.
+          numExecutorsTargetPerResourceProfileId.put(
+            profId, if (suspended) 0 else initialNumExecutors)
+          if (!suspended && initialNumExecutors > 0) {
             logDebug(s"requesting executors, rpId: $profId, initial number is $initialNumExecutors")
             // we need to trigger a schedule since we add an initial number here.
             client.requestTotalExecutors(
@@ -733,7 +876,7 @@ private[spark] class ExecutorAllocationManager(
         // because the attempt may still have running tasks,
         // even after another attempt for the stage is submitted.
         stageAttemptToNumTasks -= stageAttempt
-        stageAttemptToNumSpeculativeTasks -= stageAttempt
+        stageAttemptToPendingSpeculativeTasks -= stageAttempt
         stageAttemptToTaskIndices -= stageAttempt
         stageAttemptToSpeculativeTaskIndices -= stageAttempt
         stageAttemptToExecutorPlacementHints -= stageAttempt
@@ -744,7 +887,9 @@ private[spark] class ExecutorAllocationManager(
 
         // If this is the last stage with pending tasks, mark the scheduler queue as empty
         // This is needed in case the stage is aborted for any reason
-        if (stageAttemptToNumTasks.isEmpty && stageAttemptToNumSpeculativeTasks.isEmpty) {
+        if (stageAttemptToNumTasks.isEmpty
+          && stageAttemptToPendingSpeculativeTasks.isEmpty
+          && stageAttemptToSpeculativeTaskIndices.isEmpty) {
           allocationManager.onSchedulerQueueEmpty()
         }
       }
@@ -762,6 +907,8 @@ private[spark] class ExecutorAllocationManager(
         if (taskStart.taskInfo.speculative) {
           stageAttemptToSpeculativeTaskIndices.getOrElseUpdate(stageAttempt,
             new mutable.HashSet[Int]) += taskIndex
+          stageAttemptToPendingSpeculativeTasks
+            .get(stageAttempt).foreach(_.remove(taskIndex))
         } else {
           stageAttemptToTaskIndices.getOrElseUpdate(stageAttempt,
             new mutable.HashSet[Int]) += taskIndex
@@ -787,15 +934,14 @@ private[spark] class ExecutorAllocationManager(
         }
         if (taskEnd.taskInfo.speculative) {
           stageAttemptToSpeculativeTaskIndices.get(stageAttempt).foreach {_.remove{taskIndex}}
-          // If the previous task attempt succeeded first and it was the last task in a stage,
-          // the stage may have been removed before handing this speculative TaskEnd event.
-          if (stageAttemptToNumSpeculativeTasks.contains(stageAttempt)) {
-            stageAttemptToNumSpeculativeTasks(stageAttempt) -= 1
-          }
         }
 
         taskEnd.reason match {
-          case Success | _: TaskKilled =>
+          case Success =>
+            // Remove pending speculative task in case the normal task
+            // is finished before starting the speculative task
+            stageAttemptToPendingSpeculativeTasks.get(stageAttempt).foreach(_.remove(taskIndex))
+          case _: TaskKilled =>
           case _ =>
             if (!hasPendingTasks) {
               // If the task failed (not intentionally killed), we expect it to be resubmitted
@@ -821,9 +967,10 @@ private[spark] class ExecutorAllocationManager(
       val stageId = speculativeTask.stageId
       val stageAttemptId = speculativeTask.stageAttemptId
       val stageAttempt = StageAttempt(stageId, stageAttemptId)
+      val taskIndex = speculativeTask.taskIndex
       allocationManager.synchronized {
-        stageAttemptToNumSpeculativeTasks(stageAttempt) =
-          stageAttemptToNumSpeculativeTasks.getOrElse(stageAttempt, 0) + 1
+        stageAttemptToPendingSpeculativeTasks.getOrElseUpdate(stageAttempt,
+          new mutable.HashSet[Int]).add(taskIndex)
         allocationManager.onSchedulerBacklogged()
       }
     }
@@ -854,7 +1001,7 @@ private[spark] class ExecutorAllocationManager(
     def removeStageFromResourceProfileIfUnused(stageAttempt: StageAttempt): Unit = {
       if (!stageAttemptToNumRunningTask.contains(stageAttempt) &&
           !stageAttemptToNumTasks.contains(stageAttempt) &&
-          !stageAttemptToNumSpeculativeTasks.contains(stageAttempt) &&
+          !stageAttemptToPendingSpeculativeTasks.contains(stageAttempt) &&
           !stageAttemptToTaskIndices.contains(stageAttempt) &&
           !stageAttemptToSpeculativeTaskIndices.contains(stageAttempt)
       ) {
@@ -866,8 +1013,9 @@ private[spark] class ExecutorAllocationManager(
           // really complete and no tasks left
           resourceProfileIdToStageAttempt(rpForStage.head) -= stageAttempt
         } else {
-          logWarning(s"Should have exactly one resource profile for stage $stageAttempt," +
-              s" but have $rpForStage")
+          logWarning(log"Should have exactly one resource profile for stage " +
+            log"${MDC(STAGE_ATTEMPT, stageAttempt)}, but have " +
+            log"${MDC(RESOURCE_PROFILE_IDS, rpForStage)}")
         }
       }
     }
@@ -907,9 +1055,7 @@ private[spark] class ExecutorAllocationManager(
     }
 
     private def getPendingSpeculativeTaskSum(attempt: StageAttempt): Int = {
-      val numTotalTasks = stageAttemptToNumSpeculativeTasks.getOrElse(attempt, 0)
-      val numRunning = stageAttemptToSpeculativeTaskIndices.get(attempt).map(_.size).getOrElse(0)
-      numTotalTasks - numRunning
+      stageAttemptToPendingSpeculativeTasks.get(attempt).map(_.size).getOrElse(0)
     }
 
     /**
@@ -1007,6 +1153,8 @@ private[spark] class ExecutorAllocationManagerSource(
   registerGauge("numberMaxNeededExecutors",
     executorAllocationManager.numExecutorsTargetPerResourceProfileId.keys
       .map(executorAllocationManager.maxNumExecutorsNeededPerResourceProfile(_)).sum, 0)
+  registerGauge("numberDecommissioningExecutors",
+    executorAllocationManager.executorMonitor.decommissioningCount, 0)
 }
 
 private object ExecutorAllocationManager {

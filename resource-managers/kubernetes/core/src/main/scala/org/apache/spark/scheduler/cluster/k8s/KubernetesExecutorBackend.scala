@@ -62,11 +62,13 @@ private[spark] object KubernetesExecutorBackend extends Logging {
       backendCreateFn: (RpcEnv, Arguments, SparkEnv, ResourceProfile, String) =>
         CoarseGrainedExecutorBackend): Unit = {
 
+    Utils.resetStructuredLogging()
     Utils.initDaemon(log)
 
     SparkHadoopUtil.get.runAsSparkUser { () =>
       // Debug code
-      Utils.checkHost(arguments.hostname)
+      assert(arguments.hostname != null &&
+          (arguments.hostname.indexOf(':') == -1 || arguments.hostname.split(":").length > 2))
 
       // Bootstrap to fetch the driver's Spark properties.
       val executorConf = new SparkConf
@@ -81,7 +83,7 @@ private[spark] object KubernetesExecutorBackend extends Logging {
         clientMode = true)
 
       var driver: RpcEndpointRef = null
-      val nTries = 3
+      val nTries = sys.env.getOrElse("EXECUTOR_DRIVER_PROPS_FETCHER_MAX_ATTEMPTS", "3").toInt
       for (i <- 0 until nTries if driver == null) {
         try {
           driver = fetcher.setupEndpointRefByURI(arguments.driverUrl)
@@ -114,6 +116,10 @@ private[spark] object KubernetesExecutorBackend extends Logging {
         }
       }
 
+      // Initialize logging system again after `spark.log.structuredLogging.enabled` takes effect
+      Utils.resetStructuredLogging(driverConf)
+      Logging.uninitialize()
+
       cfg.hadoopDelegationCreds.foreach { tokens =>
         SparkHadoopUtil.get.addDelegationTokens(tokens, driverConf)
       }
@@ -121,6 +127,17 @@ private[spark] object KubernetesExecutorBackend extends Logging {
       driverConf.set(EXECUTOR_ID, execId)
       val env = SparkEnv.createExecutorEnv(driverConf, execId, arguments.bindAddress,
         arguments.hostname, arguments.cores, cfg.ioEncryptionKey, isLocal = false)
+
+      // Apply initial user credentials to the executor credential store.
+      // Uses unconditional set() rather than updateIfNewer() because the store is guaranteed
+      // null at this point (executor startup, before any RPC or task is received).
+      // Note: there is a narrow window where a renewal broadcast (vN+1) could arrive between
+      // the SparkAppConfig reply (vN) and executor registration in executorDataMap, leaving
+      // this executor on vN until vN+2. The TaskDescription path covers this case since
+      // every dispatched task carries the latest credentials.
+      cfg.userCredentials.foreach { case (version, credentials) =>
+        env.userCredentials.set(VersionedCredentials(version, credentials))
+      }
 
       val backend = backendCreateFn(env.rpcEnv, arguments, env, cfg.resourceProfile, execId)
       env.rpcEnv.setupEndpoint("Executor", backend)
@@ -157,7 +174,8 @@ private[spark] object KubernetesExecutorBackend extends Logging {
           bindAddress = value
           argv = tail
         case ("--hostname") :: value :: tail =>
-          hostname = value
+          // entrypoint.sh sets SPARK_EXECUTOR_POD_IP without '[]'
+          hostname = Utils.addBracketsIfNeeded(value)
           argv = tail
         case ("--cores") :: value :: tail =>
           cores = value.toInt

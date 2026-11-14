@@ -18,7 +18,9 @@
 package org.apache.spark.sql.catalyst.expressions.xml
 
 import org.apache.spark.SparkFunSuite
+import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.DataTypeMismatch
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.expressions.objects.Invoke
 import org.apache.spark.sql.types.StringType
 
 /**
@@ -184,6 +186,11 @@ class XPathExpressionSuite extends SparkFunSuite with ExpressionEvalHelper {
     testExpr("<a><b class='bb'>b1</b><b>b2</b><b>b3</b><c class='bb'>c1</c><c>c2</c></a>",
       "a/*[@class='bb']/text()", Seq("b1", "c1"))
 
+    checkEvaluation(
+      Coalesce(Seq(
+          GetArrayItem(XPathList(Literal("<a></a>"), Literal("a")), Literal(0)),
+          Literal("nul"))), "nul")
+
     testNullAndErrorBehavior(testExpr)
   }
 
@@ -195,7 +202,13 @@ class XPathExpressionSuite extends SparkFunSuite with ExpressionEvalHelper {
 
       // Validate that non-foldable paths are not supported.
       val nonLitPath = exprCtor(Literal("abcd"), NonFoldableLiteral("/"))
-      assert(nonLitPath.checkInputDataTypes().isFailure)
+      assert(nonLitPath.checkInputDataTypes() == DataTypeMismatch(
+        errorSubClass = "NON_FOLDABLE_INPUT",
+        messageParameters = Map(
+          "inputName" -> "`path`",
+          "inputType" -> "\"STRING\"",
+          "inputExpr" -> "\"nonfoldableliteral()\"")
+      ))
     }
 
     testExpr(XPathBoolean)
@@ -205,5 +218,27 @@ class XPathExpressionSuite extends SparkFunSuite with ExpressionEvalHelper {
     testExpr(XPathFloat)
     testExpr(XPathDouble)
     testExpr(XPathString)
+  }
+
+  test("SPARK-58209: XPathExtract is stateful and fresh copies get their own evaluator") {
+    // The evaluator owns a `UDFXPathUtil` whose parser and reader are reused across calls, so two
+    // evaluations sharing one expression instance race on them. A fresh copy must therefore carry
+    // its own evaluator in its replacement, not the one captured by the original.
+    def evaluatorOf(e: Expression): AnyRef =
+      e.asInstanceOf[XPathExtract].replacement.asInstanceOf[Invoke]
+        .targetObject.asInstanceOf[Literal].value.asInstanceOf[AnyRef]
+
+    Seq(XPathBoolean, XPathShort, XPathInt, XPathLong, XPathFloat, XPathDouble, XPathString)
+      .foreach { ctor =>
+        val expr = ctor(Literal("<a><b>1</b></a>"), Literal("a/b"))
+        assert(expr.stateful, s"${expr.prettyName}.stateful should be true")
+        val copy = expr.freshCopyIfContainsStatefulExpression()
+        assert(copy ne expr, s"${expr.prettyName} should be freshly copied")
+        assert(evaluatorOf(copy) ne evaluatorOf(expr),
+          s"a fresh copy of ${expr.prettyName} should not share the original's evaluator")
+      }
+    val copy = XPathString(Literal("<a><b>b1</b></a>"), Literal("a/b"))
+      .freshCopyIfContainsStatefulExpression()
+    checkEvaluation(copy, "b1")
   }
 }

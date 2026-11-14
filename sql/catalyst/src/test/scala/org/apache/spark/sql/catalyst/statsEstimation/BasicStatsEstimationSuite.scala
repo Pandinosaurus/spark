@@ -23,11 +23,12 @@ import org.apache.spark.sql.catalyst.analysis.ResolvedNamespace
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
 import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, AttributeMap, AttributeReference, Literal, SortOrder}
-import org.apache.spark.sql.catalyst.plans.PlanTest
+import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, Inner, PlanTest}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.connector.catalog.SupportsNamespaces
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{BooleanType, ByteType, IntegerType, LongType}
+import org.apache.spark.util.ArrayImplicits._
 
 class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
   val attribute = attr("key")
@@ -176,13 +177,52 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
         expectedStatsCboOff = rangeStats, extraConfig)
   }
 
+test("range with invalid long value") {
+  val numElements = BigInt(Long.MaxValue) - BigInt(Long.MinValue)
+  val range = Range(Long.MinValue, Long.MaxValue, 1, None)
+  val rangeAttrs = AttributeMap(range.output.map(attr =>
+    (attr, ColumnStat(
+      distinctCount = Some(numElements),
+      nullCount = Some(0),
+      maxLen = Some(LongType.defaultSize),
+      avgLen = Some(LongType.defaultSize)))))
+  val rangeStats = Statistics(
+    sizeInBytes = numElements * 8,
+    rowCount = Some(numElements),
+    attributeStats = rangeAttrs)
+  checkStats(range, rangeStats, rangeStats)
+}
+
   test("windows") {
-    val windows = plan.window(Seq(min(attribute).as('sum_attr)), Seq(attribute), Nil)
+    val windows = plan.window(Seq(min(attribute).as("sum_attr")), Seq(attribute), Nil)
     val windowsStats = Statistics(sizeInBytes = plan.size.get * (4 + 4 + 8) / (4 + 8))
     checkStats(
       windows,
       expectedStatsCboOn = windowsStats,
       expectedStatsCboOff = windowsStats)
+  }
+
+  test("offset estimation: offset < child's rowCount") {
+    val offset = Offset(Literal(2), plan)
+    checkStats(offset, Statistics(sizeInBytes = 96, rowCount = Some(8)))
+  }
+
+  test("offset estimation: offset > child's rowCount") {
+    val offset = Offset(Literal(20), plan)
+    checkStats(offset, Statistics(sizeInBytes = 1, rowCount = Some(0)))
+  }
+
+  test("offset estimation: offset = 0") {
+    val offset = Offset(Literal(0), plan)
+    // Offset is equal to zero, so Offset's stats is equal to its child's stats.
+    checkStats(offset, plan.stats.copy(attributeStats = AttributeMap(Nil)))
+  }
+
+  test("SPARK-61558: offset estimation: child's rowCount is unknown") {
+    val childStats = Statistics(sizeInBytes = 120)
+    val offset = Offset(Literal(2), DummyLogicalPlan(childStats, childStats))
+    // The number of skipped rows is unknown, so the child's size is used as an upper bound.
+    checkStats(offset, childStats)
   }
 
   test("limit estimation: limit < child's rowCount") {
@@ -216,14 +256,14 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
   }
 
   test("sample estimation") {
-    val sample = Sample(0.0, 0.5, withReplacement = false, (math.random * 1000).toLong, plan)
+    val sample = Sample(0.0, 0.5, withReplacement = false, Sample.resolveSeed(None), plan)
     checkStats(sample, Statistics(sizeInBytes = 60, rowCount = Some(5)))
 
     // Child doesn't have rowCount in stats
     val childStats = Statistics(sizeInBytes = 120)
     val childPlan = DummyLogicalPlan(childStats, childStats)
     val sample2 =
-      Sample(0.0, 0.11, withReplacement = false, (math.random * 1000).toLong, childPlan)
+      Sample(0.0, 0.11, withReplacement = false, Sample.resolveSeed(None), childPlan)
     checkStats(sample2, Statistics(sizeInBytes = 14))
   }
 
@@ -252,19 +292,24 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
 
   test("command should report a dummy stats") {
     val plan = CommentOnNamespace(
-      ResolvedNamespace(mock(classOf[SupportsNamespaces]), Array("ns")), "comment")
+      ResolvedNamespace(mock(classOf[SupportsNamespaces]),
+        Array("ns").toImmutableArraySeq), "comment")
     checkStats(
       plan,
       expectedStatsCboOn = Statistics.DUMMY,
       expectedStatsCboOff = Statistics.DUMMY)
   }
 
-  test("SPARK-35203: Improve Repartition statistics estimation") {
+  test("Improve Repartition statistics estimation") {
+    // SPARK-35203 for repartition and repartitionByExpr
+    // SPARK-37949 for rebalance
     Seq(
       RepartitionByExpression(plan.output, plan, 10),
       RepartitionByExpression(Nil, plan, None),
       plan.repartition(2),
-      plan.coalesce(3)).foreach { rep =>
+      plan.coalesce(3),
+      plan.rebalance(),
+      plan.rebalance(plan.output: _*)).foreach { rep =>
       val expectedStats = Statistics(plan.size.get, Some(plan.rowCount), plan.attributeStats)
       checkStats(
         rep,
@@ -280,7 +325,8 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
     val rowCount = Some(plan.rowCount * childrenSize)
     val attributeStats = AttributeMap(
       Seq(
-        attribute -> ColumnStat(min = Some(1), max = Some(10), nullCount = Some(0))))
+        attribute -> ColumnStat(
+          distinctCount = Some(10), min = Some(1), max = Some(10), nullCount = Some(0))))
     checkStats(
       union,
       expectedStatsCboOn = Statistics(sizeInBytes = sizeInBytes,
@@ -306,6 +352,54 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
       distinct,
       expectedStatsCboOn = Statistics(sizeInBytes, Some(plan.rowCount), plan.attributeStats),
       expectedStatsCboOff = Statistics(sizeInBytes = sizeInBytes))
+  }
+
+  test("SPARK-39851: Improve join stats estimation if one side can keep uniqueness") {
+    val brandId = attr("brand_id")
+    val classId = attr("class_id")
+    val aliasedBrandId = brandId.as("new_brand_id")
+    val aliasedClassId = classId.as("new_class_id")
+
+    val tableSize = 4059900
+    val tableRowCnt = 202995
+
+    val tbl = StatsTestPlan(
+      outputList = Seq(brandId, classId),
+      size = Some(tableSize),
+      rowCount = tableRowCnt,
+      attributeStats =
+        AttributeMap(Seq(
+          brandId -> ColumnStat(Some(858), Some(101001), Some(1016017), Some(0), Some(4), Some(4)),
+          classId -> ColumnStat(Some(16), Some(1), Some(16), Some(0), Some(4), Some(4)))))
+
+    val join = Join(
+      tbl,
+      tbl.groupBy(brandId, classId)(aliasedBrandId, aliasedClassId),
+      Inner,
+      Some(brandId === aliasedBrandId.toAttribute && classId === aliasedClassId.toAttribute),
+      JoinHint.NONE)
+
+    checkStats(
+      join,
+      expectedStatsCboOn = Statistics(4871880, Some(tableRowCnt), join.stats.attributeStats),
+      expectedStatsCboOff = Statistics(sizeInBytes = 4059900 * 2))
+  }
+
+  test("SPARK-61534: an existence join is estimated from its left side") {
+    // It outputs each of the 10 rows of `left` once, with a boolean column added. The size of
+    // `left` is twice its row count times its row width, so a size computed from the row count
+    // and the column stats, as `JoinEstimation` computes it for a left semi join, would be half.
+    val left = plan.copy(size = Some(2 * 10 * (8 + 4)))
+    val otherKey = attr("other")
+    val other = StatsTestPlan(outputList = Seq(otherKey), rowCount = 1000,
+      attributeStats = AttributeMap(Seq(otherKey -> colStat)), size = Some(1000 * (8 + 4)))
+    val exists = AttributeReference("exists", BooleanType, nullable = false)()
+    val join = Join(left, other, ExistenceJoin(exists), Some(attribute === otherKey),
+      JoinHint.NONE)
+    checkStats(join, Statistics(
+      sizeInBytes = 2 * 10 * (8 + 4 + 1),
+      rowCount = Some(10),
+      attributeStats = AttributeMap(Seq(attribute -> colStat))))
   }
 
   test("row size and column stats estimation for sort") {
@@ -340,7 +434,7 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
     checkStats(
       sort,
       expectedStatsCboOn = expectedSortStats,
-      expectedStatsCboOff = Statistics(sizeInBytes = expectedSize))
+      expectedStatsCboOff = expectedSortStats)
   }
 
   /** Check estimated stats when cbo is turned on/off. */

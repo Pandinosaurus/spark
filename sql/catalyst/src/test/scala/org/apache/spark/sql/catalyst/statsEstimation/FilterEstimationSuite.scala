@@ -25,8 +25,9 @@ import org.apache.spark.sql.catalyst.plans.LeftOuter
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.ColumnStatsMap
 import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.EstimationUtils._
-import org.apache.spark.sql.catalyst.util.DateTimeUtils
+import org.apache.spark.sql.catalyst.util.{CharVarcharUtils, DateTimeUtils}
 import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.UTF8String
 
 /**
  * In this test suite, we test predicates containing the following operators:
@@ -71,6 +72,13 @@ class FilterEstimationSuite extends StatsEstimationTestBase {
   // "A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9"
   val attrString = AttributeReference("cstring", StringType)()
   val colStatString = ColumnStat(distinctCount = Some(10), min = None, max = None,
+    nullCount = Some(0), avgLen = Some(2), maxLen = Some(2))
+
+  val attrChar = AttributeReference("cchar", CharType(2))()
+  val colStatChar = ColumnStat(distinctCount = Some(10), min = None, max = None,
+    nullCount = Some(0), avgLen = Some(2), maxLen = Some(2))
+  val attrVarchar = AttributeReference("cvarchar", VarcharType(2))()
+  val colStatVarchar = ColumnStat(distinctCount = Some(10), min = None, max = None,
     nullCount = Some(0), avgLen = Some(2), maxLen = Some(2))
 
   // column cint2 has values: 7, 8, 9, 10, 11, 12, 13, 14, 15, 16
@@ -121,6 +129,8 @@ class FilterEstimationSuite extends StatsEstimationTestBase {
     attrDecimal -> colStatDecimal,
     attrDouble -> colStatDouble,
     attrString -> colStatString,
+    attrChar -> colStatChar,
+    attrVarchar -> colStatVarchar,
     attrInt2 -> colStatInt2,
     attrInt3 -> colStatInt3,
     attrInt4 -> colStatInt4,
@@ -211,6 +221,36 @@ class FilterEstimationSuite extends StatsEstimationTestBase {
       expectedRowCount = 1)
   }
 
+  test("cint = 2 - missing min/max but has NDV") {
+    val attrIntNoMinMax = AttributeReference("cint_no_min_max", IntegerType)()
+    val colStatIntNoMinMax = ColumnStat(distinctCount = Some(10), min = None, max = None,
+      nullCount = Some(0), avgLen = Some(4), maxLen = Some(4))
+    val childPlan = StatsTestPlan(
+      outputList = Seq(attrIntNoMinMax),
+      rowCount = 10L,
+      attributeStats = AttributeMap(Seq(attrIntNoMinMax -> colStatIntNoMinMax))
+    )
+    validateEstimatedStats(
+      Filter(EqualTo(attrIntNoMinMax, Literal(2)), childPlan),
+      Seq(attrIntNoMinMax -> colStatIntNoMinMax.copy(distinctCount = Some(1),
+        min = Some(2), max = Some(2), nullCount = Some(0))),
+      expectedRowCount = 1)
+  }
+
+  test("cint = 2 - missing all column stats") {
+    val attrIntNoStats = AttributeReference("cint_no_stats", IntegerType)()
+    val colStatIntNoStats = ColumnStat()
+    val childPlan = StatsTestPlan(
+      outputList = Seq(attrIntNoStats),
+      rowCount = 10L,
+      attributeStats = AttributeMap(Seq(attrIntNoStats -> colStatIntNoStats))
+    )
+    validateEstimatedStats(
+      Filter(EqualTo(attrIntNoStats, Literal(2)), childPlan),
+      Seq(attrIntNoStats -> colStatIntNoStats),
+      expectedRowCount = 10)
+  }
+
   test("cint <=> 2") {
     validateEstimatedStats(
       Filter(EqualNullSafe(attrInt, Literal(2)), childStatsTestPlan(Seq(attrInt), 10L)),
@@ -290,6 +330,35 @@ class FilterEstimationSuite extends StatsEstimationTestBase {
       expectedRowCount = 10)
   }
 
+  test("IS NOT NULL should not increase sizeInBytes over child") {
+    val attrStringLarge = AttributeReference("cstring_large", StringType)()
+    val colStatStringLarge = ColumnStat(distinctCount = Some(10), min = None, max = None,
+      nullCount = Some(0), avgLen = Some(1000), maxLen = Some(1000))
+    val childPlan = StatsTestPlan(
+      outputList = Seq(attrStringLarge),
+      rowCount = 1000,
+      attributeStats = AttributeMap(Seq(attrStringLarge -> colStatStringLarge)),
+      size = Some(1000)
+    )
+    val filter = Filter(IsNotNull(attrStringLarge), childPlan)
+    val filterStats = filter.stats
+    assert(filterStats.rowCount.contains(1000))
+    assert(filterStats.sizeInBytes == 1000)
+  }
+
+  test("Range filter should scale sizeInBytes based on child size") {
+    val childPlan = StatsTestPlan(
+      outputList = Seq(attrInt),
+      rowCount = 10L,
+      attributeStats = AttributeMap(Seq(attrInt -> colStatInt)),
+      size = Some(100)
+    )
+    val filter = Filter(GreaterThan(attrInt, Literal(6)), childPlan)
+    val filterStats = filter.stats
+    assert(filterStats.rowCount.contains(5))
+    assert(filterStats.sizeInBytes == 50)
+  }
+
   test("cint IS NOT NULL && null") {
     // 'cint < null' will be optimized to 'cint IS NOT NULL && null'.
     // More similar cases can be found in the Optimizer NullPropagation.
@@ -356,6 +425,21 @@ class FilterEstimationSuite extends StatsEstimationTestBase {
       Seq(attrInt -> ColumnStat(distinctCount = Some(3), min = Some(3), max = Some(5),
         nullCount = Some(0), avgLen = Some(4), maxLen = Some(4))),
       expectedRowCount = 3)
+  }
+
+  test("cint IN (3, 4, 5) - missing min/max but has NDV") {
+    val attrIntNoMinMax = AttributeReference("cint_no_min_max", IntegerType)()
+    val colStatIntNoMinMax = ColumnStat(distinctCount = Some(10), min = None, max = None,
+      nullCount = Some(0), avgLen = Some(4), maxLen = Some(4))
+    val childPlan = StatsTestPlan(
+      outputList = Seq(attrIntNoMinMax),
+      rowCount = 10L,
+      attributeStats = AttributeMap(Seq(attrIntNoMinMax -> colStatIntNoMinMax))
+    )
+    validateEstimatedStats(
+      Filter(InSet(attrIntNoMinMax, Set(3, 4, 5)), childPlan),
+      Seq(attrIntNoMinMax -> colStatIntNoMinMax),
+      expectedRowCount = 10)
   }
 
   test("evaluateInSet with all zeros") {
@@ -493,6 +577,29 @@ class FilterEstimationSuite extends StatsEstimationTestBase {
       Filter(LessThan(attrString, Literal("A2")), childStatsTestPlan(Seq(attrString), 10L)),
       Seq(attrString -> ColumnStat(distinctCount = Some(10), min = None, max = None,
         nullCount = Some(0), avgLen = Some(2), maxLen = Some(2))),
+      expectedRowCount = 10)
+  }
+
+  test("SPARK-59273: CHAR/VARCHAR equality, IN, and range fall back like STRING") {
+    Seq(attrChar -> colStatChar, attrVarchar -> colStatVarchar).foreach {
+      case (attr, colStat) =>
+        validateEstimatedStats(
+          Filter(EqualTo(attr, Literal("A2")), childStatsTestPlan(Seq(attr), 10L)),
+          Seq(attr -> colStat.copy(distinctCount = Some(1), nullCount = Some(0))),
+          expectedRowCount = 1)
+        validateEstimatedStats(
+          Filter(InSet(attr, Set("A0")), childStatsTestPlan(Seq(attr), 10L)),
+          Seq(attr -> colStat.copy(distinctCount = Some(1), nullCount = Some(0))),
+          expectedRowCount = 1)
+        validateEstimatedStats(
+          Filter(LessThan(attr, Literal("A2")), childStatsTestPlan(Seq(attr), 10L)),
+          Seq(attr -> colStat),
+          expectedRowCount = 10)
+    }
+    validateEstimatedStats(
+      Filter(GreaterThan(attrChar, attrVarchar),
+        childStatsTestPlan(Seq(attrChar, attrVarchar), 10L)),
+      Seq(attrChar -> colStatChar, attrVarchar -> colStatVarchar),
       expectedRowCount = 10)
   }
 
@@ -855,6 +962,66 @@ class FilterEstimationSuite extends StatsEstimationTestBase {
       condition,
       Seq(attrString -> colStatString),
       expectedRowCount = 10)
+  }
+
+  test("SPARK-60810: predicates on a read-side padded CHAR column use the column's stats") {
+    val padded = CharVarcharUtils.addPaddingForScan(
+      charAttr("cstring", 2).withExprId(attrString.exprId))
+    assert(padded match {
+      case CharVarcharUtils.ReadSidePadding(a: Attribute, _) => a.exprId == attrString.exprId
+      case _ => false
+    }, s"expected read-side padding over cstring, got $padded")
+    val child = childStatsTestPlan(Seq(attrString), tableRowCount = 10L)
+    // colStatString has 10 distinct values and no nulls over 10 rows.
+    Seq(
+      EqualTo(padded, Literal("A0")) -> 1,
+      EqualTo(Literal("A0"), padded) -> 1,
+      In(padded, Seq(Literal("A0"), Literal("A1"))) -> 2,
+      InSet(padded, Set(UTF8String.fromString("A0"), UTF8String.fromString("A1"))) -> 2,
+      IsNull(padded) -> 0).foreach { case (condition, expectedRows) =>
+      val filter = Filter(condition, child)
+      assert(filter.stats.rowCount.contains(BigInt(expectedRows)), condition)
+    }
+    // With no nulls IS NOT NULL keeps every row, which an unsupported predicate does too, so
+    // use a child with nulls. The update lands on the column's own stat (in a plan, the padding
+    // Project above passes it on): nullCount becomes 0, where scaling alone would give 3.
+    val childWithNulls = childStatsTestPlan(Seq(attrString), tableRowCount = 10L,
+      attributeMap = AttributeMap(Seq(attrString -> colStatString.copy(nullCount = Some(4)))))
+    validateEstimatedStats(
+      Filter(IsNotNull(padded), childWithNulls),
+      Seq(attrString -> colStatString.copy(distinctCount = Some(6), nullCount = Some(0))),
+      expectedRowCount = 6)
+    // Under Not the predicate is estimated without update; the output stat is only scaled to
+    // the 9 remaining rows.
+    validateEstimatedStats(
+      Filter(Not(EqualTo(padded, Literal("A0"))), child),
+      Seq(attrString -> colStatString.copy(distinctCount = Some(9))),
+      expectedRowCount = 9)
+  }
+
+  test("SPARK-60810: equality on a string or binary column with a reported histogram") {
+    // DSv2 connectors can report a histogram for any type. Only numeric-like types have
+    // equi-height histograms, so string and binary columns fall back to their distinct count.
+    val histogram = Histogram(height = 1, Array(HistogramBin(lo = 0, hi = 10, ndv = 10)))
+    val stat = colStatString.copy(min = Some(UTF8String.fromString("A0")),
+      max = Some(UTF8String.fromString("A9")), histogram = Some(histogram))
+    val child = childStatsTestPlan(Seq(attrString), tableRowCount = 10L,
+      attributeMap = AttributeMap(Seq(attrString -> stat)))
+    validateEstimatedStats(
+      Filter(EqualTo(attrString, Literal("A0")), child),
+      Seq(attrString -> stat.copy(distinctCount = Some(1))),
+      expectedRowCount = 1)
+
+    val attrBinary = AttributeReference("cbinary", BinaryType)()
+    val binaryStat = ColumnStat(distinctCount = Some(10), min = Some(Array[Byte](0)),
+      max = Some(Array[Byte](9)), nullCount = Some(0), avgLen = Some(1), maxLen = Some(1),
+      histogram = Some(histogram))
+    val binaryChild = StatsTestPlan(
+      outputList = Seq(attrBinary),
+      rowCount = 10,
+      attributeStats = AttributeMap(Seq(attrBinary -> binaryStat)))
+    assert(Filter(EqualTo(attrBinary, Literal(Array[Byte](1))), binaryChild).stats.rowCount
+      .contains(BigInt(1)))
   }
 
   test("ColumnStatsMap tests") {

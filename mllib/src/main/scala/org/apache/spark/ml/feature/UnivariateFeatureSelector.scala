@@ -17,6 +17,8 @@
 
 package org.apache.spark.ml.feature
 
+import java.io.{DataInputStream, DataOutputStream}
+
 import scala.collection.mutable.ArrayBuilder
 
 import org.apache.hadoop.fs.Path
@@ -24,7 +26,7 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.annotation.Since
 import org.apache.spark.ml.{Estimator, Model}
 import org.apache.spark.ml.attribute.{Attribute, AttributeGroup, NominalAttribute, NumericAttribute}
-import org.apache.spark.ml.linalg.{DenseVector, SparseVector, Vector, Vectors, VectorUDT}
+import org.apache.spark.ml.linalg.{DenseVector, SparseVector, SQLDataTypes, Vector, Vectors}
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared.{HasFeaturesCol, HasLabelCol, HasOutputCol}
 import org.apache.spark.ml.stat.{ANOVATest, ChiSquareTest, FValueTest}
@@ -32,6 +34,8 @@ import org.apache.spark.ml.util._
 import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
 import org.apache.spark.sql.functions.{col, udf}
 import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.util.ArrayImplicits._
+import org.apache.spark.util.SizeEstimator
 
 
 /**
@@ -164,7 +168,7 @@ final class UnivariateFeatureSelector @Since("3.1.1")(@Since("3.1.1") override v
   @Since("3.1.1")
   override def fit(dataset: Dataset[_]): UnivariateFeatureSelectorModel = {
     transformSchema(dataset.schema, logging = true)
-    val numFeatures = MetadataUtils.getNumFeatures(dataset, $(featuresCol))
+    val numFeatures = DatasetUtils.getNumFeatures(dataset, $(featuresCol))
 
     var threshold = Double.NaN
     if (isSet(selectionThreshold)) {
@@ -179,11 +183,11 @@ final class UnivariateFeatureSelector @Since("3.1.1")(@Since("3.1.1") override v
 
     val resultDF = ($(featureType), $(labelType)) match {
       case ("categorical", "categorical") =>
-        ChiSquareTest.test(dataset.toDF, getFeaturesCol, getLabelCol, true)
+        ChiSquareTest.test(dataset.toDF(), getFeaturesCol, getLabelCol, true)
       case ("continuous", "categorical") =>
-        ANOVATest.test(dataset.toDF, getFeaturesCol, getLabelCol, true)
+        ANOVATest.test(dataset.toDF(), getFeaturesCol, getLabelCol, true)
       case ("continuous", "continuous") =>
-        FValueTest.test(dataset.toDF, getFeaturesCol, getLabelCol, true)
+        FValueTest.test(dataset.toDF(), getFeaturesCol, getLabelCol, true)
       case _ =>
         throw new IllegalArgumentException(s"Unsupported combination:" +
           s" featureType=${$(featureType)}, labelType=${$(labelType)}")
@@ -227,7 +231,7 @@ final class UnivariateFeatureSelector @Since("3.1.1")(@Since("3.1.1") override v
         val maxIndex = resultDF.sort("pValue", "featureIndex")
           .select("pValue")
           .as[Double].rdd
-          .zipWithIndex
+          .zipWithIndex()
           .flatMap { case (pValue, index) =>
             if (pValue <= f * (index + 1)) {
               Iterator.single(index.toInt)
@@ -262,9 +266,9 @@ final class UnivariateFeatureSelector @Since("3.1.1")(@Since("3.1.1") override v
       }
     }
     require(isSet(featureType) && isSet(labelType), "featureType and labelType need to be set")
-    SchemaUtils.checkColumnType(schema, $(featuresCol), new VectorUDT)
+    SchemaUtils.checkColumnType(schema, $(featuresCol), SQLDataTypes.VectorType)
     SchemaUtils.checkNumericType(schema, $(labelCol))
-    SchemaUtils.appendColumn(schema, $(outputCol), new VectorUDT)
+    SchemaUtils.appendColumn(schema, $(outputCol), SQLDataTypes.VectorType)
   }
 
   @Since("3.1.1")
@@ -288,6 +292,14 @@ class UnivariateFeatureSelectorModel private[ml](
   extends Model[UnivariateFeatureSelectorModel] with UnivariateFeatureSelectorParams
     with MLWritable {
 
+  // For ml connect only
+  private[ml] def this() = this("", Array.emptyIntArray)
+
+  private[spark] override def estimatedSize: Long = {
+    // selectedFeatures: Array[Int]
+    estimateMatadataSize + SizeEstimator.estimate(selectedFeatures)
+  }
+
   /** @group setParam */
   @Since("3.1.1")
   def setFeaturesCol(value: String): this.type = set(featuresCol, value)
@@ -308,7 +320,7 @@ class UnivariateFeatureSelectorModel private[ml](
 
   @Since("3.1.1")
   override def transformSchema(schema: StructType): StructType = {
-    SchemaUtils.checkColumnType(schema, $(featuresCol), new VectorUDT)
+    SchemaUtils.checkColumnType(schema, $(featuresCol), SQLDataTypes.VectorType)
     val newField =
       UnivariateFeatureSelectorModel
         .prepOutputField(schema, selectedFeatures, $(outputCol), $(featuresCol), isNumericAttribute)
@@ -334,6 +346,18 @@ class UnivariateFeatureSelectorModel private[ml](
 
 @Since("3.1.1")
 object UnivariateFeatureSelectorModel extends MLReadable[UnivariateFeatureSelectorModel] {
+  private[ml] case class Data(selectedFeatures: Seq[Int])
+
+  private[ml] def serializeData(data: Data, dos: DataOutputStream): Unit = {
+    import ReadWriteUtils._
+    serializeIntArray(data.selectedFeatures.toArray, dos)
+  }
+
+  private[ml] def deserializeData(dis: DataInputStream): Data = {
+    import ReadWriteUtils._
+    val selectedFeatures = deserializeIntArray(dis).toSeq
+    Data(selectedFeatures)
+  }
 
   @Since("3.1.1")
   override def read: MLReader[UnivariateFeatureSelectorModel] =
@@ -345,13 +369,11 @@ object UnivariateFeatureSelectorModel extends MLReadable[UnivariateFeatureSelect
   private[UnivariateFeatureSelectorModel] class UnivariateFeatureSelectorModelWriter(
       instance: UnivariateFeatureSelectorModel) extends MLWriter {
 
-    private case class Data(selectedFeatures: Seq[Int])
-
     override protected def saveImpl(path: String): Unit = {
-      DefaultParamsWriter.saveMetadata(instance, path, sc)
-      val data = Data(instance.selectedFeatures.toSeq)
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
+      val data = Data(instance.selectedFeatures.toImmutableArraySeq)
       val dataPath = new Path(path, "data").toString
-      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
+      ReadWriteUtils.saveObject[Data](dataPath, data, sparkSession, serializeData)
     }
   }
 
@@ -362,12 +384,10 @@ object UnivariateFeatureSelectorModel extends MLReadable[UnivariateFeatureSelect
     private val className = classOf[UnivariateFeatureSelectorModel].getName
 
     override def load(path: String): UnivariateFeatureSelectorModel = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val dataPath = new Path(path, "data").toString
-      val data = sparkSession.read.parquet(dataPath)
-        .select("selectedFeatures").head()
-      val selectedFeatures = data.getAs[Seq[Int]](0).toArray
-      val model = new UnivariateFeatureSelectorModel(metadata.uid, selectedFeatures)
+      val data = ReadWriteUtils.loadObject[Data](dataPath, sparkSession, deserializeData)
+      val model = new UnivariateFeatureSelectorModel(metadata.uid, data.selectedFeatures.toArray)
       metadata.getAndSetParams(model)
       model
     }
@@ -409,7 +429,9 @@ object UnivariateFeatureSelectorModel extends MLReadable[UnivariateFeatureSelect
       featuresCol: String,
       isNumericAttribute: Boolean): StructField = {
     val selector = selectedFeatures.toSet
-    val origAttrGroup = AttributeGroup.fromStructField(schema(featuresCol))
+    val origAttrGroup = AttributeGroup.fromStructField(
+      SchemaUtils.getSchemaField(schema, featuresCol)
+    )
     val featureAttributes: Array[Attribute] = if (origAttrGroup.attributes.nonEmpty) {
       origAttrGroup.attributes.get.zipWithIndex.filter(x => selector.contains(x._2)).map(_._1)
     } else {

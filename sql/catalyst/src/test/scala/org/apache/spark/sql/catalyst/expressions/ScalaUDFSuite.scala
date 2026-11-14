@@ -22,10 +22,13 @@ import java.util.Locale
 import scala.reflect.runtime.universe.TypeTag
 
 import org.apache.spark.{SparkException, SparkFunSuite}
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenContext
+import org.apache.spark.sql.catalyst.expressions.variant.{ParseJson, VariantGet}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{DecimalType, IntegerType, StringType}
+import org.apache.spark.sql.types.{DecimalType, IntegerType, StringType, StructType, VariantType}
+import org.apache.spark.unsafe.types.VariantVal
 
 class ScalaUDFSuite extends SparkFunSuite with ExpressionEvalHelper {
 
@@ -43,6 +46,34 @@ class ScalaUDFSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(stringUdf, "ax")
   }
 
+  test("variant basic input output") {
+    val variantUdf = ScalaUDF(
+      (v: VariantVal) => v,
+      VariantType,
+      ParseJson(Literal("{\"a\": \"b\"}")).replacement :: Nil,
+      Option(resolvedEncoder[VariantVal]()) :: Nil)
+    checkEvaluation(VariantGet(variantUdf, Literal("$.a"), StringType, true), "b")
+  }
+
+  test("variant basic output string") {
+    val variantUdf = ScalaUDF(
+      (v: VariantVal) => v.toString(),
+      StringType,
+      ParseJson(Literal("{\"a\": \"b\"}")).replacement :: Nil,
+      Option(resolvedEncoder[VariantVal]()) :: Nil)
+    checkEvaluation(variantUdf, "{\"a\":\"b\"}")
+  }
+
+  test("variant basic output variant") {
+    val variantUdf = ScalaUDF(
+      // The variant value below corresponds to a JSON string of {"a": "b"}.
+      () => new VariantVal(Array[Byte](2, 1, 0, 0, 2, 5, 98), Array[Byte](1, 1, 0, 1, 97)),
+      VariantType,
+      Seq(),
+      Option(resolvedEncoder[VariantVal]()) :: Nil)
+    checkEvaluation(VariantGet(variantUdf, Literal("$.a"), StringType, true), "b")
+  }
+
   test("better error message for NPE") {
     val udf = ScalaUDF(
       (s: String) => s.toLowerCase(Locale.ROOT),
@@ -50,13 +81,15 @@ class ScalaUDFSuite extends SparkFunSuite with ExpressionEvalHelper {
       Literal.create(null, StringType) :: Nil,
       Option(resolvedEncoder[String]()) :: Nil)
 
+    val pattern = "User defined function .+ failed due to: java.lang.NullPointerException".r
+
     val e1 = intercept[SparkException](udf.eval())
-    assert(e1.getMessage.contains("Failed to execute user defined function"))
+    assert(pattern.findFirstIn(e1.getMessage).isDefined)
 
     val e2 = intercept[SparkException] {
       checkEvaluationWithUnsafeProjection(udf, null)
     }
-    assert(e2.getMessage.contains("Failed to execute user defined function"))
+    assert(pattern.findFirstIn(e2.getMessage).isDefined)
   }
 
   test("SPARK-22695: ScalaUDF should not use global variables") {
@@ -88,5 +121,22 @@ class ScalaUDFSuite extends SparkFunSuite with ExpressionEvalHelper {
         Option(resolvedEncoder[java.math.BigDecimal]()) :: Nil)
       checkEvaluation(udf, null)
     }
+  }
+
+  test("SPARK-60762: The text of a UDF's error is not in the generated code") {
+    val udf = ScalaUDF(
+      (_: Any) => throw new IllegalStateException("harmless"),
+      new StructType().add("outputName\"\\q", IntegerType),
+      Literal.create(InternalRow(1), new StructType().add("fieldName\"\\q", IntegerType)) :: Nil,
+      None :: Nil,
+      udfName = Some("udfName\"\\q"))
+    val generated = intercept[SparkException] {
+      checkEvaluationWithUnsafeProjection(udf, null)
+    }
+    assert(generated.getCondition == "FAILED_EXECUTE_UDF")
+    val interpreted = intercept[SparkException](udf.eval())
+    assert(generated.getMessageParameters == interpreted.getMessageParameters)
+    val code = udf.genCode(new CodegenContext).code.toString
+    assert(!code.contains("fieldName") && !code.contains("udfName") && !code.contains("outputName"))
   }
 }

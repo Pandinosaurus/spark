@@ -19,7 +19,7 @@ package org.apache.spark.sql
 
 import java.math.MathContext
 import java.sql.{Date, Timestamp}
-import java.time.{Duration, Instant, LocalDate, LocalDateTime, Period, ZoneId}
+import java.time.{Duration, Instant, LocalDate, LocalDateTime, LocalTime, Period, ZoneId}
 import java.time.temporal.ChronoUnit
 
 import scala.collection.mutable
@@ -28,11 +28,14 @@ import scala.util.{Random, Try}
 import org.apache.spark.sql.catalyst.CatalystTypeConverters
 import org.apache.spark.sql.catalyst.util.DateTimeConstants._
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
+import org.apache.spark.sql.catalyst.util.TimestampNanosTestUtils
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.types.DayTimeIntervalType._
 import org.apache.spark.sql.types.YearMonthIntervalType.YEAR
 import org.apache.spark.unsafe.types.CalendarInterval
+import org.apache.spark.util.ArrayImplicits._
+import org.apache.spark.util.collection.Utils
 /**
  * Random data generators for Spark SQL DataTypes. These generators do not generate uniformly random
  * values; instead, they're biased to return "interesting" values (such as maximum / minimum values)
@@ -51,9 +54,12 @@ object RandomDataGenerator {
    */
   private val PROBABILITY_OF_NULL: Float = 0.1f
 
-  final val MAX_STR_LEN: Int = 1024
-  final val MAX_ARR_SIZE: Int = 128
-  final val MAX_MAP_SIZE: Int = 128
+  final val MAX_STR_LEN: Int =
+    System.getProperty("spark.sql.test.randomDataGenerator.maxStrLen", "1024").toInt
+  final val MAX_ARR_SIZE: Int =
+    System.getProperty("spark.sql.test.randomDataGenerator.maxArraySize", "128").toInt
+  final val MAX_MAP_SIZE: Int =
+    System.getProperty("spark.sql.test.randomDataGenerator.maxMapSize", "128").toInt
 
   /**
    * Helper function for constructing a biased random number generator which returns "interesting"
@@ -279,6 +285,61 @@ object RandomDataGenerator {
           },
           specialTs.map { s => LocalDateTime.parse(s.replace(" ", "T")) }
         )
+      case t: TimestampNTZNanosType =>
+        // Honor the declared precision: e.g. TimestampNTZNanosType(7) values must have at most
+        // 7 fractional-second digits, so the low (9-p) digits of nano-of-second are zeroed for
+        // both the uniform random and the specialNanosTs corpus.
+        val truncate = TimestampNanosTestUtils.nanoOfSecTruncator(t.precision)
+        randomNumeric[LocalDateTime](
+          rand,
+          (rand: Random) => {
+            // Uniform micros for the high-order Long + an independent [0, 999] for the
+            // sub-microsecond nanos. plusNanos is safe here because microsToLocalDateTime
+            // returns a value whose nano-of-second is a multiple of 1000, so adding [0, 999]
+            // never crosses a microsecond boundary.
+            val ldt = DateTimeUtils.microsToLocalDateTime(uniformMicrosRand(rand))
+              .plusNanos(rand.nextInt(NANOS_PER_MICROS.toInt).toLong)
+            ldt.withNano(truncate(ldt.getNano))
+          },
+          TimestampNanosTestUtils.specialNanosTs
+            .map(TimestampNanosTestUtils.parseSpecialNanosNTZ)
+            .map(ldt => ldt.withNano(truncate(ldt.getNano)))
+        )
+      case t: TimestampLTZNanosType =>
+        val truncate = TimestampNanosTestUtils.nanoOfSecTruncator(t.precision)
+        randomNumeric[Instant](
+          rand,
+          (rand: Random) => {
+            val instant = DateTimeUtils.microsToInstant(uniformMicrosRand(rand))
+              .plusNanos(rand.nextInt(NANOS_PER_MICROS.toInt).toLong)
+            Instant.ofEpochSecond(instant.getEpochSecond, truncate(instant.getNano).toLong)
+          },
+          TimestampNanosTestUtils.specialNanosTs
+            .map(s => TimestampNanosTestUtils.parseSpecialNanosLTZ(s, ZoneId.systemDefault()))
+            .map(i => Instant.ofEpochSecond(i.getEpochSecond, truncate(i.getNano).toLong))
+        )
+      case t: TimeType =>
+        // Honor the declared precision: both the uniform random draw and the special values are
+        // truncated to `t.precision` so the generated TIME(p) values carry at most p
+        // fractional-second digits (mirrors the nanosecond-timestamp branches above).
+        val specialTimes = Seq(
+          "00:00:00",
+          "23:59:59.999999",
+          "23:59:59.999999999"
+        ).map(LocalTime.parse)
+          .map(lt => DateTimeUtils.nanosToLocalTime(
+            DateTimeUtils.truncateTimeToPrecision(
+              DateTimeUtils.localTimeToNanos(lt), t.precision)))
+        randomNumeric[LocalTime](
+          rand,
+          (rand: Random) => {
+            // The full valid range is [0, 86_399_999_999_999] nanoseconds since midnight.
+            val nanos = DateTimeUtils.truncateTimeToPrecision(
+              rand.between(0L, 24 * 60 * 60 * 1000 * 1000 * 1000L), t.precision)
+            DateTimeUtils.nanosToLocalTime(nanos)
+          },
+          specialTimes
+        )
       case CalendarIntervalType => Some(() => {
         val months = rand.nextInt(1000)
         val days = rand.nextInt(10000)
@@ -340,13 +401,13 @@ object RandomDataGenerator {
               count += 1
             }
             val values = Seq.fill(keys.size)(valueGenerator())
-            keys.zip(values).toMap
+            Utils.toMap(keys, values)
           }
         }
       case StructType(fields) =>
         val maybeFieldGenerators: Seq[Option[() => Any]] = fields.map { field =>
           forType(field.dataType, nullable = field.nullable, rand)
-        }
+        }.toImmutableArraySeq
         if (maybeFieldGenerators.forall(_.isDefined)) {
           val fieldGenerators: Seq[() => Any] = maybeFieldGenerators.map(_.get)
           Some(() => Row.fromSeq(fieldGenerators.map(_.apply())))
@@ -369,6 +430,51 @@ object RandomDataGenerator {
             }
           }
         }
+      case gt: GeometryType =>
+        val possibleGeometriesWKB = Seq(
+          "010100000000000000000031400000000000001c40", // POINT (17 7)
+          "010100000000000000000014400000000000001440", // POINT (5 5)
+          "010100000000000000008057400000000000003340" // POINT (93.5 19)
+        )
+
+        val possibleSrids = Seq(4326, 3857, 0)
+
+        Some(() => {
+          val wkbIdx = rand.nextInt(possibleGeometriesWKB.length)
+          val sridIdx = rand.nextInt(possibleSrids.length)
+          val wkb = possibleGeometriesWKB(wkbIdx).grouped(2)
+            .map(Integer.parseInt(_, 16).toByte).toArray
+          val srid = if (gt.srid == GeometryType.MIXED_SRID) {
+            possibleSrids(sridIdx)
+          } else {
+            gt.srid
+          }
+
+          Geometry.fromWKB(wkb, srid)
+        })
+
+      case gt: GeographyType =>
+        val possibleGeometriesWKB = Seq(
+          "010100000000000000000031400000000000001c40", // POINT (17 7)
+          "010100000000000000000014400000000000001440", // POINT (5 5)
+          "010100000000000000008057400000000000003340" // POINT (93.5 19)
+        )
+
+        val possibleSrids = Seq(4326)
+
+        Some(() => {
+          val wkbIdx = rand.nextInt(possibleGeometriesWKB.length)
+          val sridIdx = rand.nextInt(possibleSrids.length)
+          val wkb = possibleGeometriesWKB(wkbIdx).grouped(2)
+            .map(Integer.parseInt(_, 16).toByte).toArray
+          val srid = if (gt.srid == GeographyType.MIXED_SRID) {
+            possibleSrids(sridIdx)
+          } else {
+            gt.srid
+          }
+
+          Geography.fromWKB(wkb, srid)
+        })
       case unsupportedType => None
     }
     // Handle nullability by wrapping the non-null value generator:

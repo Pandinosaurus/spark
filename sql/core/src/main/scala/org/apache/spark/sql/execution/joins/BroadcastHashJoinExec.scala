@@ -25,9 +25,9 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen._
-import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
+import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide, JoinSelectionHelper}
 import org.apache.spark.sql.catalyst.plans._
-import org.apache.spark.sql.catalyst.plans.physical.{BroadcastDistribution, Distribution, HashPartitioning, Partitioning, PartitioningCollection, UnspecifiedDistribution}
+import org.apache.spark.sql.catalyst.plans.physical.{BroadcastDistribution, Distribution, Partitioning, PartitioningCollection, UnspecifiedDistribution}
 import org.apache.spark.sql.execution.{CodegenSupport, SparkPlan}
 import org.apache.spark.sql.execution.metric.SQLMetrics
 
@@ -37,7 +37,7 @@ import org.apache.spark.sql.execution.metric.SQLMetrics
  * broadcast relation.  This data is then placed in a Spark broadcast variable.  The streamed
  * relation is not shuffled.
  */
-case class BroadcastHashJoinExec(
+case class BroadcastHashJoinExec private(
     leftKeys: Seq[Expression],
     rightKeys: Seq[Expression],
     joinType: JoinType,
@@ -45,8 +45,13 @@ case class BroadcastHashJoinExec(
     condition: Option[Expression],
     left: SparkPlan,
     right: SparkPlan,
-    isNullAwareAntiJoin: Boolean = false)
+    isNullAwareAntiJoin: Boolean = false,
+    isSkewJoin: Boolean = false)
   extends HashJoin {
+
+  override def nodeName: String = {
+    if (isSkewJoin) super.nodeName + "(skew=true)" else super.nodeName
+  }
 
   if (isNullAwareAntiJoin) {
     require(leftKeys.length == 1, "leftKeys length should be 1")
@@ -72,10 +77,14 @@ case class BroadcastHashJoinExec(
   override lazy val outputPartitioning: Partitioning = {
     joinType match {
       case _: InnerLike if conf.broadcastHashJoinOutputPartitioningExpandLimit > 0 =>
-        streamedPlan.outputPartitioning match {
-          case h: HashPartitioning => expandOutputPartitioning(h)
-          case c: PartitioningCollection => expandOutputPartitioning(c)
-          case other => other
+        val expandedPartitioning = expandOutputPartitioning(streamedPlan.outputPartitioning)
+        expandedPartitioning match {
+          // We don't need to handle the empty case, since it could only occur if
+          // `streamedPlan.outputPartitioning` were an empty `PartitioningCollection`, but its
+          // constructor prevents that.
+
+          case p :: Nil => p
+          case ps => PartitioningCollection.fromPartitionings(ps)
         }
       case _ => streamedPlan.outputPartitioning
     }
@@ -95,45 +104,30 @@ case class BroadcastHashJoinExec(
     mapping.toMap
   }
 
-  // Expands the given partitioning collection recursively.
-  private def expandOutputPartitioning(
-      partitioning: PartitioningCollection): PartitioningCollection = {
-    PartitioningCollection(partitioning.partitionings.flatMap {
-      case h: HashPartitioning => expandOutputPartitioning(h).partitionings
-      case c: PartitioningCollection => Seq(expandOutputPartitioning(c))
+  // Expands the given partitioning recursively.
+  private def expandOutputPartitioning(partitioning: Partitioning): Seq[Partitioning] = {
+    partitioning match {
+      case c: PartitioningCollection => c.partitionings.flatMap(expandOutputPartitioning)
+      case p: Partitioning with Expression =>
+        // Expands the given partitioning, that is also an expression, by substituting streamed keys
+        // with build keys.
+        // For example, if the expressions for the given partitioning are Seq("a", "b", "c") where
+        // the streamed keys are Seq("b", "c") and the build keys are Seq("x", "y"), the expanded
+        // partitioning will have the following expressions:
+        // Seq("a", "b", "c"), Seq("a", "b", "y"), Seq("a", "x", "c"), Seq("a", "x", "y").
+        // The expanded expressions are returned as `Seq[Partitioning]`.
+        p.multiTransformDown {
+          case e: Expression if streamedKeyToBuildKeyMapping.contains(e.canonicalized) =>
+            e +: streamedKeyToBuildKeyMapping(e.canonicalized)
+        }.asInstanceOf[LazyList[Partitioning]]
+          .take(conf.broadcastHashJoinOutputPartitioningExpandLimit)
+          // Materialize the bounded expansion into a strict `List` -- never an unforced `LazyList`,
+          // which chained across nodes can overflow the stack when serialized or deeply traversed.
+          // A `List` also lets the `case p :: Nil` in `outputPartitioning` unwrap a single-element
+          // expansion to the partitioning itself, not a one-element `PartitioningCollection`.
+          .toList
       case other => Seq(other)
-    })
-  }
-
-  // Expands the given hash partitioning by substituting streamed keys with build keys.
-  // For example, if the expressions for the given partitioning are Seq("a", "b", "c")
-  // where the streamed keys are Seq("b", "c") and the build keys are Seq("x", "y"),
-  // the expanded partitioning will have the following expressions:
-  // Seq("a", "b", "c"), Seq("a", "b", "y"), Seq("a", "x", "c"), Seq("a", "x", "y").
-  // The expanded expressions are returned as PartitioningCollection.
-  private def expandOutputPartitioning(partitioning: HashPartitioning): PartitioningCollection = {
-    val maxNumCombinations = conf.broadcastHashJoinOutputPartitioningExpandLimit
-    var currentNumCombinations = 0
-
-    def generateExprCombinations(
-        current: Seq[Expression],
-        accumulated: Seq[Expression]): Seq[Seq[Expression]] = {
-      if (currentNumCombinations >= maxNumCombinations) {
-        Nil
-      } else if (current.isEmpty) {
-        currentNumCombinations += 1
-        Seq(accumulated)
-      } else {
-        val buildKeysOpt = streamedKeyToBuildKeyMapping.get(current.head.canonicalized)
-        generateExprCombinations(current.tail, accumulated :+ current.head) ++
-          buildKeysOpt.map(_.flatMap(b => generateExprCombinations(current.tail, accumulated :+ b)))
-            .getOrElse(Nil)
-      }
     }
-
-    PartitioningCollection(
-      generateExprCombinations(partitioning.expressions, Nil)
-        .map(HashPartitioning(_, partitioning.numPartitions)))
   }
 
   protected override def doExecute(): RDD[InternalRow] = {
@@ -142,19 +136,17 @@ case class BroadcastHashJoinExec(
     val broadcastRelation = buildPlan.executeBroadcast[HashedRelation]()
     if (isNullAwareAntiJoin) {
       streamedPlan.execute().mapPartitionsInternal { streamedIter =>
-        val hashed = broadcastRelation.value.asReadOnlyCopy()
-        TaskContext.get().taskMetrics().incPeakExecutionMemory(hashed.estimatedSize)
+        val hashed = BroadcastHashJoinExec.buildReadOnlyRelation(broadcastRelation)
         if (hashed == EmptyHashedRelation) {
-          streamedIter
+          streamedIter.map { row =>
+            numOutputRows += 1
+            row
+          }
         } else if (hashed == HashedRelationWithAllNullKeys) {
           Iterator.empty
         } else {
-          val keyGenerator = UnsafeProjection.create(
-            BindReferences.bindReferences[Expression](
-              leftKeys,
-              AttributeSeq(left.output))
-          )
-          streamedIter.filter(row => {
+          val keyGenerator = streamSideKeyGenerator()
+          streamedIter.filter { row =>
             val lookupKey: UnsafeRow = keyGenerator(row)
             if (lookupKey.anyNull()) {
               false
@@ -162,13 +154,15 @@ case class BroadcastHashJoinExec(
               // Anti Join: Drop the row on the streamed side if it is a match on the build
               hashed.get(lookupKey) == null
             }
-          })
+          }.map { row =>
+            numOutputRows += 1
+            row
+          }
         }
       }
     } else {
       streamedPlan.execute().mapPartitions { streamedIter =>
-        val hashed = broadcastRelation.value.asReadOnlyCopy()
-        TaskContext.get().taskMetrics().incPeakExecutionMemory(hashed.estimatedSize)
+        val hashed = BroadcastHashJoinExec.buildReadOnlyRelation(broadcastRelation)
         join(streamedIter, hashed, numOutputRows)
       }
     }
@@ -204,11 +198,13 @@ case class BroadcastHashJoinExec(
     val broadcast = ctx.addReferenceObj("broadcast", broadcastRelation)
     val clsName = broadcastRelation.value.getClass.getName
 
-    // Inline mutable state since not many join operations in a task
+    // Inline mutable state since not many join operations in a task.
+    // Cast the helper's HashedRelation result back to the concrete class so the field stays
+    // concretely typed for the hot-path getValue/get calls.
     val relationTerm = ctx.addMutableState(clsName, "relation",
       v => s"""
-         | $v = (($clsName) $broadcast.value()).asReadOnlyCopy();
-         | incPeakExecutionMemory($v.estimatedSize());
+         | $v = ($clsName) org.apache.spark.sql.execution.joins.BroadcastHashJoinExec
+         |   .buildReadOnlyRelation($broadcast);
        """.stripMargin, forceInline = true)
     (broadcastRelation, relationTerm)
   }
@@ -237,7 +233,7 @@ case class BroadcastHashJoinExec(
            |${consume(ctx, input)}
          """.stripMargin
       } else if (broadcastRelation.value == HashedRelationWithAllNullKeys) {
-        s"""
+        """
            |// If the right side contains any all-null key, NAAJ simply returns Nothing.
          """.stripMargin
       } else {
@@ -258,4 +254,41 @@ case class BroadcastHashJoinExec(
   override protected def withNewChildrenInternal(
       newLeft: SparkPlan, newRight: SparkPlan): BroadcastHashJoinExec =
     copy(left = newLeft, right = newRight)
+}
+
+object BroadcastHashJoinExec extends JoinSelectionHelper {
+  /**
+   * Returns a read-only copy of the broadcast relation and records its size as peak execution
+   * memory. Shared by `doExecute` and the generated code of `prepareBroadcast`. This is called by
+   * generated Java class, should be public.
+   */
+  def buildReadOnlyRelation(broadcast: Broadcast[HashedRelation]): HashedRelation = {
+    val relation = broadcast.value.asReadOnlyCopy()
+    TaskContext.get().taskMetrics().incPeakExecutionMemory(relation.estimatedSize)
+    relation
+  }
+
+  def apply(
+      leftKeys: Seq[Expression],
+      rightKeys: Seq[Expression],
+      joinType: JoinType,
+      buildSide: BuildSide,
+      condition: Option[Expression],
+      left: SparkPlan,
+      right: SparkPlan,
+      isNullAwareAntiJoin: Boolean = false,
+      isSkewJoin: Boolean = false): BroadcastHashJoinExec = {
+    val (normalizedLeftKeys, normalizedRightKeys) = HashJoin.normalizeJoinKeys(leftKeys, rightKeys)
+
+    new BroadcastHashJoinExec(
+      normalizedLeftKeys,
+      normalizedRightKeys,
+      joinType,
+      buildSide,
+      condition,
+      left,
+      right,
+      isNullAwareAntiJoin,
+      isSkewJoin)
+  }
 }

@@ -16,6 +16,7 @@
 --CONFIG_DIM3 spark.sql.optimizeNullAwareAntiJoin=true
 --CONFIG_DIM3 spark.sql.optimizeNullAwareAntiJoin=false
 
+--ONLY_IF spark
 create temporary view t1 as select * from values
   ("val1a", 6S, 8, 10L, float(15.0), 20D, 20E2, timestamp '2014-04-04 01:00:00.000', date '2014-04-04'),
   ("val1b", 8S, 16, 19L, float(17.0), 25D, 26E2, timestamp '2014-05-04 01:01:00.000', date '2014-05-04'),
@@ -386,6 +387,20 @@ SELECT s1.id, s2.id AS id2 FROM s1
 FULL OUTER JOIN s2
 ON s1.id = s2.id
 AND s1.id NOT IN (SELECT id FROM s3);
+
+
+-- SPARK-58481: NOT IN subquery with NULL in result and non-nullable child on FULL OUTER JOIN.
+-- 5 NOT IN (99, NULL) evaluates to UNKNOWN; a join condition that is not TRUE matches no rows,
+-- so FULL OUTER JOIN must emit null-padded rows for every row from each side (5+5=10 rows).
+create temporary view s4 as select * from values
+    (99), (cast(null as int))
+  as s4(id);
+
+SELECT s_a.id, s_b.id AS id2 FROM s1 AS s_a
+FULL OUTER JOIN s2 AS s_b
+ON (5 NOT IN (SELECT id FROM s4));
+
+DROP VIEW s4;
 
 
 DROP VIEW s1;

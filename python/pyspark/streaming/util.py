@@ -15,17 +15,17 @@
 # limitations under the License.
 #
 
-import time
-from datetime import datetime
-import traceback
 import sys
+import time
+import traceback
+from datetime import datetime
 
 from py4j.java_gateway import is_instance_of
 
-from pyspark import SparkContext, RDD
+from pyspark import RDD, SparkContext
 
 
-class TransformFunction(object):
+class TransformFunction:
     """
     This class wraps a function RDD[X] -> RDD[Y] that was passed to
     DStream.transform(), allowing it to be called from Java via Py4J's
@@ -78,7 +78,7 @@ class TransformFunction(object):
                     return r._jrdd
                 else:
                     return r.map(lambda x: x)._jrdd
-        except:
+        except BaseException:
             self.failure = traceback.format_exc()
 
     def getLastFailure(self):
@@ -91,7 +91,7 @@ class TransformFunction(object):
         implements = ["org.apache.spark.streaming.api.python.PythonTransformFunction"]
 
 
-class TransformFunctionSerializer(object):
+class TransformFunctionSerializer:
     """
     This class implements a serializer for PythonTransformFunction Java
     objects.
@@ -118,7 +118,7 @@ class TransformFunctionSerializer(object):
             return bytearray(
                 self.serializer.dumps((func.func, func.rdd_wrap_func, func.deserializers))
             )
-        except:
+        except BaseException:
             self.failure = traceback.format_exc()
 
     def loads(self, data):
@@ -127,7 +127,7 @@ class TransformFunctionSerializer(object):
         try:
             f, wrap_func, deserializers = self.serializer.loads(bytes(data))
             return TransformFunction(self.ctx, f, *deserializers).rdd_wrapper(wrap_func)
-        except:
+        except BaseException:
             self.failure = traceback.format_exc()
 
     def getLastFailure(self):
@@ -163,6 +163,6 @@ def rddToFileName(prefix, suffix, timestamp):
 if __name__ == "__main__":
     import doctest
 
-    (failure_count, test_count) = doctest.testmod()
+    failure_count, test_count = doctest.testmod()
     if failure_count:
         sys.exit(-1)

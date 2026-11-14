@@ -17,20 +17,22 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
-import java.util.Objects
-
 import scala.collection.mutable
 
-import org.apache.spark.TaskContext
+import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
-import org.apache.spark.sql.catalyst.expressions.objects.LambdaVariable
+import org.apache.spark.sql.catalyst.trees.TreePattern.{COMMON_EXPR_REF, LAMBDA_VARIABLE, PLAN_EXPRESSION}
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.util.Utils
 
 /**
  * This class is used to compute equality of (sub)expression trees. Expressions can be added
  * to this class and they subsequently query for expression equality. Expression trees are
  * considered equal if for the same input(s), the same result is produced.
  */
-class EquivalentExpressions {
+class EquivalentExpressions(
+    skipForShortcutEnable: Boolean = SQLConf.get.subexpressionEliminationSkipForShotcutExpr) {
+
   // For each expression, the set of equivalent expressions.
   private val equivalenceMap = mutable.HashMap.empty[ExpressionEquals, ExpressionStats]
 
@@ -40,7 +42,11 @@ class EquivalentExpressions {
    * Returns true if there was already a matching expression.
    */
   def addExpr(expr: Expression): Boolean = {
-    updateExprInMap(expr, equivalenceMap)
+    if (supportedExpression(expr)) {
+      updateExprInMap(expr, equivalenceMap)
+    } else {
+      false
+    }
   }
 
   /**
@@ -54,7 +60,7 @@ class EquivalentExpressions {
       expr: Expression,
       map: mutable.HashMap[ExpressionEquals, ExpressionStats],
       useCount: Int = 1): Boolean = {
-    if (expr.deterministic) {
+    if (expr.deterministic && supportedExpression(expr)) {
       val wrapper = ExpressionEquals(expr)
       map.get(wrapper) match {
         case Some(stats) =>
@@ -66,16 +72,12 @@ class EquivalentExpressions {
             false
           } else {
             // Should not happen
-            throw new IllegalStateException(
+            throw SparkException.internalError(
               s"Cannot update expression: $expr in map: $map with use count: $useCount")
           }
         case _ =>
           if (useCount > 0) {
             map.put(wrapper, ExpressionStats(expr)(useCount))
-          } else {
-            // Should not happen
-            throw new IllegalStateException(
-              s"Cannot update expression: $expr in map: $map with use count: $useCount")
           }
           false
       }
@@ -125,55 +127,118 @@ class EquivalentExpressions {
     }
   }
 
+  private def skipForShortcut(expr: Expression): Expression = {
+    if (skipForShortcutEnable) {
+      // The subexpression may not need to eval even if it appears more than once.
+      // e.g., `if(or(a, and(b, b)))`, the expression `b` would be skipped if `a` is true.
+      // `And`/`Or` short-circuit, so only the left operand is guaranteed to be evaluated.
+      // A chained predicate `a AND b AND c` is left-deep, i.e. `And(And(a, b), c)`, so we must
+      // keep peeling left operands until we reach the single always-evaluated leaf. Peeling only
+      // one level would leave operands past the first (which are conditionally evaluated) to be
+      // treated as always-evaluated, so a subexpression they share could be hoisted and eagerly
+      // evaluated, breaking short-circuit semantics (e.g. a spurious NPE or divide-by-zero).
+      expr match {
+        case and: And => skipForShortcut(and.left)
+        case or: Or => skipForShortcut(or.left)
+        case other => other
+      }
+    } else {
+      expr
+    }
+  }
+
   // There are some special expressions that we should not recurse into all of its children.
   //   1. CodegenFallback: it's children will not be used to generate code (call eval() instead)
-  //   2. If: common subexpressions will always be evaluated at the beginning, but the true and
-  //          false expressions in `If` may not get accessed, according to the predicate
-  //          expression. We should only recurse into the predicate expression.
-  //   3. CaseWhen: like `If`, the children of `CaseWhen` only get accessed in a certain
-  //                condition. We should only recurse into the first condition expression as it
-  //                will always get accessed.
-  //   4. Coalesce: it's also a conditional expression, we should only recurse into the first
-  //                children, because others may not get accessed.
+  //   2. ConditionalExpression: use its children that will always be evaluated.
+  //   3. HigherOrderFunction: lambda functions operate in the context of local lambdas and can't
+  //        be called outside of that scope, only always-evaluated arguments can be evaluated
+  //        ahead of time.
+  // The caller has already applied `skipForShortcut`, so these cases are asked about the operand
+  // that the peel lands on rather than about the `And`/`Or` chain above it.
   private def childrenToRecurse(expr: Expression): Seq[Expression] = expr match {
     case _: CodegenFallback => Nil
-    case i: If => i.predicate :: Nil
-    case c: CaseWhen => c.children.head :: Nil
-    case c: Coalesce => c.children.head :: Nil
+    // Definitions stay lazy unless the body always reaches their references;
+    // supportedExpression excludes candidates whose references would escape their binding scope.
+    case withExpr: With =>
+      if (withExpr.refUnderCodegenFallback) Nil
+      else withExpr.child +: alwaysEvaluatedDefinitions(withExpr)
+    // Peeling here is redundant for safety: `updateExprTree` peels before it descends, so this
+    // method sees the peeled node either way. It stays because dropping it would pass
+    // `updateExprTree` the input itself rather than the operand its peel lands on.
+    case c: ConditionalExpression => c.alwaysEvaluatedInputs.map(skipForShortcut)
+    case h: HigherOrderFunction => h.alwaysEvaluatedArguments
     case other => other.children
   }
 
+  private def alwaysEvaluatedDefinitions(withExpr: With): Seq[Expression] = {
+    val definitions = withExpr.defs.map(definition => definition.id -> definition).toMap
+    val required = mutable.HashSet.empty[CommonExpressionId]
+    def collectReference(ref: CommonExpressionRef): Unit = {
+      definitions.get(ref.id).foreach { definition =>
+        if (required.add(ref.id)) collect(definition.child, collectReference)
+      }
+    }
+    def collect(expression: Expression, resolve: CommonExpressionRef => Unit): Unit = {
+      val alwaysEvaluated = skipForShortcut(expression)
+      if (alwaysEvaluated.containsPattern(COMMON_EXPR_REF)) {
+        alwaysEvaluated match {
+          case ref: CommonExpressionRef => resolve(ref)
+          case nested: With =>
+            if (!nested.refUnderCodegenFallback) {
+              val innerDefs = nested.defs.map(definition => definition.id -> definition).toMap
+              val visited = mutable.HashSet.empty[CommonExpressionId]
+              def collectInnerReference(ref: CommonExpressionRef): Unit = {
+                innerDefs.get(ref.id) match {
+                  case Some(definition) =>
+                    if (visited.add(ref.id)) collect(definition.child, resolve)
+                  case None => resolve(ref)
+                }
+              }
+              collect(nested.child, collectInnerReference)
+            }
+          case other =>
+            childrenToRecurse(other).foreach(collect(_, resolve))
+        }
+      }
+    }
+    collect(withExpr.child, collectReference)
+    withExpr.defs.filter(definition => required.contains(definition.id)).map(_.child)
+  }
+
   // For some special expressions we cannot just recurse into all of its children, but we can
-  // recursively add the common expressions shared between all of its children.
+  // recursively add the common expressions shared between all of its children. As with
+  // `childrenToRecurse`, the caller has already applied `skipForShortcut`.
   private def commonChildrenToRecurse(expr: Expression): Seq[Seq[Expression]] = expr match {
     case _: CodegenFallback => Nil
-    case i: If => Seq(Seq(i.trueValue, i.falseValue))
-    case c: CaseWhen =>
-      // We look at subexpressions in conditions and values of `CaseWhen` separately. It is
-      // because a subexpression in conditions will be run no matter which condition is matched
-      // if it is shared among conditions, but it doesn't need to be shared in values. Similarly,
-      // a subexpression among values doesn't need to be in conditions because no matter which
-      // condition is true, it will be evaluated.
-      val conditions = if (c.branches.length > 1) {
-        c.branches.map(_._1)
-      } else {
-        // If there is only one branch, the first condition is already covered by
-        // `childrenToRecurse` and we should exclude it here.
-        Nil
-      }
-      // For an expression to be in all branch values of a CaseWhen statement, it must also be in
-      // the elseValue.
-      val values = if (c.elseValue.nonEmpty) {
-        c.branches.map(_._2) ++ c.elseValue
-      } else {
-        Nil
-      }
-
-      Seq(conditions, values)
-    // If there is only one child, the first child is already covered by
-    // `childrenToRecurse` and we should exclude it here.
-    case c: Coalesce if c.children.length > 1 => Seq(c.children)
+    case c: ConditionalExpression => c.branchGroups
     case _ => Nil
+  }
+
+  private def supportedExpression(e: Expression): Boolean = {
+    // `LambdaVariable` is usually used as a loop variable, which can't be evaluated ahead of the
+    // loop. So we can't evaluate sub-expressions containing `LambdaVariable` at the beginning.
+    !(e.containsPattern(LAMBDA_VARIABLE) ||
+      e.isInstanceOf[CommonExpressionDef] ||
+      hasUnboundCommonExpressionRef(e) ||
+      // `PlanExpression` wraps query plan. To compare query plans of `PlanExpression` on executor,
+      // can cause error like NPE.
+      (e.containsPattern(PLAN_EXPRESSION) && Utils.isInRunningSparkTask))
+  }
+
+  private def hasUnboundCommonExpressionRef(
+      expression: Expression,
+      boundIds: Set[CommonExpressionId] = Set.empty): Boolean = {
+    if (!expression.containsPattern(COMMON_EXPR_REF)) {
+      false
+    } else {
+      expression match {
+        case ref: CommonExpressionRef => !boundIds.contains(ref.id)
+        case withExpr: With =>
+          val innerIds = boundIds ++ withExpr.defs.map(_.id)
+          withExpr.children.exists(hasUnboundCommonExpressionRef(_, innerIds))
+        case other => other.children.exists(hasUnboundCommonExpressionRef(_, boundIds))
+      }
+    }
   }
 
   /**
@@ -183,26 +248,27 @@ class EquivalentExpressions {
   def addExprTree(
       expr: Expression,
       map: mutable.HashMap[ExpressionEquals, ExpressionStats] = equivalenceMap): Unit = {
-    updateExprTree(expr, map)
+    if (supportedExpression(expr)) {
+      updateExprTree(expr, map)
+    }
   }
 
   private def updateExprTree(
       expr: Expression,
       map: mutable.HashMap[ExpressionEquals, ExpressionStats] = equivalenceMap,
       useCount: Int = 1): Unit = {
-    val skip = useCount == 0 ||
-      expr.isInstanceOf[LeafExpression] ||
-      // `LambdaVariable` is usually used as a loop variable, which can't be evaluated ahead of the
-      // loop. So we can't evaluate sub-expressions containing `LambdaVariable` at the beginning.
-      expr.find(_.isInstanceOf[LambdaVariable]).isDefined ||
-      // `PlanExpression` wraps query plan. To compare query plans of `PlanExpression` on executor,
-      // can cause error like NPE.
-      (expr.isInstanceOf[PlanExpression[_]] && TaskContext.get != null)
+    val skip = useCount == 0 || expr.isInstanceOf[LeafExpression]
 
     if (!skip && !updateExprInMap(expr, map, useCount)) {
-      val uc = useCount.signum
-      childrenToRecurse(expr).foreach(updateExprTree(_, map, uc))
-      commonChildrenToRecurse(expr).filter(_.nonEmpty).foreach(updateCommonExprs(_, map, uc))
+      val uc = useCount.sign
+      // Peel first: which children may be recursed into is a question about the operand that is
+      // always evaluated, and `And`/`Or` are not `ConditionalExpression`s. Asking
+      // `childrenToRecurse` about the chain above that operand walks past its guards; asking
+      // `commonChildrenToRecurse` about the chain reaches no branch group at all.
+      val alwaysEvaluated = skipForShortcut(expr)
+      childrenToRecurse(alwaysEvaluated).foreach(updateExprTree(_, map, uc))
+      commonChildrenToRecurse(alwaysEvaluated).filter(_.nonEmpty)
+        .foreach(updateCommonExprs(_, map, uc))
     }
   }
 
@@ -211,7 +277,11 @@ class EquivalentExpressions {
    * equivalent expressions.
    */
   def getExprState(e: Expression): Option[ExpressionStats] = {
-    equivalenceMap.get(ExpressionEquals(e))
+    if (supportedExpression(e)) {
+      equivalenceMap.get(ExpressionEquals(e))
+    } else {
+      None
+    }
   }
 
   // Exposed for testing.
@@ -244,20 +314,25 @@ class EquivalentExpressions {
  * Wrapper around an Expression that provides semantic equality.
  */
 case class ExpressionEquals(e: Expression) {
-  private def getHeight(tree: Expression): Int = {
-    tree.children.map(getHeight).reduceOption(_ max _).getOrElse(0) + 1
-  }
-
   // This is used to do a fast pre-check for child-parent relationship. For example, expr1 can
   // only be a parent of expr2 if expr1.height is larger than expr2.height.
-  lazy val height = getHeight(e)
+  def height: Int = e.height
 
   override def equals(o: Any): Boolean = o match {
-    case other: ExpressionEquals => e.semanticEquals(other.e) && height == other.height
+    // Equality needs both checks (semantically equal exprs can still differ in `height`); test
+    // the cheap `height` first so it short-circuits the recursive `semanticEquals`.
+    case other: ExpressionEquals => height == other.height && e.semanticEquals(other.e)
     case _ => false
   }
 
-  override def hashCode: Int = Objects.hash(e.semanticHash(): Integer, height: Integer)
+  override def hashCode: Int = {
+    // Allocation-free equivalent of Objects.hash(e.semanticHash(), height).
+    val prime = 31
+    var result = 1
+    result = prime * result + e.semanticHash()
+    result = prime * result + height
+    result
+  }
 }
 
 /**

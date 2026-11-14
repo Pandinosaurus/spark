@@ -17,9 +17,9 @@
 import os
 import shutil
 import tempfile
-import unittest
 
-from pyspark.testing.utils import ReusedPySparkTestCase, SPARK_HOME
+from pyspark.testing.sqlutils import SPARK_HOME
+from pyspark.testing.utils import ReusedPySparkTestCase
 
 
 class InputFormatTests(ReusedPySparkTestCase):
@@ -232,7 +232,9 @@ class OutputFormatTests(ReusedPySparkTestCase):
         self.assertEqual(result, data)
 
         conf = {
-            "mapreduce.job.outputformat.class": "org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat",
+            "mapreduce.job.outputformat.class": (
+                "org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat"
+            ),
             "mapreduce.job.output.key.class": "org.apache.hadoop.io.IntWritable",
             "mapreduce.job.output.value.class": "org.apache.hadoop.io.Text",
             "mapreduce.output.fileoutputformat.outputdir": basepath + "/newdataset/",
@@ -333,7 +335,9 @@ class OutputFormatTests(ReusedPySparkTestCase):
         self.assertEqual(result4, data)
 
         conf5 = {
-            "mapreduce.job.outputformat.class": "org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat",
+            "mapreduce.job.outputformat.class": (
+                "org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat"
+            ),
             "mapreduce.job.output.key.class": "org.apache.hadoop.io.IntWritable",
             "mapreduce.job.output.value.class": "org.apache.hadoop.io.IntWritable",
             "mapreduce.output.fileoutputformat.outputdir": basepath + "/reserialize/newdataset",
@@ -353,12 +357,6 @@ class OutputFormatTests(ReusedPySparkTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.tests.test_readwrite import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

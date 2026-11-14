@@ -97,8 +97,8 @@ class CSVInferSchemaSuite extends SparkFunSuite with SQLHelper {
   }
 
   test("Type arrays are merged to highest common type") {
-    val options = new CSVOptions(Map.empty[String, String], false, "UTC")
-    val inferSchema = new CSVInferSchema(options)
+    var options = new CSVOptions(Map.empty[String, String], false, "UTC")
+    var inferSchema = new CSVInferSchema(options)
 
     assert(
       inferSchema.mergeRowTypes(Array(StringType),
@@ -109,6 +109,28 @@ class CSVInferSchemaSuite extends SparkFunSuite with SQLHelper {
     assert(
       inferSchema.mergeRowTypes(Array(DoubleType),
         Array(LongType)).sameElements(Array(DoubleType)))
+
+    // Can merge DateType and TimestampType into TimestampType when no timestamp format specified
+    assert(
+      inferSchema.mergeRowTypes(Array(DateType),
+        Array(TimestampNTZType)).sameElements(Array(TimestampNTZType)))
+    assert(
+      inferSchema.mergeRowTypes(Array(DateType),
+        Array(TimestampType)).sameElements(Array(TimestampType)))
+
+    // Merge DateType and TimestampType into StringType when there are timestamp formats specified
+    options = new CSVOptions(
+      Map("timestampFormat" -> "yyyy-MM-dd HH:mm:ss",
+        "timestampNTZFormat" -> "yyyy/MM/dd HH:mm:ss"),
+      false,
+      "UTC")
+    inferSchema = new CSVInferSchema(options)
+    assert(
+      inferSchema.mergeRowTypes(Array(DateType),
+        Array(TimestampNTZType)).sameElements(Array(StringType)))
+    assert(
+      inferSchema.mergeRowTypes(Array(DateType),
+        Array(TimestampType)).sameElements(Array(StringType)))
   }
 
   test("Null fields are handled properly when a nullValue is specified") {
@@ -191,5 +213,115 @@ class CSVInferSchemaSuite extends SparkFunSuite with SQLHelper {
     // input like '1,0' is inferred as strings for backward compatibility.
     Seq("en-US").foreach(checkDecimalInfer(_, StringType))
     Seq("ko-KR", "ru-RU", "de-DE").foreach(checkDecimalInfer(_, DecimalType(7, 0)))
+  }
+
+  test("SPARK-39469: inferring date type") {
+    // "yyyy/MM/dd" format
+    var options = new CSVOptions(Map("dateFormat" -> "yyyy/MM/dd"),
+      false, "UTC")
+    var inferSchema = new CSVInferSchema(options)
+    assert(inferSchema.inferField(NullType, "2018/12/02") == DateType)
+    // "MMM yyyy" format
+    options = new CSVOptions(Map("dateFormat" -> "MMM yyyy"),
+      false, "GMT")
+    inferSchema = new CSVInferSchema(options)
+    assert(inferSchema.inferField(NullType, "Dec 2018") == DateType)
+    // Field should strictly match date format to infer as date
+    options = new CSVOptions(
+      Map("dateFormat" -> "yyyy-MM-dd", "timestampFormat" -> "yyyy-MM-dd'T'HH:mm:ss"),
+      columnPruning = false,
+      defaultTimeZoneId = "GMT")
+    inferSchema = new CSVInferSchema(options)
+    assert(inferSchema.inferField(NullType, "2018-12-03T11:00:00") == TimestampType)
+    assert(inferSchema.inferField(NullType, "2018-12-03") == DateType)
+  }
+
+  test("SPARK-39469: inferring the schema of columns with mixing dates and timestamps properly") {
+    var options = new CSVOptions(
+      Map("dateFormat" -> "yyyy_MM_dd", "timestampFormat" -> "yyyy|MM|dd",
+        "timestampNTZFormat" -> "yyyy/MM/dd"),
+      columnPruning = false,
+      defaultTimeZoneId = "UTC")
+    var inferSchema = new CSVInferSchema(options)
+
+    assert(inferSchema.inferField(DateType, "2012_12_12") == DateType)
+
+    // inferField should infer a column as string type if it contains mixing dates and timestamps
+    assert(inferSchema.inferField(DateType, "2003|01|01") == StringType)
+    // SQL configuration must be set to default to TimestampNTZ
+    withSQLConf(SQLConf.TIMESTAMP_TYPE.key -> SQLConf.TimestampTypes.TIMESTAMP_NTZ.toString) {
+      assert(inferSchema.inferField(DateType, "2003/02/05") == StringType)
+    }
+    assert(inferSchema.inferField(TimestampNTZType, "2012_12_12") == StringType)
+    assert(inferSchema.inferField(TimestampType, "2018_12_03") == StringType)
+
+    // No errors when Date and Timestamp have the same format. Inference defaults to date
+    options = new CSVOptions(
+      Map("dateFormat" -> "yyyy_MM_dd", "timestampFormat" -> "yyyy_MM_dd"),
+      columnPruning = false,
+      defaultTimeZoneId = "UTC")
+    inferSchema = new CSVInferSchema(options)
+    assert(inferSchema.inferField(DateType, "2012_12_12") == DateType)
+  }
+
+  test("SPARK-45433: inferring the schema when timestamps do not match specified timestampFormat" +
+    " with only one row") {
+    val options = new CSVOptions(
+      Map("timestampFormat" -> "yyyy-MM-dd'T'HH:mm:ss"),
+      columnPruning = false,
+      defaultTimeZoneId = "UTC")
+    val inferSchema = new CSVInferSchema(options)
+    assert(inferSchema.inferField(NullType, "2884-06-24T02:45:51.138") == StringType)
+  }
+
+  test("SPARK-57572: infer TimeType when timeType.enabled is true") {
+    withSQLConf(SQLConf.TIME_TYPE_ENABLED.key -> "true") {
+      val options = new CSVOptions(Map.empty[String, String],
+        columnPruning = false, defaultTimeZoneId = "UTC")
+      val inferSchema = new CSVInferSchema(options)
+
+      // Basic time inference
+      assert(inferSchema.inferField(NullType, "12:13:14") == TimeType(TimeType.DEFAULT_PRECISION))
+      assert(inferSchema.inferField(NullType, "23:59:59") == TimeType(TimeType.DEFAULT_PRECISION))
+      assert(inferSchema.inferField(NullType, "00:00:00") == TimeType(TimeType.DEFAULT_PRECISION))
+
+      // Time with fractional seconds
+      assert(inferSchema.inferField(NullType, "12:13:14.123") ==
+        TimeType(TimeType.DEFAULT_PRECISION))
+
+      // Not a time -- should fall through to other types
+      assert(inferSchema.inferField(NullType, "not-a-time") == StringType)
+
+      // Date should NOT be inferred as time
+      assert(inferSchema.inferField(NullType, "2023-01-01") == DateType)
+    }
+  }
+
+  test("SPARK-57572: TimeType not inferred when timeType.enabled is false") {
+    withSQLConf(SQLConf.TIME_TYPE_ENABLED.key -> "false") {
+      val options = new CSVOptions(Map.empty[String, String],
+        columnPruning = false, defaultTimeZoneId = "UTC")
+      val inferSchema = new CSVInferSchema(options)
+
+      // When disabled, a time-only string is not inferred as TimeType; the lenient timestamp
+      // parser accepts it (using the current date), so it infers as TimestampType.
+      assert(inferSchema.inferField(NullType, "12:13:14") == TimestampType)
+    }
+  }
+
+  test("SPARK-57572: TimeType cross-row merge via compatibleType") {
+    withSQLConf(SQLConf.TIME_TYPE_ENABLED.key -> "true") {
+      val options = new CSVOptions(Map.empty[String, String],
+        columnPruning = false, defaultTimeZoneId = "UTC")
+      val inferSchema = new CSVInferSchema(options)
+
+      val timeType = TimeType(TimeType.DEFAULT_PRECISION)
+      // Two time values merge to TimeType
+      assert(inferSchema.inferField(timeType, "23:59:59") == timeType)
+      // Time + non-time merges to StringType
+      assert(inferSchema.inferField(timeType, "not-a-time") == StringType)
+      // Time + Date merges to StringType
+      assert(inferSchema.inferField(timeType, "2023-01-01") == StringType)
+    }
   }
 }

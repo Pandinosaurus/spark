@@ -20,8 +20,7 @@ package org.apache.spark.ml.util
 import scala.collection.immutable.HashMap
 
 import org.apache.spark.ml.attribute._
-import org.apache.spark.ml.linalg.{Vector, VectorUDT}
-import org.apache.spark.sql.Dataset
+import org.apache.spark.ml.linalg.{SQLDataTypes, VectorUDT}
 import org.apache.spark.sql.types.StructField
 
 
@@ -43,22 +42,11 @@ private[spark] object MetadataUtils {
   }
 
   /**
-   * Obtain the number of features in a vector column.
-   * If no metadata is available, extract it from the dataset.
-   */
-  def getNumFeatures(dataset: Dataset[_], vectorCol: String): Int = {
-    getNumFeatures(dataset.schema(vectorCol)).getOrElse {
-      dataset.select(DatasetUtils.columnToVector(dataset, vectorCol))
-        .head.getAs[Vector](0).size
-    }
-  }
-
-  /**
    * Examine a schema to identify the number of features in a vector column.
    * Returns None if the number of features is not specified.
    */
   def getNumFeatures(vectorSchema: StructField): Option[Int] = {
-    if (vectorSchema.dataType == new VectorUDT) {
+    if (vectorSchema.dataType == SQLDataTypes.VectorType) {
       val group = AttributeGroup.fromStructField(vectorSchema)
       val size = group.size
       if (size >= 0) {

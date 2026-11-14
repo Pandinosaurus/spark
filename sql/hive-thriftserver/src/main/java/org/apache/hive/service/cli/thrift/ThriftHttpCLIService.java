@@ -33,27 +33,30 @@ import org.apache.hive.service.cli.CLIService;
 import org.apache.hive.service.rpc.thrift.TCLIService;
 import org.apache.hive.service.rpc.thrift.TCLIService.Iface;
 import org.apache.hive.service.server.ThreadFactoryWithGarbageCleanup;
+import org.apache.spark.sql.hive.thriftserver.HiveThriftServer2$;
 import org.apache.thrift.TProcessor;
 import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.protocol.TProtocolFactory;
-import org.apache.thrift.server.TServlet;
 import org.eclipse.jetty.server.AbstractConnectionFactory;
 import org.eclipse.jetty.server.ConnectionFactory;
 import org.eclipse.jetty.server.HttpConnectionFactory;
+import org.eclipse.jetty.server.HttpConfiguration;
+import org.eclipse.jetty.server.SecureRequestCustomizer;
 import org.eclipse.jetty.server.ServerConnector;
-import org.eclipse.jetty.servlet.ServletContextHandler;
-import org.eclipse.jetty.servlet.ServletHolder;
+import org.eclipse.jetty.ee10.servlet.ServletContextHandler;
+import org.eclipse.jetty.ee10.servlet.ServletHolder;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
 import org.eclipse.jetty.util.thread.ExecutorThreadPool;
 import org.eclipse.jetty.util.thread.ScheduledExecutorScheduler;
 
-
 public class ThriftHttpCLIService extends ThriftCLIService {
 
   protected org.eclipse.jetty.server.Server httpServer;
+  private final boolean sniHostCheckEnabled;
 
-  public ThriftHttpCLIService(CLIService cliService) {
+  public ThriftHttpCLIService(CLIService cliService, boolean sniHostCheckEnabled) {
     super(cliService, ThriftHttpCLIService.class.getSimpleName());
+    this.sniHostCheckEnabled = sniHostCheckEnabled;
   }
 
   @Override
@@ -84,16 +87,23 @@ public class ThriftHttpCLIService extends ThriftCLIService {
           throw new IllegalArgumentException(ConfVars.HIVE_SERVER2_SSL_KEYSTORE_PATH.varname
               + " Not configured for SSL connection");
         }
-        SslContextFactory sslContextFactory = new SslContextFactory.Server();
+        SslContextFactory.Server sslContextFactoryServer = new SslContextFactory.Server();
         String[] excludedProtocols = hiveConf.getVar(ConfVars.HIVE_SSL_PROTOCOL_BLACKLIST).split(",");
         LOG.info("HTTP Server SSL: adding excluded protocols: " + Arrays.toString(excludedProtocols));
-        sslContextFactory.addExcludeProtocols(excludedProtocols);
+        sslContextFactoryServer.addExcludeProtocols(excludedProtocols);
         LOG.info("HTTP Server SSL: SslContextFactory.getExcludeProtocols = " +
-          Arrays.toString(sslContextFactory.getExcludeProtocols()));
-        sslContextFactory.setKeyStorePath(keyStorePath);
-        sslContextFactory.setKeyStorePassword(keyStorePassword);
+          Arrays.toString(sslContextFactoryServer.getExcludeProtocols()));
+        sslContextFactoryServer.setKeyStorePath(keyStorePath);
+        sslContextFactoryServer.setKeyStorePassword(keyStorePassword);
+        // SPARK-54293: Configure SNI host check, which defaults to true since Jetty 10.
+        // Controlled by spark.sql.hive.thriftServer.http.sniHostCheckEnabled (default: true),
+        // consistent with the behavior since SPARK-45522 (Jetty 10+).
+        HttpConfiguration httpConfig = new HttpConfiguration();
+        SecureRequestCustomizer src = new SecureRequestCustomizer();
+        src.setSniHostCheck(sniHostCheckEnabled);
+        httpConfig.addCustomizer(src);
         connectionFactories = AbstractConnectionFactory.getFactories(
-            sslContextFactory, new HttpConnectionFactory());
+            sslContextFactoryServer, new HttpConnectionFactory(httpConfig));
       } else {
         connectionFactories = new ConnectionFactory[] { new HttpConnectionFactory() };
       }
@@ -182,7 +192,11 @@ public class ThriftHttpCLIService extends ThriftCLIService {
       } else {
         LOG.error("Error starting HiveServer2: could not start "
             + ThriftHttpCLIService.class.getSimpleName(), t);
-        System.exit(-1);
+        if (HiveThriftServer2$.MODULE$.systemExitOnError().get()) {
+          System.exit(-1);
+        } else {
+          throw new ServiceException(t);
+        }
       }
     }
   }

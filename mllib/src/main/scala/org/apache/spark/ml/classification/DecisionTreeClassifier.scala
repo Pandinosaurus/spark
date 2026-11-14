@@ -22,6 +22,7 @@ import org.json4s.{DefaultFormats, JObject}
 import org.json4s.JsonDSL._
 
 import org.apache.spark.annotation.Since
+import org.apache.spark.ml.feature._
 import org.apache.spark.ml.linalg.{DenseVector, SparseVector, Vector, Vectors}
 import org.apache.spark.ml.param.ParamMap
 import org.apache.spark.ml.tree._
@@ -29,12 +30,14 @@ import org.apache.spark.ml.tree.{DecisionTreeModel, Node, TreeClassifierParams}
 import org.apache.spark.ml.tree.DecisionTreeModelReadWrite._
 import org.apache.spark.ml.tree.impl.RandomForest
 import org.apache.spark.ml.util._
+import org.apache.spark.ml.util.DatasetUtils._
 import org.apache.spark.ml.util.Instrumentation.instrumented
 import org.apache.spark.mllib.tree.configuration.{Algo => OldAlgo, Strategy => OldStrategy}
 import org.apache.spark.mllib.tree.model.{DecisionTreeModel => OldDecisionTreeModel}
-import org.apache.spark.sql.{DataFrame, Dataset}
+import org.apache.spark.sql._
 import org.apache.spark.sql.functions.{col, udf}
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.storage.StorageLevel
 
 /**
  * Decision tree learning algorithm (http://en.wikipedia.org/wiki/Decision_tree_learning)
@@ -72,6 +75,10 @@ class DecisionTreeClassifier @Since("1.4.0") (
   @Since("1.4.0")
   def setMinInfoGain(value: Double): this.type = set(minInfoGain, value)
 
+  /** @group setParam */
+  @Since("4.3.0")
+  def setPruneTree(value: Boolean): this.type = set(pruneTree, value)
+
   /** @group expertSetParam */
   @Since("1.4.0")
   def setMaxMemoryInMB(value: Int): this.type = set(maxMemoryInMB, value)
@@ -91,6 +98,10 @@ class DecisionTreeClassifier @Since("1.4.0") (
    */
   @Since("1.4.0")
   def setCheckpointInterval(value: Int): this.type = set(checkpointInterval, value)
+
+  /** @group expertSetParam */
+  @Since("4.4.0")
+  def setIntermediateStorageLevel(value: String): this.type = set(intermediateStorageLevel, value)
 
   /** @group setParam */
   @Since("1.4.0")
@@ -122,17 +133,27 @@ class DecisionTreeClassifier @Since("1.4.0") (
         ".train() called with non-matching numClasses and thresholds.length." +
         s" numClasses=$numClasses, but thresholds has length ${$(thresholds).length}")
     }
-    validateNumClasses(numClasses)
-    val instances = extractInstances(dataset, numClasses)
+
+    val instances = dataset.select(
+      checkClassificationLabels($(labelCol), Some(numClasses)),
+      checkNonNegativeWeights(get(weightCol)),
+      checkNonNanVectors($(featuresCol))
+    ).rdd.map { case Row(l: Double, w: Double, v: Vector) => Instance(l, w, v)
+    }.setName("training instances")
+
     val strategy = getOldStrategy(categoricalFeatures, numClasses)
     require(!strategy.bootstrap, "DecisionTreeClassifier does not need bootstrap sampling")
+    strategy.pruneTree = $(pruneTree)
+
     instr.logNumClasses(numClasses)
     instr.logParams(this, labelCol, featuresCol, predictionCol, rawPredictionCol,
-      probabilityCol, leafCol, maxDepth, maxBins, minInstancesPerNode, minInfoGain,
-      maxMemoryInMB, cacheNodeIds, checkpointInterval, impurity, seed, thresholds)
+      probabilityCol, leafCol, maxDepth, maxBins, minInstancesPerNode, minInfoGain, pruneTree,
+      maxMemoryInMB, cacheNodeIds, checkpointInterval, impurity, seed, thresholds,
+      intermediateStorageLevel)
 
     val trees = RandomForest.run(instances, strategy, numTrees = 1, featureSubsetStrategy = "all",
-      seed = $(seed), instr = Some(instr), parentUID = Some(uid))
+      seed = $(seed), instr = Some(instr), parentUID = Some(uid),
+      intermediateStorageLevel = StorageLevel.fromString($(intermediateStorageLevel)))
 
     trees.head.asInstanceOf[DecisionTreeClassificationModel]
   }
@@ -184,8 +205,53 @@ class DecisionTreeClassificationModel private[ml] (
   private[ml] def this(rootNode: Node, numFeatures: Int, numClasses: Int) =
     this(Identifiable.randomUID("dtc"), rootNode, numFeatures, numClasses)
 
+  // For ml connect only
+  private[ml] def this() = this("", Node.dummyNode, -1, -1)
+
+  override private[ml] val treeStats: NodeStats = rootNode.computeStats
+
+  private[spark] override def estimatedSize: Long = estimateMatadataSize + getEstimatedSize()
+
   override def predict(features: Vector): Double = {
     rootNode.predictImpl(features).prediction
+  }
+
+  override protected def predictRawColumn(features: Column): Column = {
+    val localRootNode = rootNode
+    udf((features: Vector) =>
+      DecisionTreeClassificationModel.predictRaw(features, localRootNode)
+    ).apply(features)
+  }
+
+  override protected def raw2probabilityColumn(rawPrediction: Column): Column = {
+    udf((rawPrediction: Vector) =>
+      DecisionTreeClassificationModel.raw2probability(rawPrediction)
+    ).apply(rawPrediction)
+  }
+
+  override protected def predictProbabilityColumn(features: Column): Column = {
+    val localRootNode = rootNode
+    udf((features: Vector) => {
+      val rawPrediction = DecisionTreeClassificationModel.predictRaw(features, localRootNode)
+      DecisionTreeClassificationModel.raw2probability(rawPrediction)
+    }).apply(features)
+  }
+
+  override protected def raw2predictionColumn(rawPrediction: Column): Column = {
+    if (isDefined(thresholds)) {
+      val localThresholds = getThresholds.clone()
+      udf((rawPrediction: Vector) => {
+        val probability = DecisionTreeClassificationModel.raw2probability(rawPrediction)
+        ProbabilisticClassificationModel.probability2prediction(probability, localThresholds)
+      }).apply(rawPrediction)
+    } else {
+      udf((rawPrediction: Vector) => rawPrediction.argmax.toDouble).apply(rawPrediction)
+    }
+  }
+
+  override protected def predictionColumn(features: Column): Column = {
+    val localRootNode = rootNode
+    udf((features: Vector) => localRootNode.predictImpl(features).prediction).apply(features)
   }
 
   @Since("3.0.0")
@@ -202,7 +268,10 @@ class DecisionTreeClassificationModel private[ml] (
 
     val outputData = super.transform(dataset)
     if ($(leafCol).nonEmpty) {
-      val leafUDF = udf { features: Vector => predictLeaf(features) }
+      val localRootNode = rootNode
+      val leafUDF = udf { features: Vector =>
+        DecisionTreeModel.predictLeaf(features, localRootNode)
+      }
       outputData.withColumn($(leafCol), leafUDF(col($(featuresCol))),
         outputSchema($(leafCol)).metadata)
     } else {
@@ -212,7 +281,7 @@ class DecisionTreeClassificationModel private[ml] (
 
   @Since("3.0.0")
   override def predictRaw(features: Vector): Vector = {
-    Vectors.dense(rootNode.predictImpl(features).impurityStats.stats.clone())
+    DecisionTreeClassificationModel.predictRaw(features, rootNode)
   }
 
   override protected def raw2probabilityInPlace(rawPrediction: Vector): Vector = {
@@ -270,6 +339,16 @@ class DecisionTreeClassificationModel private[ml] (
 @Since("2.0.0")
 object DecisionTreeClassificationModel extends MLReadable[DecisionTreeClassificationModel] {
 
+  private def predictRaw(features: Vector, rootNode: Node): Vector = {
+    Vectors.dense(rootNode.predictImpl(features).impurityStats.stats.clone())
+  }
+
+  private def raw2probability(rawPrediction: Vector): Vector = {
+    val probability = rawPrediction.copy.toDense
+    ProbabilisticClassificationModel.normalizeToProbabilitiesInPlace(probability)
+    probability
+  }
+
   @Since("2.0.0")
   override def read: MLReader[DecisionTreeClassificationModel] =
     new DecisionTreeClassificationModelReader
@@ -285,11 +364,13 @@ object DecisionTreeClassificationModel extends MLReadable[DecisionTreeClassifica
       val extraMetadata: JObject = Map(
         "numFeatures" -> instance.numFeatures,
         "numClasses" -> instance.numClasses)
-      DefaultParamsWriter.saveMetadata(instance, path, sc, Some(extraMetadata))
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession, Some(extraMetadata))
       val (nodeData, _) = NodeData.build(instance.rootNode, 0)
       val dataPath = new Path(path, "data").toString
       val numDataParts = NodeData.inferNumPartitions(instance.numNodes)
-      sparkSession.createDataFrame(nodeData).repartition(numDataParts).write.parquet(dataPath)
+      ReadWriteUtils.saveArray(
+        dataPath, nodeData.toArray, sparkSession, NodeData.serializeData, numDataParts
+      )
     }
   }
 
@@ -301,7 +382,7 @@ object DecisionTreeClassificationModel extends MLReadable[DecisionTreeClassifica
 
     override def load(path: String): DecisionTreeClassificationModel = {
       implicit val format = DefaultFormats
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val numFeatures = (metadata.metadata \ "numFeatures").extract[Int]
       val numClasses = (metadata.metadata \ "numClasses").extract[Int]
       val root = loadTreeNodes(path, metadata, sparkSession)

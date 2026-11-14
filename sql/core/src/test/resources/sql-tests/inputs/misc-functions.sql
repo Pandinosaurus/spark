@@ -20,3 +20,50 @@ SELECT assert_true(false, 'custom error message');
 CREATE TEMPORARY VIEW tbl_misc AS SELECT * FROM (VALUES (1), (8), (2)) AS T(v);
 SELECT raise_error('error message');
 SELECT if(v > 5, raise_error('too big: ' || v), v + 1) FROM tbl_misc;
+
+-- Too many parameters
+SELECT raise_error('error message', Map());
+
+-- Too many parameters
+SELECT raise_error('error message', 'some args');
+
+-- Too few parameters
+SELECT raise_error();
+
+-- Passing null as message
+SELECT raise_error(NULL);
+
+-- Passing non-string type
+SELECT raise_error(1);
+
+-- Check legacy config disables printing of [USER_RAISED_EXCEPTION]
+SET spark.sql.legacy.raiseErrorWithoutErrorClass=true;
+SELECT assert_true(false);
+SELECT raise_error('hello');
+SET spark.sql.legacy.raiseErrorWithoutErrorClass=false;
+
+-- Implicit alias of assert expression
+SELECT assert_true(col1 <= col2) FROM VALUES ('2025-03-01', '2025-03-10');
+
+-- hmac
+SELECT hex(hmac('key', 'message'));
+SELECT hex(hmac('key', 'message', 'SHA-256'));
+SELECT hex(hmac('key', 'message', 'SHA-512'));
+SELECT lower(hex(hmac('key', 'message', 'sha256')));
+-- Chaining: the binary output of one hmac feeds in as the key of the next.
+SELECT hex(hmac(hmac('key', 'message'), 'message2'));
+-- Null propagation.
+SELECT hmac(CAST(NULL AS BINARY), 'message');
+SELECT hmac('key', CAST(NULL AS BINARY));
+SELECT hmac('key', 'message', CAST(NULL AS STRING));
+-- Unsupported algorithm.
+SELECT hmac('key', 'message', 'SHA-3');
+
+-- xxh3_64 and xxh3_128
+SELECT xxh3_64('Spark');
+SELECT xxh3_64(CAST('Spark' AS BINARY));
+SELECT xxh3_128('Spark');
+SELECT xxh3_128(CAST('Spark' AS BINARY));
+-- Null propagation.
+SELECT xxh3_64(CAST(NULL AS STRING));
+SELECT xxh3_128(CAST(NULL AS BINARY));

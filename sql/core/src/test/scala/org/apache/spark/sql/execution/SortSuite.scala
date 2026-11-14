@@ -25,12 +25,14 @@ import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
+import org.apache.spark.tags.ExtendedSQLTest
 
 /**
  * Test sorting. Many of the test cases generate random data and compares the sorted result with one
  * sorted by a reference implementation ([[ReferenceSort]]).
  */
-class SortSuite extends SparkPlanTest with SharedSparkSession {
+@ExtendedSQLTest
+class SortSuite extends SharedSparkSession {
   import testImplicits.newProductEncoder
   import testImplicits.localSeqToDatasetHolder
 
@@ -44,13 +46,15 @@ class SortSuite extends SparkPlanTest with SharedSparkSession {
 
     checkAnswer(
       input.toDF("a", "b", "c"),
-      (child: SparkPlan) => SortExec('a.asc :: 'b.asc :: Nil, global = true, child = child),
+      (child: SparkPlan) => SortExec($"a".asc :: $"b".asc :: Nil,
+        global = true, child = child),
       input.sortBy(t => (t._1, t._2)).map(Row.fromTuple),
       sortAnswers = false)
 
     checkAnswer(
       input.toDF("a", "b", "c"),
-      (child: SparkPlan) => SortExec('b.asc :: 'a.asc :: Nil, global = true, child = child),
+      (child: SparkPlan) => SortExec($"b".asc :: $"a".asc :: Nil,
+        global = true, child = child),
       input.sortBy(t => (t._2, t._1)).map(Row.fromTuple),
       sortAnswers = false)
   }
@@ -59,9 +63,9 @@ class SortSuite extends SparkPlanTest with SharedSparkSession {
     checkThatPlansAgree(
       (1 to 100).map(v => Tuple1(v)).toDF().selectExpr("NULL as a"),
       (child: SparkPlan) =>
-        GlobalLimitExec(10, SortExec('a.asc :: Nil, global = true, child = child)),
+        GlobalLimitExec(10, SortExec($"a".asc :: Nil, global = true, child = child)),
       (child: SparkPlan) =>
-        GlobalLimitExec(10, ReferenceSort('a.asc :: Nil, global = true, child)),
+        GlobalLimitExec(10, ReferenceSort($"a".asc :: Nil, global = true, child)),
       sortAnswers = false
     )
   }
@@ -70,18 +74,19 @@ class SortSuite extends SparkPlanTest with SharedSparkSession {
     checkThatPlansAgree(
       (1 to 100).map(v => Tuple1(v)).toDF("a"),
       (child: SparkPlan) =>
-        GlobalLimitExec(10, SortExec('a.asc :: Nil, global = true, child = child)),
+        GlobalLimitExec(10, SortExec($"a".asc :: Nil, global = true, child = child)),
       (child: SparkPlan) =>
-        GlobalLimitExec(10, ReferenceSort('a.asc :: Nil, global = true, child)),
+        GlobalLimitExec(10, ReferenceSort($"a".asc :: Nil, global = true, child)),
       sortAnswers = false
     )
   }
 
   test("sorting does not crash for large inputs") {
-    val sortOrder = 'a.asc :: Nil
+    val sortOrder = $"a".asc :: Nil
     val stringLength = 1024 * 1024 * 2
+    val df = Seq(Tuple1("a".repeat(stringLength)), Tuple1("b".repeat(stringLength))).toDF("a")
     checkThatPlansAgree(
-      Seq(Tuple1("a" * stringLength), Tuple1("b" * stringLength)).toDF("a").repartition(1),
+      df.repartition(1),
       SortExec(sortOrder, global = true, _: SparkPlan, testSpillFrequency = 1),
       ReferenceSort(sortOrder, global = true, _: SparkPlan),
       sortAnswers = false
@@ -92,8 +97,8 @@ class SortSuite extends SparkPlanTest with SharedSparkSession {
     AccumulatorSuite.verifyPeakExecutionMemorySet(sparkContext, "unsafe external sort") {
       checkThatPlansAgree(
         (1 to 100).map(v => Tuple1(v)).toDF("a"),
-        (child: SparkPlan) => SortExec('a.asc :: Nil, global = true, child = child),
-        (child: SparkPlan) => ReferenceSort('a.asc :: Nil, global = true, child),
+        (child: SparkPlan) => SortExec($"a".asc :: Nil, global = true, child = child),
+        (child: SparkPlan) => ReferenceSort($"a".asc :: Nil, global = true, child),
         sortAnswers = false)
     }
   }
@@ -106,9 +111,29 @@ class SortSuite extends SparkPlanTest with SharedSparkSession {
     )
     checkAnswer(
       input.toDF("a", "b", "c"),
-      (child: SparkPlan) => SortExec(Stream('a.asc, 'b.asc, 'c.asc), global = true, child = child),
+      (child: SparkPlan) => SortExec(LazyList($"a".asc, $"b".asc, $"c".asc),
+        global = true, child = child),
       input.sortBy(t => (t._1, t._2, t._3)).map(Row.fromTuple),
       sortAnswers = false)
+  }
+
+  test("SPARK-40089: decimal values sort correctly") {
+    val input = Seq(
+      BigDecimal("999999999999999999.50"),
+      BigDecimal("1.11"),
+      BigDecimal("999999999999999999.49")
+    )
+    // The range partitioner does the right thing. If there are too many
+    // shuffle partitions the error might not always show up.
+    withSQLConf("spark.sql.shuffle.partitions" -> "1") {
+      val inputDf = spark.createDataFrame(sparkContext.parallelize(input.map(v => Row(v)), 1),
+        StructType(StructField("a", DecimalType(20, 2)) :: Nil))
+      checkAnswer(
+        inputDf,
+        (child: SparkPlan) => SortExec(Symbol("a").asc :: Nil, global = true, child = child),
+        input.sorted.map(Row(_)),
+        sortAnswers = false)
+    }
   }
 
   // Test sorting on different data types
@@ -116,7 +141,8 @@ class SortSuite extends SparkPlanTest with SharedSparkSession {
     dataType <- DataTypeTestUtils.atomicTypes ++ Set(NullType);
     nullable <- Seq(true, false);
     sortOrder <-
-      Seq('a.asc :: Nil, 'a.asc_nullsLast :: Nil, 'a.desc :: Nil, 'a.desc_nullsFirst :: Nil);
+      Seq($"a".asc :: Nil, $"a".asc_nullsLast :: Nil, $"a".desc :: Nil,
+        $"a".desc_nullsFirst :: Nil);
     randomDataGenerator <- RandomDataGenerator.forType(dataType, nullable)
   ) {
     test(s"sorting on $dataType with nullable=$nullable, sortOrder=$sortOrder") {

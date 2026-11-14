@@ -17,13 +17,18 @@
 
 package org.apache.spark.deploy.k8s
 
-import io.fabric8.kubernetes.api.model.{LocalObjectReferenceBuilder, PodBuilder}
+import java.util.{Map => JMap}
 
-import org.apache.spark.{SPARK_VERSION, SparkConf, SparkFunSuite}
+import scala.jdk.CollectionConverters._
+
+import io.fabric8.kubernetes.api.model.{LocalObjectReferenceBuilder, Pod, PodBuilder}
+
+import org.apache.spark.{SPARK_VERSION, SparkConf, SparkFunSuite, SSLOptions}
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
 import org.apache.spark.deploy.k8s.submit._
 import org.apache.spark.resource.ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID
+import org.apache.spark.util.Utils
 
 class KubernetesConfSuite extends SparkFunSuite {
 
@@ -39,10 +44,14 @@ class KubernetesConfSuite extends SparkFunSuite {
     "execNodeSelectorKey2" -> "execNodeSelectorValue2")
   private val CUSTOM_LABELS = Map(
     "customLabel1Key" -> "customLabel1Value",
-    "customLabel2Key" -> "customLabel2Value")
+    "customLabel2Key" -> "customLabel2Value",
+    "customLabel3Key" -> "{{APP_ID}}",
+    "customLabel4Key" -> "{{EXECUTOR_ID}}")
   private val CUSTOM_ANNOTATIONS = Map(
     "customAnnotation1Key" -> "customAnnotation1Value",
-    "customAnnotation2Key" -> "customAnnotation2Value")
+    "customAnnotation2Key" -> "customAnnotation2Value",
+    "customAnnotation3Key" -> "{{APP_ID}}",
+    "customAnnotation4Key" -> "{{EXECUTOR_ID}}")
   private val SECRET_NAMES_TO_MOUNT_PATHS = Map(
     "secret1" -> "/mnt/secrets/secret1",
     "secret2" -> "/mnt/secrets/secret2")
@@ -92,12 +101,58 @@ class KubernetesConfSuite extends SparkFunSuite {
       SPARK_APP_ID_LABEL -> KubernetesTestConf.APP_ID,
       SPARK_APP_NAME_LABEL -> KubernetesConf.getAppNameLabel(conf.appName),
       SPARK_ROLE_LABEL -> SPARK_POD_DRIVER_ROLE) ++
-      CUSTOM_LABELS)
-    assert(conf.annotations === CUSTOM_ANNOTATIONS)
+      CUSTOM_LABELS.map {
+        case (k, v) => (k, Utils.substituteAppNExecIds(v, conf.appId, ""))
+      })
+    assert(conf.annotations === CUSTOM_ANNOTATIONS.map {
+      case (k, v) => (k, Utils.substituteAppNExecIds(v, conf.appId, ""))
+    })
     assert(conf.secretNamesToMountPaths === SECRET_NAMES_TO_MOUNT_PATHS)
     assert(conf.secretEnvNamesToKeyRefs === SECRET_ENV_VARS)
     assert(conf.environment === CUSTOM_ENVS)
     assert(conf.sparkConf.get(MEMORY_OVERHEAD_FACTOR) === 0.3)
+  }
+
+  test("SPARK-56490: Java-friendly createDriverConf with nullable proxyUser") {
+    val sparkConf = new SparkConf(false)
+    val conf = KubernetesConf.createDriverConf(
+      sparkConf,
+      KubernetesTestConf.APP_ID,
+      JavaMainAppResource(None),
+      KubernetesTestConf.MAIN_CLASS,
+      APP_ARGS,
+      null: String)
+    assert(conf.proxyUser === None)
+
+    val confWithProxy = KubernetesConf.createDriverConf(
+      sparkConf,
+      KubernetesTestConf.APP_ID,
+      JavaMainAppResource(None),
+      KubernetesTestConf.MAIN_CLASS,
+      APP_ARGS,
+      "proxy")
+    assert(confWithProxy.proxyUser === Some("proxy"))
+  }
+
+  test("SPARK-58333: Java-friendly KubernetesDriverConf constructor with nullable proxyUser") {
+    val sparkConf = new SparkConf(false)
+    val conf = new KubernetesDriverConf(
+      sparkConf,
+      KubernetesTestConf.APP_ID,
+      JavaMainAppResource(None),
+      KubernetesTestConf.MAIN_CLASS,
+      APP_ARGS,
+      null: String)
+    assert(conf.proxyUser === None)
+
+    val confWithProxy = new KubernetesDriverConf(
+      sparkConf,
+      KubernetesTestConf.APP_ID,
+      JavaMainAppResource(None),
+      KubernetesTestConf.MAIN_CLASS,
+      APP_ARGS,
+      "proxy")
+    assert(confWithProxy.proxyUser === Some("proxy"))
   }
 
   test("Basic executor translated fields.") {
@@ -105,10 +160,85 @@ class KubernetesConfSuite extends SparkFunSuite {
       new SparkConf(false),
       EXECUTOR_ID,
       KubernetesTestConf.APP_ID,
-      Some(DRIVER_POD))
+      Some(DRIVER_POD),
+      authSecret = None,
+      sslRpcPasswordEnvs = Map.empty)
     assert(conf.executorId === EXECUTOR_ID)
     assert(conf.driverPod.get === DRIVER_POD)
     assert(conf.resourceProfileId === DEFAULT_RESOURCE_PROFILE_ID)
+    assert(conf.authSecret.isEmpty)
+  }
+
+  test("Java-friendly KubernetesExecutorConf constructor with nullable arguments") {
+    val sparkConf = new SparkConf(false)
+    val conf = new KubernetesExecutorConf(
+      sparkConf,
+      KubernetesTestConf.APP_ID,
+      EXECUTOR_ID,
+      null: Pod,
+      DEFAULT_RESOURCE_PROFILE_ID,
+      null: String,
+      null: JMap[String, String])
+    assert(conf.appId === KubernetesTestConf.APP_ID)
+    assert(conf.executorId === EXECUTOR_ID)
+    assert(conf.driverPod === None)
+    assert(conf.resourceProfileId === DEFAULT_RESOURCE_PROFILE_ID)
+    assert(conf.authSecret === None)
+    assert(conf.sslRpcPasswordEnvs === Map.empty)
+
+    val confWithValues = new KubernetesExecutorConf(
+      sparkConf,
+      KubernetesTestConf.APP_ID,
+      EXECUTOR_ID,
+      DRIVER_POD,
+      3,
+      "custom-secret",
+      Map(SSLOptions.ENV_RPC_SSL_KEY_STORE_PASSWORD -> "keyStorePass").asJava)
+    assert(confWithValues.driverPod === Some(DRIVER_POD))
+    assert(confWithValues.resourceProfileId === 3)
+    assert(confWithValues.authSecret === Some("custom-secret"))
+    assert(confWithValues.sslRpcPasswordEnvs ===
+      Map(SSLOptions.ENV_RPC_SSL_KEY_STORE_PASSWORD -> "keyStorePass"))
+  }
+
+  test("KubernetesExecutorConf authSecret resolution.") {
+    val confWithoutSecret = KubernetesConf.createExecutorConf(
+      new SparkConf(false),
+      EXECUTOR_ID,
+      KubernetesTestConf.APP_ID,
+      Some(DRIVER_POD),
+      authSecret = None,
+      sslRpcPasswordEnvs = Map.empty)
+    assert(confWithoutSecret.authSecret.isEmpty)
+
+    val confWithCustomSecret = KubernetesConf.createExecutorConf(
+      new SparkConf(false),
+      EXECUTOR_ID,
+      KubernetesTestConf.APP_ID,
+      Some(DRIVER_POD),
+      authSecret = Some("custom-secret"),
+      sslRpcPasswordEnvs = Map.empty)
+    assert(confWithCustomSecret.authSecret === Some("custom-secret"))
+
+    val sparkConf = new SparkConf(false)
+      .set(org.apache.spark.internal.config.AUTH_SECRET, "conf-secret")
+    val confWithSparkConfSecret = KubernetesConf.createExecutorConf(
+      sparkConf,
+      EXECUTOR_ID,
+      KubernetesTestConf.APP_ID,
+      Some(DRIVER_POD),
+      authSecret = None,
+      sslRpcPasswordEnvs = Map.empty)
+    assert(confWithSparkConfSecret.authSecret === Some("conf-secret"))
+
+    val confWithOverride = KubernetesConf.createExecutorConf(
+      sparkConf,
+      EXECUTOR_ID,
+      KubernetesTestConf.APP_ID,
+      Some(DRIVER_POD),
+      authSecret = Some("override-secret"),
+      sslRpcPasswordEnvs = Map.empty)
+    assert(confWithOverride.authSecret === Some("override-secret"))
   }
 
   test("resource profile not default.") {
@@ -117,7 +247,9 @@ class KubernetesConfSuite extends SparkFunSuite {
       EXECUTOR_ID,
       KubernetesTestConf.APP_ID,
       Some(DRIVER_POD),
-      10)
+      10,
+      authSecret = None,
+      sslRpcPasswordEnvs = Map.empty)
     assert(conf.resourceProfileId === 10)
   }
 
@@ -127,7 +259,9 @@ class KubernetesConfSuite extends SparkFunSuite {
         .set(IMAGE_PULL_SECRETS, Seq("my-secret-1", "my-secret-2 ")),
       EXECUTOR_ID,
       KubernetesTestConf.APP_ID,
-      Some(DRIVER_POD))
+      Some(DRIVER_POD),
+      authSecret = None,
+      sslRpcPasswordEnvs = Map.empty)
     assert(conf.imagePullSecrets ===
       Seq(
         new LocalObjectReferenceBuilder().withName("my-secret-1").build(),
@@ -153,15 +287,22 @@ class KubernetesConfSuite extends SparkFunSuite {
       sparkConf,
       EXECUTOR_ID,
       KubernetesTestConf.APP_ID,
-      Some(DRIVER_POD))
+      Some(DRIVER_POD),
+      authSecret = None,
+      sslRpcPasswordEnvs = Map.empty)
     assert(conf.labels === Map(
       SPARK_VERSION_LABEL -> SPARK_VERSION,
       SPARK_EXECUTOR_ID_LABEL -> EXECUTOR_ID,
       SPARK_APP_ID_LABEL -> KubernetesTestConf.APP_ID,
       SPARK_APP_NAME_LABEL -> KubernetesConf.getAppNameLabel(conf.appName),
       SPARK_ROLE_LABEL -> SPARK_POD_EXECUTOR_ROLE,
-      SPARK_RESOURCE_PROFILE_ID_LABEL -> DEFAULT_RESOURCE_PROFILE_ID.toString) ++ CUSTOM_LABELS)
-    assert(conf.annotations === CUSTOM_ANNOTATIONS)
+      SPARK_RESOURCE_PROFILE_ID_LABEL -> DEFAULT_RESOURCE_PROFILE_ID.toString) ++
+      CUSTOM_LABELS.map {
+        case (k, v) => (k, Utils.substituteAppNExecIds(v, conf.appId, EXECUTOR_ID))
+      })
+    assert(conf.annotations === CUSTOM_ANNOTATIONS.map {
+      case (k, v) => (k, Utils.substituteAppNExecIds(v, conf.appId, EXECUTOR_ID))
+    })
     assert(conf.secretNamesToMountPaths === SECRET_NAMES_TO_MOUNT_PATHS)
     assert(conf.secretEnvNamesToKeyRefs === SECRET_ENV_VARS)
   }
@@ -176,7 +317,9 @@ class KubernetesConfSuite extends SparkFunSuite {
       sparkConf,
       EXECUTOR_ID,
       KubernetesTestConf.APP_ID,
-      Some(DRIVER_POD))
+      Some(DRIVER_POD),
+      authSecret = None,
+      sslRpcPasswordEnvs = Map.empty)
     assert(conf.environment ===
       Map(
         "executorEnvVars3_var3" -> "executorEnvVars3",
@@ -206,22 +349,95 @@ class KubernetesConfSuite extends SparkFunSuite {
   test("SPARK-36059: Set driver.scheduler and executor.scheduler") {
     val sparkConf = new SparkConf(false)
     val execUnsetConf = KubernetesTestConf.createExecutorConf(sparkConf)
-    val driverUnsetConf = KubernetesTestConf.createExecutorConf(sparkConf)
-    assert(execUnsetConf.schedulerName === "")
-    assert(driverUnsetConf.schedulerName === "")
+    val driverUnsetConf = KubernetesTestConf.createDriverConf(sparkConf)
+    assert(execUnsetConf.schedulerName === None)
+    assert(driverUnsetConf.schedulerName === None)
 
+    sparkConf.set(KUBERNETES_SCHEDULER_NAME, "sameScheduler")
+    // Use KUBERNETES_SCHEDULER_NAME when is NOT set
+    assert(KubernetesTestConf.createDriverConf(sparkConf).schedulerName === Some("sameScheduler"))
+    assert(KubernetesTestConf.createExecutorConf(sparkConf).schedulerName === Some("sameScheduler"))
+
+    // Override by driver/executor side scheduler when ""
+    sparkConf.set(KUBERNETES_DRIVER_SCHEDULER_NAME, "")
+    sparkConf.set(KUBERNETES_EXECUTOR_SCHEDULER_NAME, "")
+    assert(KubernetesTestConf.createDriverConf(sparkConf).schedulerName === Some(""))
+    assert(KubernetesTestConf.createExecutorConf(sparkConf).schedulerName === Some(""))
+
+    // Override by driver/executor side scheduler when set
     sparkConf.set(KUBERNETES_DRIVER_SCHEDULER_NAME, "driverScheduler")
     sparkConf.set(KUBERNETES_EXECUTOR_SCHEDULER_NAME, "executorScheduler")
     val execConf = KubernetesTestConf.createExecutorConf(sparkConf)
-    assert(execConf.schedulerName === "executorScheduler")
+    assert(execConf.schedulerName === Some("executorScheduler"))
     val driverConf = KubernetesTestConf.createDriverConf(sparkConf)
-    assert(driverConf.schedulerName === "driverScheduler")
+    assert(driverConf.schedulerName === Some("driverScheduler"))
+  }
+
+  test("SPARK-37735: access appId in KubernetesConf") {
+    val sparkConf = new SparkConf(false)
+    val driverConf = KubernetesTestConf.createDriverConf(sparkConf)
+    val execConf = KubernetesTestConf.createExecutorConf(sparkConf)
+    assert(driverConf.appId === KubernetesTestConf.APP_ID)
+    assert(execConf.appId === KubernetesTestConf.APP_ID)
   }
 
   test("SPARK-36566: get app name label") {
     assert(KubernetesConf.getAppNameLabel(" Job+Spark-Pi 2021") === "job-spark-pi-2021")
-    assert(KubernetesConf.getAppNameLabel("a" * 63) === "a" * 63)
-    assert(KubernetesConf.getAppNameLabel("a" * 64) === "a" * 63)
-    assert(KubernetesConf.getAppNameLabel("a" * 253) === "a" * 63)
+    assert(KubernetesConf.getAppNameLabel("a".repeat(63)) === "a".repeat(63))
+    assert(KubernetesConf.getAppNameLabel("a".repeat(64)) === "a".repeat(63))
+    assert(KubernetesConf.getAppNameLabel("a".repeat(253)) === "a".repeat(63))
+  }
+
+  test("SPARK-38630: K8s label value should start and end with alphanumeric") {
+    assert(KubernetesConf.getAppNameLabel("-hello-") === "hello")
+    assert(KubernetesConf.getAppNameLabel("a".repeat(62) + "-aaa") === "a".repeat(62))
+    assert(KubernetesConf.getAppNameLabel("-" + "a".repeat(63)) === "a".repeat(62))
+  }
+
+  test("SPARK-40869: Resource name prefix should not start with a hyphen") {
+    assert(KubernetesConf.getResourceNamePrefix("_hello_").startsWith("hello"))
+  }
+
+  test("SPARK-42906: Resource name prefix should start with an alphabetic character") {
+    // scalastyle:off nonascii
+    Seq("你好-123", "---123", "123---", "------", "123456").foreach { appName =>
+    // scalastyle:on nonascii
+      assert(KubernetesConf.getResourceNamePrefix(appName).matches("[a-z]([-a-z0-9]*[a-z0-9])?"))
+    }
+  }
+
+  test("SPARK-56736: sparkVersion returns the runtime Spark version for driver and executor") {
+    val sparkConf = new SparkConf(false)
+    val driverConf = KubernetesTestConf.createDriverConf(sparkConf)
+    val execConf = KubernetesTestConf.createExecutorConf(sparkConf)
+    assert(driverConf.sparkVersion === SPARK_VERSION)
+    assert(execConf.sparkVersion === SPARK_VERSION)
+    assert(driverConf.labels(SPARK_VERSION_LABEL) === SPARK_VERSION)
+    assert(execConf.labels(SPARK_VERSION_LABEL) === SPARK_VERSION)
+  }
+
+  test("SPARK-56736: KubernetesDriverConf subclass can override sparkVersion") {
+    val customVersion = "9.9.9-custom"
+    val customConf = new KubernetesDriverConf(
+      new SparkConf(false),
+      KubernetesTestConf.APP_ID,
+      JavaMainAppResource(None),
+      KubernetesTestConf.MAIN_CLASS,
+      APP_ARGS,
+      None) {
+      override def sparkVersion: String = customVersion
+    }
+    assert(customConf.sparkVersion === customVersion)
+    assert(customConf.labels(SPARK_VERSION_LABEL) === customVersion)
+  }
+
+  test("SPARK-52902: K8s image configs support {{SPARK_VERSION}} placeholder") {
+    val sparkConf = new SparkConf(false)
+    sparkConf.set(CONTAINER_IMAGE, "apache/spark:{{SPARK_VERSION}}")
+    sparkConf.set(EXECUTOR_CONTAINER_IMAGE, Some("foo.com/spark:{{SPARK_VERSION}}-corp"))
+    val driverUnsetConf = KubernetesTestConf.createDriverConf(sparkConf)
+    val execUnsetConf = KubernetesTestConf.createExecutorConf(sparkConf)
+    assert(driverUnsetConf.image === s"apache/spark:$SPARK_VERSION")
+    assert(execUnsetConf.image === s"foo.com/spark:$SPARK_VERSION-corp")
   }
 }

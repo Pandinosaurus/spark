@@ -21,9 +21,14 @@ import java.util.Locale
 import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
 
 import scala.collection.mutable
+import scala.util.{Failure, Success, Try}
 import scala.util.control.NonFatal
 
-import org.apache.spark.broadcast
+import com.google.common.cache.{Cache, CacheBuilder}
+
+import org.apache.spark.{broadcast, SparkException, SparkUnsupportedOperationException}
+import org.apache.spark.internal.LogKeys.{CODEGEN_STAGE_ID, CONFIG, ERROR, HUGE_METHOD_LIMIT, MAX_METHOD_CODE_SIZE, TREE_NODE}
+import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
@@ -31,14 +36,14 @@ import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.execution.aggregate.HashAggregateExec
+import org.apache.spark.sql.execution.aggregate.{HashAggregateExec, SortAggregateExec}
 import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
-import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNestedLoopJoinExec, ShuffledHashJoinExec, SortMergeJoinExec}
+import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNestedLoopJoinExec, BroadcastRangeJoinExec, ShuffledHashJoinExec, SortMergeAsOfJoinExec, SortMergeJoinExec}
 import org.apache.spark.sql.execution.metric.SQLMetrics
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.ColumnarBatch
-import org.apache.spark.util.Utils
+import org.apache.spark.util.{KeyLock, Utils}
 
 /**
  * An interface for those physical operators that support codegen.
@@ -47,12 +52,17 @@ trait CodegenSupport extends SparkPlan {
 
   /** Prefix used in the current operator's variable names. */
   private def variablePrefix: String = this match {
-    case _: HashAggregateExec => "agg"
+    case _: HashAggregateExec => "hashAgg"
+    case _: SortAggregateExec => "sortAgg"
     case _: BroadcastHashJoinExec => "bhj"
     case _: ShuffledHashJoinExec => "shj"
     case _: SortMergeJoinExec => "smj"
+    // A skewed join is named "SortMergeAsOfJoin(skew=true)", which is not a valid Java name.
+    case _: SortMergeAsOfJoinExec => "smaj"
+    case _: BroadcastRangeJoinExec => "brj"
     case _: BroadcastNestedLoopJoinExec => "bnlj"
     case _: RDDScanExec => "rdd"
+    case _: OneRowRelationExec => "orr"
     case _: DataSourceScanExec => "scan"
     case _: InMemoryTableScanExec => "memoryScan"
     case _: WholeStageCodegenExec => "wholestagecodegen"
@@ -114,6 +124,13 @@ trait CodegenSupport extends SparkPlan {
    *     # call consume(), which will call parent.doConsume()
    *      if (shouldStop()) return;
    *   }
+   *
+   * If the emitted code depends on the partition index, read it from
+   * `ctx.currentPartitionIndexVar` rather than hard-coding the field name
+   * `partitionIndex`. `UnionExec` rebinds `currentPartitionIndexVar` per
+   * fused child so that each child sees its own child-local index; a
+   * hard-coded reference would silently observe the global `UnionRDD` index
+   * under fusion.
    */
   protected def doProduce(ctx: CodegenContext): String
 
@@ -162,8 +179,10 @@ trait CodegenSupport extends SparkPlan {
         }
       }
 
+    @scala.annotation.nowarn("cat=deprecation")
     val inputVars = inputVarsCandidate match {
       case stream: Stream[ExprCode] => stream.force
+      case lazyList: LazyList[ExprCode] => lazyList.force
       case other => other
     }
 
@@ -232,11 +251,11 @@ trait CodegenSupport extends SparkPlan {
    * Returns arguments for calling method and method definition parameters of the consume function.
    * And also returns the list of `ExprCode` for the parameters.
    */
-  private def constructConsumeParameters(
+  protected def constructConsumeParameters(
       ctx: CodegenContext,
       attributes: Seq[Attribute],
       variables: Seq[ExprCode],
-      row: String): (Seq[String], Seq[String], Seq[ExprCode]) = {
+      row: String = null): (Seq[String], Seq[String], Seq[ExprCode]) = {
     val arguments = mutable.ArrayBuffer[String]()
     val parameters = mutable.ArrayBuffer[String]()
     val paramVars = mutable.ArrayBuffer[ExprCode]()
@@ -338,7 +357,7 @@ trait CodegenSupport extends SparkPlan {
    *       different inputs(join build side, aggregate buffer, etc.), or other special cases.
    */
   def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
-    throw new UnsupportedOperationException
+    throw SparkUnsupportedOperationException()
   }
 
   /**
@@ -355,7 +374,9 @@ trait CodegenSupport extends SparkPlan {
     } else if (children.length == 1) {
       children.head.asInstanceOf[CodegenSupport].needCopyResult
     } else {
-      throw new UnsupportedOperationException
+      throw new SparkUnsupportedOperationException(
+        errorClass = "_LEGACY_ERROR_TEMP_3163",
+        messageParameters = Map("num" -> children.length.toString))
     }
   }
 
@@ -401,9 +422,9 @@ trait CodegenSupport extends SparkPlan {
       val errMsg = "Only leaf nodes and blocking nodes need to call 'limitNotReachedCond' " +
         "in its data producing loop."
       if (Utils.isTesting) {
-        throw new IllegalStateException(errMsg)
+        throw SparkException.internalError(errMsg)
       } else {
-        logWarning(s"[BUG] $errMsg Please open a JIRA ticket to report it.")
+        logWarning(log"[BUG] ${MDC(ERROR, errMsg)} Please open a JIRA ticket to report it.")
       }
     }
     if (parent.limitNotReachedChecks.isEmpty) {
@@ -494,7 +515,8 @@ trait InputRDDCodegen extends CodegenSupport {
  * This is the leaf node of a tree with WholeStageCodegen that is used to generate code
  * that consumes an RDD iterator of InternalRow.
  */
-case class InputAdapter(child: SparkPlan) extends UnaryExecNode with InputRDDCodegen {
+case class InputAdapter(child: SparkPlan)
+    extends UnaryExecNode with InputRDDCodegen with SafeForKWayMerge {
 
   override def output: Seq[Attribute] = child.output
 
@@ -533,13 +555,14 @@ case class InputAdapter(child: SparkPlan) extends UnaryExecNode with InputRDDCod
 
   override def generateTreeString(
       depth: Int,
-      lastChildren: Seq[Boolean],
+      lastChildren: java.util.ArrayList[Boolean],
       append: String => Unit,
       verbose: Boolean,
       prefix: String = "",
       addSuffix: Boolean = false,
       maxFields: Int,
       printNodeId: Boolean,
+      printOutputColumns: Boolean,
       indent: Int = 0): Unit = {
     child.generateTreeString(
       depth,
@@ -550,6 +573,7 @@ case class InputAdapter(child: SparkPlan) extends UnaryExecNode with InputRDDCod
       addSuffix = false,
       maxFields,
       printNodeId,
+      printOutputColumns,
       indent)
   }
 
@@ -593,6 +617,103 @@ object WholeStageCodegenExec {
   // Reset generation time of Java source code.
   // Visible for testing
   def resetCodeGenTime(): Unit = _codeGenTime.set(0L)
+
+  /**
+   * A trial compile's outcome for `WholeStageCodegenExec.chooseCode`: the bytecode size of each
+   * method, None where they are unknown, or the failure; and the reports and metric updates the
+   * compile held back for the code kept.
+   */
+  private[execution] case class TrialResult(
+      methodSizes: Try[Option[Map[String, Int]]],
+      report: () => Unit)
+
+  /**
+   * Compiles `code` as a trial (`CodeCompiler.trial`). A hit in the compile cache produces no
+   * method sizes, so the class is then dropped and compiled again. A hit happens where the class
+   * is cached while the decision for its code is not: the decision was evicted, or the same body
+   * was compiled earlier without being decided - with the split off, whose code is the recorded
+   * code without its marks, or under another limit. Should another thread load the class again
+   * in between, the second compile is a hit as well, and the sizes are unknown.
+   */
+  private[execution] def trialCompile(
+      code: CodeAndComment,
+      failureExpected: Boolean): TrialResult = {
+    def once(): (Try[Map[String, Int]], CodeCompiler.TrialCompile) = {
+      val (result, trial) = CodeCompiler.trial(failureExpected)(CodeGenerator.compile(code))
+      (result.map(_ => trial.methodSizes), trial)
+    }
+    val (sizes, trial) = once() match {
+      case (Success(m), _) if m.isEmpty =>
+        CodeGenerator.invalidateCompiled(code)
+        once()
+      case result => result
+    }
+    TrialResult(sizes.map(m => Option.when(m.nonEmpty)(m)), () => trial.report())
+  }
+
+  /** The methods run per row that are past `limit`, with their bytecode sizes. */
+  private def methodsOver(sizes: Map[String, Int], limit: Int): Map[String, Int] =
+    sizes.filter { case (m, size) => size > limit && !CodeCompiler.runOnceMethods(m) }
+
+  /** What `chooseCode` decided for a stage's code; see [[splitDecisions]]. */
+  private sealed trait SplitDecision
+  /**
+   * The code in one piece is kept: the JIT compiles it whole, no split lowers its bytes past the
+   * limit, or no split compiles either; where it fails to compile itself, `doExecute` reports that.
+   */
+  private case object KeepWhole extends SplitDecision
+  /** The expressions split, by their index in `CodegenContext.wholeStageSplitsRecorded`. */
+  private case class SplitThese(indices: Option[Set[Int]]) extends SplitDecision
+  /** Nothing decided, the method sizes being unknown: the code in one piece runs this time. */
+  private case object Undecided extends SplitDecision
+
+  /**
+   * What `chooseCode` decided for each stage's code, by [[decisionKey]], so that a stage generated
+   * again skips the trial compiles: the code kept in one piece or the expressions split. Sized as
+   * the compile cache is, 0 being unbounded.
+   *
+   * A plain Guava cache, kept within sql/core: one handed to core's `NonFateSharingCache` fails
+   * sql/core's Maven tests, whose classes refer to Guava as it is while the installed core jar has
+   * it relocated (SPARK-44064, SPARK-50443). [[decided]] serializes the deciders itself.
+   */
+  private val splitDecisions: Cache[AnyRef, SplitDecision] = {
+    val builder = CacheBuilder.newBuilder()
+    val maxEntries = SQLConf.get.codegenCacheMaxEntries
+    (if (maxEntries > 0) builder.maximumSize(maxEntries) else builder)
+      .build[AnyRef, SplitDecision]()
+  }
+
+  /** Serializes the threads deciding one key of [[splitDecisions]]. */
+  private val decisionLock = new KeyLock[AnyRef]
+
+  /**
+   * The key of a decision for the stage's code `code` under `limit`: what the compile cache keys a
+   * class on besides its code - the class loader and the backend - with `methodSplitThreshold`,
+   * which packs the split's blocks, and a digest of the source with the marks of the recorded
+   * expressions (`CodegenContext.wholeStageSplitDigest`), whose marks say which expression each
+   * index of a decision is; a digest rather than the source, which runs to megabytes for the
+   * stages that split.
+   */
+  private def decisionKey(ctx: CodegenContext, code: CodeAndComment, limit: Int): AnyRef =
+    (CodeGenerator.compileCacheScope(code), limit, SQLConf.get.methodSplitThreshold,
+      ctx.wholeStageSplitDigest)
+
+  /**
+   * The decision remembered for `key`, or else `decide()`'s, which is remembered unless it is
+   * `Undecided`. Threads that meet one key at once decide one at a time, so the later ones find
+   * the first one's decision; one whose `decide()` throws remembers nothing, and the next decides
+   * on its own.
+   */
+  private def decided(key: AnyRef, decide: () => SplitDecision): SplitDecision =
+    decisionLock.withLock(key) {
+      Option(splitDecisions.getIfPresent(key)).getOrElse {
+        val decision = decide()
+        if (decision != Undecided) {
+          splitDecisions.put(key, decision)
+        }
+        decision
+      }
+    }
 }
 
 /**
@@ -624,7 +745,7 @@ object WholeStageCodegenExec {
  * used to generated code for [[BoundReference]].
  */
 case class WholeStageCodegenExec(child: SparkPlan)(val codegenStageId: Int)
-    extends UnaryExecNode with CodegenSupport {
+    extends UnaryExecNode with CodegenSupport with SafeForKWayMerge {
 
   override def output: Seq[Attribute] = child.output
 
@@ -651,11 +772,182 @@ case class WholeStageCodegenExec(child: SparkPlan)(val codegenStageId: Int)
   /**
    * Generates code for this subtree.
    *
+   * Under `spark.sql.codegen.wholeStage.splitExpressions` the stage's code is first generated in
+   * one piece, with the code of each expression a split could take marked, and only where there
+   * is one is that code compiled to choose which expressions to split ([[chooseCode]]). A stage
+   * the JIT compiles whole keeps that code, which a split's calls would only slow down; the trial
+   * compile of the code kept is the one [[doExecute]] finds in the compile cache.
+   *
    * @return the tuple of the codegen context and the actual generated source.
    */
   def doCodeGen(): (CodegenContext, CodeAndComment) = {
+    if (!conf.wholeStageSplitExpressions) {
+      generate(WholeStageSplit.Off)
+    } else if (conf.wholeStageSplitExpressionsMethodLimit == 0) {
+      generate(WholeStageSplit.Split(None))
+    } else {
+      chooseCode(generate(WholeStageSplit.Record), only => generate(WholeStageSplit.Split(only)),
+        WholeStageCodegenExec.trialCompile, CodeGenerator.invalidateCompiled,
+        throwSplitFailure = Utils.isTesting)
+    }
+  }
+
+  /**
+   * Which code [[doCodeGen]] returns for the stage: `recorded`, its code in one piece with the
+   * expressions a split could take marked (`WholeStageSplit.Record`), or the code `split` generates
+   * with some of them split. The code in one piece is compiled by `compile` as a trial
+   * ([[WholeStageCodegenExec.trialCompile]]), and the reports of a method past the JIT limit, with
+   * the codegen metrics, are made for the code kept.
+   *
+   *  - Where it fails to compile, the split of every expression is the code that can run, and is
+   *    compiled as a trial too; where that fails as well, or no block could be split, the code in
+   *    one piece is left to [[doExecute]], which reports its failure, falls back or throws it, as
+   *    without the split.
+   *  - Otherwise the methods run for each row past the limit - the lower of
+   *    `spark.sql.codegen.wholeStage.splitExpressions.methodLimit` (HotSpot's JIT limit by default)
+   *    and `spark.sql.codegen.hugeMethodLimit` - are the ones a split could help, and the
+   *    expressions marked in them are split: an expression in a method the JIT compiles whole
+   *    would only be slowed down by a split's calls. Where none is marked in them, or no block of
+   *    them could be split, the code in one piece is kept.
+   *  - The split is kept if it lowers the bytes of the methods past the limit, and compiles;
+   *    otherwise the code in one piece runs, as it did before the split existed.
+   *
+   * A split that fails to compile is thrown where `throwSplitFailure`, which is under testing, and
+   * warned about otherwise. The decision is remembered by [[WholeStageCodegenExec.decisionKey]], so
+   * that a stage generated again, as every execution of a query generates it, skips the trial
+   * compiles, and threads that meet the stage at once wait for one decision; where a trial's sizes
+   * are unknown, nothing is remembered. The variant not kept leaves the compile cache
+   * (`invalidate`), so that it holds only code that runs and a later compile of that variant
+   * reports what it finds.
+   */
+  private[execution] def chooseCode(
+      recorded: (CodegenContext, CodeAndComment),
+      split: Option[Set[WholeStageSplitKey]] => (CodegenContext, CodeAndComment),
+      compile: (CodeAndComment, Boolean) => WholeStageCodegenExec.TrialResult,
+      invalidate: CodeAndComment => Unit,
+      throwSplitFailure: Boolean): (CodegenContext, CodeAndComment) = {
+    import WholeStageCodegenExec._
+    val (ctx, whole) = recorded
+    if (ctx.wholeStageSplitsRecorded.isEmpty) {
+      return recorded
+    }
+    val limit = math.min(conf.wholeStageSplitExpressionsMethodLimit, conf.hugeMethodLimit)
+    def splitOf(indices: Option[Set[Int]]) =
+      split(indices.map(_.map(ctx.wholeStageSplitsRecorded)))
+    // The thread that decides keeps the code it chose; one that finds a decision generates its
+    // code. The indices of a decision are among this recording's: its key holds the digest of the
+    // marked source, which says which expression each index is.
+    var chosen: Option[(CodegenContext, CodeAndComment)] = None
+    def decide(): SplitDecision = {
+      val (decision, code) = decideFromTrials(recorded, limit, splitOf, compile, invalidate,
+        throwSplitFailure)
+      chosen = Some(code)
+      decision
+    }
+    val decision = decided(decisionKey(ctx, whole, limit), () => decide())
+    chosen.getOrElse(decision match {
+      case SplitThese(indices) => splitOf(indices)
+      case _ => recorded
+    })
+  }
+
+  /** The decision of `chooseCode` from the trial compiles, with the code it keeps. */
+  private def decideFromTrials(
+      recorded: (CodegenContext, CodeAndComment),
+      limit: Int,
+      splitOf: Option[Set[Int]] => (CodegenContext, CodeAndComment),
+      compile: (CodeAndComment, Boolean) => WholeStageCodegenExec.TrialResult,
+      invalidate: CodeAndComment => Unit,
+      throwSplitFailure: Boolean): (WholeStageCodegenExec.SplitDecision,
+        (CodegenContext, CodeAndComment)) = {
+    import WholeStageCodegenExec._
+    val (ctx, whole) = recorded
+    // Whether the split generation `splitCode` turned any block into a method. Where it did not,
+    // the split would change nothing but drop the helper functions of a discarded subexpression
+    // pass, so the code in one piece is kept, as it is with no split compiled.
+    def splitsSomething(splitCode: (CodegenContext, CodeAndComment)): Boolean =
+      splitCode._1.wholeStageBlocksSplit > 0
+    // A split that fails to compile is thrown under testing (`throwSplitFailure`), and warned
+    // about otherwise. The warning carries the failure only where the split's compile expected
+    // it (`failureExpected`); otherwise that compile has logged it as an error, with the source.
+    def splitFailed(e: Throwable, failureExpected: Boolean): Unit = {
+      if (throwSplitFailure) throw e
+      def message = log"Whole-stage codegen stage (id=${MDC(CODEGEN_STAGE_ID, codegenStageId)}) " +
+        log"failed to compile with its expressions split, so its code is kept in one " +
+        log"piece:\n ${MDC(TREE_NODE, treeString)}"
+      if (failureExpected) logWarning(message, e) else logWarning(message)
+    }
+    val wholeTrial = compile(whole, true)
+    wholeTrial.methodSizes match {
+      case Failure(_) =>
+        val splitAll = splitOf(None)
+        if (!splitsSomething(splitAll)) {
+          (KeepWhole, recorded)
+        } else {
+          // Where the split fails as well, `doExecute` compiles the code in one piece again and
+          // reports its failure as any compile's, so the split's compile expects its failure,
+          // which the warning carries; under testing it is reported and thrown as any compile's.
+          val failureExpected = !throwSplitFailure
+          val splitTrial = compile(splitAll._2, failureExpected)
+          splitTrial.methodSizes match {
+            case Success(_) =>
+              splitTrial.report()
+              (SplitThese(None), splitAll)
+            case Failure(e) =>
+              splitFailed(e, failureExpected)
+              (KeepWhole, recorded)
+          }
+        }
+      case Success(None) =>
+        wholeTrial.report()
+        (Undecided, recorded)
+      case Success(Some(sizes)) =>
+        val over = methodsOver(sizes, limit)
+        val indices = if (over.isEmpty) {
+          Nil
+        } else {
+          ctx.wholeStageSplitMarkersByFunction.collect {
+            case (i, functions) if functions.exists(over.contains) => i
+          }
+        }
+        if (indices.isEmpty) {
+          wholeTrial.report()
+          (KeepWhole, recorded)
+        } else {
+          val splitCode = splitOf(Some(indices.toSet))
+          if (!splitsSomething(splitCode)) {
+            wholeTrial.report()
+            (KeepWhole, recorded)
+          } else {
+            val splitTrial = compile(splitCode._2, false)
+            splitTrial.methodSizes match {
+              case Success(Some(splitSizes))
+                  if methodsOver(splitSizes, limit).values.sum < over.values.sum =>
+                splitTrial.report()
+                invalidate(whole)
+                (SplitThese(Some(indices.toSet)), splitCode)
+              case Success(Some(_)) =>
+                wholeTrial.report()
+                invalidate(splitCode._2)
+                (KeepWhole, recorded)
+              case Success(None) =>
+                wholeTrial.report()
+                (Undecided, recorded)
+              case Failure(e) =>
+                splitFailed(e, failureExpected = false)
+                wholeTrial.report()
+                (KeepWhole, recorded)
+            }
+          }
+        }
+    }
+  }
+
+  /** The stage's code, its expression splits made as `mode` says; see [[doCodeGen]]. */
+  private[execution] def generate(mode: WholeStageSplit): (CodegenContext, CodeAndComment) = {
     val startTime = System.nanoTime()
     val ctx = new CodegenContext
+    ctx.wholeStageSplit = mode
     val code = child.asInstanceOf[CodegenSupport].produce(ctx, this)
 
     // main next function.
@@ -701,9 +993,17 @@ case class WholeStageCodegenExec(child: SparkPlan)(val codegenStageId: Int)
       }
       """.trim
 
+    // The marks go before the code is formatted, so that the code is what it is without them.
+    val unmarked = if (ctx.wholeStageSplitsRecorded.isEmpty) {
+      source
+    } else {
+      ctx.wholeStageSplitDigest = JavaUtils.sha256Hex(source)
+      CodeGenerator.stripWholeStageSplitMarkers(source)
+    }
     // try to compile, helpful for debug
     val cleanedSource = CodeFormatter.stripOverlappingComments(
-      new CodeAndComment(CodeFormatter.stripExtraNewLines(source), ctx.getPlaceHolderToComments()))
+      new CodeAndComment(CodeFormatter.stripExtraNewLines(unmarked),
+        ctx.getPlaceHolderToComments()))
 
     val duration = System.nanoTime() - startTime
     WholeStageCodegenExec.increaseCodeGenTime(duration)
@@ -726,17 +1026,21 @@ case class WholeStageCodegenExec(child: SparkPlan)(val codegenStageId: Int)
     } catch {
       case NonFatal(_) if !Utils.isTesting && conf.codegenFallback =>
         // We should already saw the error message
-        logWarning(s"Whole-stage codegen disabled for plan (id=$codegenStageId):\n $treeString")
+        logWarning(log"Whole-stage codegen disabled for plan " +
+          log"(id=${MDC(CODEGEN_STAGE_ID, codegenStageId)}):\n " +
+          log"${MDC(TREE_NODE, treeString)}")
         return child.execute()
     }
 
     // Check if compiled code has a too large function
     if (compiledCodeStats.maxMethodCodeSize > conf.hugeMethodLimit) {
-      logInfo(s"Found too long generated codes and JIT optimization might not work: " +
-        s"the bytecode size (${compiledCodeStats.maxMethodCodeSize}) is above the limit " +
-        s"${conf.hugeMethodLimit}, and the whole-stage codegen was disabled " +
-        s"for this plan (id=$codegenStageId). To avoid this, you can raise the limit " +
-        s"`${SQLConf.WHOLESTAGE_HUGE_METHOD_LIMIT.key}`:\n$treeString")
+      logInfo(log"Found too long generated codes and JIT optimization might not work: " +
+        log"the bytecode size (${MDC(MAX_METHOD_CODE_SIZE, compiledCodeStats.maxMethodCodeSize)})" +
+        log" is above the limit ${MDC(HUGE_METHOD_LIMIT, conf.hugeMethodLimit)}, " +
+        log"and the whole-stage codegen was disabled for this plan " +
+        log"(id=${MDC(CODEGEN_STAGE_ID, codegenStageId)}). To avoid this, you can raise the limit" +
+        log" `${MDC(CONFIG, SQLConf.WHOLESTAGE_HUGE_METHOD_LIMIT.key)}`:\n" +
+        log"${MDC(TREE_NODE, treeString)}")
       return child.execute()
     }
 
@@ -749,48 +1053,41 @@ case class WholeStageCodegenExec(child: SparkPlan)(val codegenStageId: Int)
     // but the output must be rows.
     val rdds = child.asInstanceOf[CodegenSupport].inputRDDs()
     assert(rdds.size <= 2, "Up to two input RDDs can be supported")
+    val cleanedSourceOpt = tryBroadcastCleanedSource(cleanedSource)
+    val evaluatorFactory = new WholeStageCodegenEvaluatorFactory(
+      cleanedSourceOpt, durationMs, references)
     if (rdds.length == 1) {
-      rdds.head.mapPartitionsWithIndex { (index, iter) =>
-        val (clazz, _) = CodeGenerator.compile(cleanedSource)
-        val buffer = clazz.generate(references).asInstanceOf[BufferedRowIterator]
-        buffer.init(index, Array(iter))
-        new Iterator[InternalRow] {
-          override def hasNext: Boolean = {
-            val v = buffer.hasNext
-            if (!v) durationMs += buffer.durationMs()
-            v
-          }
-          override def next: InternalRow = buffer.next()
+      if (conf.usePartitionEvaluator) {
+        rdds.head.mapPartitionsWithEvaluator(evaluatorFactory)
+      } else {
+        rdds.head.mapPartitionsWithIndex { (index, iter) =>
+          val evaluator = evaluatorFactory.createEvaluator()
+          evaluator.eval(index, iter)
         }
       }
     } else {
       // Right now, we support up to two input RDDs.
-      rdds.head.zipPartitions(rdds(1)) { (leftIter, rightIter) =>
-        Iterator((leftIter, rightIter))
-        // a small hack to obtain the correct partition index
-      }.mapPartitionsWithIndex { (index, zippedIter) =>
-        val (leftIter, rightIter) = zippedIter.next()
-        val (clazz, _) = CodeGenerator.compile(cleanedSource)
-        val buffer = clazz.generate(references).asInstanceOf[BufferedRowIterator]
-        buffer.init(index, Array(leftIter, rightIter))
-        new Iterator[InternalRow] {
-          override def hasNext: Boolean = {
-            val v = buffer.hasNext
-            if (!v) durationMs += buffer.durationMs()
-            v
-          }
-          override def next: InternalRow = buffer.next()
+      if (conf.usePartitionEvaluator) {
+        rdds.head.zipPartitionsWithEvaluator(rdds(1), evaluatorFactory)
+      } else {
+        rdds.head.zipPartitions(rdds(1)) { (leftIter, rightIter) =>
+          Iterator((leftIter, rightIter))
+          // a small hack to obtain the correct partition index
+        }.mapPartitionsWithIndex { (index, zippedIter) =>
+          val (leftIter, rightIter) = zippedIter.next()
+          val evaluator = evaluatorFactory.createEvaluator()
+          evaluator.eval(index, leftIter, rightIter)
         }
       }
     }
   }
 
   override def inputRDDs(): Seq[RDD[InternalRow]] = {
-    throw new UnsupportedOperationException
+    throw SparkUnsupportedOperationException()
   }
 
   override def doProduce(ctx: CodegenContext): String = {
-    throw new UnsupportedOperationException
+    throw SparkUnsupportedOperationException()
   }
 
   override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
@@ -807,13 +1104,14 @@ case class WholeStageCodegenExec(child: SparkPlan)(val codegenStageId: Int)
 
   override def generateTreeString(
       depth: Int,
-      lastChildren: Seq[Boolean],
+      lastChildren: java.util.ArrayList[Boolean],
       append: String => Unit,
       verbose: Boolean,
       prefix: String = "",
       addSuffix: Boolean = false,
       maxFields: Int,
       printNodeId: Boolean,
+      printOutputColumns: Boolean,
       indent: Int = 0): Unit = {
     child.generateTreeString(
       depth,
@@ -824,6 +1122,7 @@ case class WholeStageCodegenExec(child: SparkPlan)(val codegenStageId: Int)
       false,
       maxFields,
       printNodeId,
+      printOutputColumns,
       indent)
   }
 
@@ -835,6 +1134,23 @@ case class WholeStageCodegenExec(child: SparkPlan)(val codegenStageId: Int)
 
   override protected def withNewChildInternal(newChild: SparkPlan): WholeStageCodegenExec =
     copy(child = newChild)(codegenStageId)
+
+  // Use broadcast if the conf is enabled and the code + comment size exceeds the threshold,
+  // otherwise, fallback to use cleanedSource directly. The method returns either a
+  // broadcast variable or the original form of cleanedSource.
+  private[spark] def tryBroadcastCleanedSource(code: CodeAndComment):
+      Either[broadcast.Broadcast[CodeAndComment], CodeAndComment] = {
+    def exceedThreshold(): Boolean = {
+      code.body.length + code.comment.iterator.map(
+        e => e._1.length + e._2.length).sum > conf.broadcastCleanedSourceThreshold
+    }
+    val enabled = conf.broadcastCleanedSourceThreshold >= 0
+    if (enabled && exceedThreshold()) {
+      scala.util.Left(sparkContext.broadcast(code))
+    } else {
+      scala.util.Right(code)
+    }
+  }
 }
 
 
@@ -891,7 +1207,7 @@ case class CollapseCodegenStages(
 
   private def supportCodegen(plan: SparkPlan): Boolean = plan match {
     case plan: CodegenSupport if plan.supportCodegen =>
-      val willFallback = plan.expressions.exists(_.find(e => !supportCodegen(e)).isDefined)
+      val willFallback = plan.expressions.exists(_.exists(e => !supportCodegen(e)))
       // the generated code will be huge if there are too many columns
       val hasTooManyOutputFields =
         WholeStageCodegenExec.isTooManyFields(conf, plan.schema)
@@ -917,6 +1233,10 @@ case class CollapseCodegenStages(
         // The children of ShuffledHashJoin should do codegen separately.
         j.withNewChildren(j.children.map(
           child => InputAdapter(insertWholeStageCodegen(child))))
+      case j: SortMergeAsOfJoinExec =>
+        // The children of SortMergeAsOfJoin should do codegen separately.
+        j.withNewChildren(j.children.map(
+          child => InputAdapter(insertWholeStageCodegen(child))))
       case p => p.withNewChildren(p.children.map(insertInputAdapter))
     }
   }
@@ -934,6 +1254,10 @@ case class CollapseCodegenStages(
         // Do not make LogicalTableScanExec the root of WholeStageCodegen
         // to support the fast driver-local collect/take paths.
         plan
+      case plan: EmptyRelationExec =>
+        // Do not make EmptyRelationExec the root of WholeStageCodegen
+        // to support the fast driver-local collect/take paths.
+        plan
       case plan: CommandResultExec =>
         // Do not make CommandResultExec the root of WholeStageCodegen
         // to support the fast driver-local collect/take paths.
@@ -949,7 +1273,7 @@ case class CollapseCodegenStages(
   }
 
   def apply(plan: SparkPlan): SparkPlan = {
-    if (conf.wholeStageEnabled) {
+    if (conf.wholeStageEnabled && conf.codegenFactoryMode != CodegenObjectFactoryMode.NO_CODEGEN) {
       insertWholeStageCodegen(plan)
     } else {
       plan

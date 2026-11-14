@@ -17,10 +17,9 @@
 
 package org.apache.spark.streaming.ui
 
-import javax.servlet.http.HttpServletRequest
-
 import scala.xml._
 
+import jakarta.servlet.http.HttpServletRequest
 import org.apache.commons.text.StringEscapeUtils
 
 import org.apache.spark.status.api.v1.{JobData, StageData}
@@ -245,7 +244,7 @@ private[ui] class BatchPage(parent: StreamingTab) extends WebUIPage("batch") {
     <div>
       {outputOp.name}
       <span
-        onclick="this.parentNode.querySelector('.stage-details').classList.toggle('collapsed')"
+        data-toggle-details=".stage-details"
         class="expand-details">
           +details
       </span>
@@ -268,19 +267,6 @@ private[ui] class BatchPage(parent: StreamingTab) extends WebUIPage("batch") {
       Some(store.lastStageAttempt(stageId))
     } catch {
       case _: NoSuchElementException => None
-    }
-  }
-
-  private def generateOutputOperationStatusForUI(failure: String): String = {
-    if (failure.startsWith("org.apache.spark.SparkException")) {
-      "Failed due to Spark job error\n" + failure
-    } else {
-      var nextLineIndex = failure.indexOf("\n")
-      if (nextLineIndex < 0) {
-        nextLineIndex = failure.length
-      }
-      val firstLine = failure.substring(0, nextLineIndex)
-      s"Failed due to error: $firstLine\n$failure"
     }
   }
 
@@ -405,7 +391,7 @@ private[ui] class BatchPage(parent: StreamingTab) extends WebUIPage("batch") {
   private def metadataDescriptionToHTML(metadataDescription: String): Seq[Node] = {
     // tab to 4 spaces and "\n" to "<br/>"
     Unparsed(StringEscapeUtils.escapeHtml4(metadataDescription).
-      replaceAllLiterally("\t", "&nbsp;&nbsp;&nbsp;&nbsp;").replaceAllLiterally("\n", "<br/>"))
+      replace("\t", "&nbsp;&nbsp;&nbsp;&nbsp;").replace("\n", "<br/>"))
   }
 
   private def outputOpStatusCell(outputOp: OutputOperationUIData, rowspan: Int): Seq[Node] = {

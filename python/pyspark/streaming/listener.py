@@ -17,11 +17,10 @@
 
 from typing import Any
 
-
 __all__ = ["StreamingListener"]
 
 
-class StreamingListener(object):
+class StreamingListener:
     def __init__(self) -> None:
         pass
 

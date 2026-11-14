@@ -17,34 +17,79 @@
 # under the License.
 #
 
-# Intentionally has a general name.
-# because the test status check created in GitHub Actions
-# currently randomly picks any associated workflow.
-# So, the name was changed to make sense in that context too.
-# See also https://github.community/t/specify-check-suite-when-creating-a-checkrun/118380/10
+# Scheduled to avoid pull_request_target; never check out or run PR code here.
+# Labels in .github/labeler.yml are authoritative and must already exist.
+# Manually added configured labels are removed on the next scan if they do not
+# match the PR's changed files.
+#
+# To label all open PRs once, regardless of their last update:
+#   gh workflow run labeler.yml --repo apache/spark --ref master -f backfill=true
 
-name: "On pull requests"
-on: pull_request_target
+name: Label pull requests
+
+on:
+  schedule:
+  - cron: "7-59/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: Label all open PRs regardless of their last update
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   label:
     name: Label pull requests
+    if: github.repository == 'apache/spark' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
     steps:
-    # In order to get back the negated matches like in the old config,
-    # we need the actinons/labeler concept of `all` and `any` which matches
-    # all of the given constraints / glob patterns for either `all`
-    # files or `any` file in the change set.
-    #
-    # Github issue which requests a timeline for a release with any/all support:
-    #     - https://github.com/actions/labeler/issues/111
-    # This issue also references the issue that mentioned that any/all are only
-    # supported on main branch (previously called master):
-    #    - https://github.com/actions/labeler/issues/73#issuecomment-639034278
-    #
-    # However, these are not in a published release and the current `main` branch
-    # has some issues upon testing.
-    - uses: actions/labeler@5f867a63be70efff62b767459b009290364495eb # pin@2.2.0
-      with:
-        repo-token: "${{ secrets.GITHUB_TOKEN }}"
-        sync-labels: true
+      - name: Checkout labeler configuration
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - name: List PRs
+        id: prs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BACKFILL: ${{ inputs.backfill }}
+        run: |
+          if [[ "$BACKFILL" == "true" ]]; then
+            filters=(-f state=open)
+            echo "Listing all open PRs"
+          else
+            last_success=$(gh run list --workflow labeler.yml --branch master \
+              --event schedule --status success --limit 1 --json startedAt \
+              --jq '.[0].startedAt // empty')
+            if [ -n "$last_success" ]; then
+              # Keep a short overlap to catch PR updates missed near the previous run's start.
+              since=$(date -u -d "$last_success - 10 minutes" +%Y-%m-%dT%H:%M:%SZ)
+            else
+              since=$(date -u -d "12 hours ago" +%Y-%m-%dT%H:%M:%SZ)
+            fi
+            filters=(-f state=all -f since="$since")
+            echo "Listing PRs updated since $since"
+          fi
+          numbers=$(gh api --method GET --paginate "repos/$GITHUB_REPOSITORY/issues" \
+            "${filters[@]}" -f sort=updated -f direction=desc \
+            -f per_page=100 --jq '.[] | select(.pull_request != null) | .number')
+          echo "PRs to label: $(tr '\n' ' ' <<< "$numbers")"
+          if [ -n "$numbers" ]; then
+            printf 'numbers<<EOF\n%s\nEOF\n' "$numbers" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Label PRs
+        if: steps.prs.outputs.numbers != ''
+        uses: actions/labeler@v7
+        with:
+          pr-number: ${{ steps.prs.outputs.numbers }}
+          sync-labels: true

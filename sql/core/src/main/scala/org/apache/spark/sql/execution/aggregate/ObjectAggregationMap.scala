@@ -24,8 +24,66 @@ import org.apache.spark.internal.config
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateFunction, TypedImperativeAggregate}
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.catalyst.util.{UnsafeRowKeyOperations, UnsafeRowUtils}
 import org.apache.spark.sql.execution.UnsafeKVExternalSorter
 import org.apache.spark.sql.types.StructType
+
+private[aggregate] object ObjectAggregationMap {
+  private final class SemanticKey(
+      val keyOperations: UnsafeRowKeyOperations,
+      var row: UnsafeRow) {
+    override def hashCode(): Int = keyOperations.hash(row)
+
+    override def equals(other: Any): Boolean = other match {
+      case that: SemanticKey => row.equals(that.row) || keyOperations.areEqual(row, that.row)
+      case _ => false
+    }
+  }
+
+  def create(groupingSchema: StructType): ObjectAggregationMap = {
+    if (UnsafeRowUtils.isBinaryStable(groupingSchema)) {
+      new ObjectAggregationMap()
+    } else {
+      new SemanticObjectAggregationMap(groupingSchema)
+    }
+  }
+
+  private final class SemanticObjectAggregationMap(groupingSchema: StructType)
+      extends ObjectAggregationMap {
+    private val keyOperations = new UnsafeRowKeyOperations(groupingSchema)
+    private val hashMap = new ju.LinkedHashMap[SemanticKey, InternalRow]
+    private val reusableLookupKey = new SemanticKey(keyOperations, null)
+
+    override def getAggregationBuffer(groupingKey: UnsafeRow): InternalRow = {
+      reusableLookupKey.row = groupingKey
+      hashMap.get(reusableLookupKey)
+    }
+
+    override def putAggregationBuffer(groupingKey: UnsafeRow, aggBuffer: InternalRow): Unit = {
+      hashMap.put(new SemanticKey(keyOperations, groupingKey), aggBuffer)
+    }
+
+    override def size: Int = hashMap.size()
+
+    override def destructiveIterator(): Iterator[AggregationBufferEntry] = {
+      val iter = hashMap.entrySet().iterator()
+      new Iterator[AggregationBufferEntry] {
+        override def hasNext: Boolean = iter.hasNext
+
+        override def next(): AggregationBufferEntry = {
+          val entry = iter.next()
+          iter.remove()
+          new AggregationBufferEntry(entry.getKey.row, entry.getValue)
+        }
+      }
+    }
+
+    override def clear(): Unit = {
+      hashMap.clear()
+    }
+  }
+}
 
 /**
  * An aggregation map that supports using safe `SpecificInternalRow`s aggregation buffers, so that
@@ -45,7 +103,11 @@ class ObjectAggregationMap() {
 
   def size: Int = hashMap.size()
 
-  def iterator: Iterator[AggregationBufferEntry] = {
+  /**
+   * Returns a destructive iterator of AggregationBufferEntry.
+   * Notice: it is illegal to call any method after `destructiveIterator()` has been called.
+   */
+  def destructiveIterator(): Iterator[AggregationBufferEntry] = {
     val iter = hashMap.entrySet().iterator()
     new Iterator[AggregationBufferEntry] {
 
@@ -54,6 +116,7 @@ class ObjectAggregationMap() {
       }
       override def next(): AggregationBufferEntry = {
         val entry = iter.next()
+        iter.remove()
         new AggregationBufferEntry(entry.getKey, entry.getValue)
       }
     }
@@ -68,16 +131,17 @@ class ObjectAggregationMap() {
       aggregateFunctions: Seq[AggregateFunction]): UnsafeKVExternalSorter = {
     val aggBufferAttributes = aggregateFunctions.flatMap(_.aggBufferAttributes)
     val sorter = new UnsafeKVExternalSorter(
-      StructType.fromAttributes(groupingAttributes),
-      StructType.fromAttributes(aggBufferAttributes),
+      DataTypeUtils.fromAttributes(groupingAttributes),
+      DataTypeUtils.fromAttributes(aggBufferAttributes),
       SparkEnv.get.blockManager,
       SparkEnv.get.serializerManager,
       TaskContext.get().taskMemoryManager().pageSizeBytes,
       SparkEnv.get.conf.get(config.SHUFFLE_SPILL_NUM_ELEMENTS_FORCE_SPILL_THRESHOLD),
+      SparkEnv.get.conf.get(config.SHUFFLE_SPILL_MAX_SIZE_FORCE_SPILL_THRESHOLD),
       null
     )
 
-    val mapIterator = iterator
+    val mapIterator = destructiveIterator()
     val unsafeAggBufferProjection =
       UnsafeProjection.create(aggBufferAttributes.map(_.dataType).toArray)
 
@@ -95,7 +159,7 @@ class ObjectAggregationMap() {
       )
     }
 
-    hashMap.clear()
+    clear()
     sorter
   }
 

@@ -9,9 +9,9 @@ license: |
   The ASF licenses this file to You under the Apache License, Version 2.0
   (the "License"); you may not use this file except in compliance with
   the License.  You may obtain a copy of the License at
- 
+
      http://www.apache.org/licenses/LICENSE-2.0
- 
+
   Unless required by applicable law or agreed to in writing, software
   distributed under the License is distributed on an "AS IS" BASIS,
   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -27,7 +27,7 @@ Security features like authentication are not enabled by default. When deploying
 or an untrusted network, it's important to secure access to the cluster to prevent unauthorized applications
 from running on the cluster.
 
-Spark supports multiple deployments types and each one supports different levels of security. Not
+Spark supports multiple deployment types and each one supports different levels of security. Not
 all deployment types will be secure in all environments and none are secure by default. Be
 sure to evaluate your environment, what Spark supports, and take the appropriate measure to secure
 your Spark deployment.
@@ -49,9 +49,13 @@ specified below, the secret must be defined by setting the `spark.authenticate.s
 option. The same secret is shared by all Spark applications and daemons in that case, which limits
 the security of these deployments, especially on multi-tenant clusters.
 
-The REST Submission Server and the MesosClusterDispatcher do not support authentication.  You should
-ensure that all network access to the REST API & MesosClusterDispatcher (port 6066 and 7077
-respectively by default) are restricted to hosts that are trusted to submit jobs.
+The REST Submission Server supports HTTP `Authorization` header with
+a cryptographically signed JSON Web Token via `JWSFilter`.
+To enable authorization, Spark Master should have
+`spark.master.rest.filters=org.apache.spark.ui.JWSFilter` and
+`spark.org.apache.spark.ui.JWSFilter.param.secretKey=BASE64URL-ENCODED-KEY` configurations, and
+client should provide HTTP `Authorization` header which contains JSON Web Token signed by
+the shared secret key.
 
 ### YARN
 
@@ -59,6 +63,20 @@ For Spark on [YARN](running-on-yarn.html), Spark will automatically handle gener
 distributing the shared secret. Each application will use a unique shared secret. In
 the case of YARN, this feature relies on YARN RPC encryption being enabled for the distribution of
 secrets to be secure.
+
+<table class="spark-config">
+<thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr></thead>
+<tr>
+  <td><code>spark.yarn.shuffle.server.recovery.disabled</code></td>
+  <td>false</td>
+  <td>
+    Set to true for applications that have higher security requirements and prefer that their
+    secret is not saved in the db. The shuffle data of such applications will not be recovered after
+    the External Shuffle Service restarts.
+  </td>
+  <td>3.5.0</td>
+</tr>
+</table>
 
 ### Kubernetes
 
@@ -68,8 +86,8 @@ that any user that can list pods in the namespace where the Spark application is
 also see their authentication secret. Access control rules should be properly set up by the
 Kubernetes admin to ensure that Spark authentication is secure.
 
-<table class="table">
-<tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr>
+<table class="spark-config">
+<thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr></thead>
 <tr>
   <td><code>spark.authenticate</code></td>
   <td>false</td>
@@ -80,7 +98,7 @@ Kubernetes admin to ensure that Spark authentication is secure.
   <td><code>spark.authenticate.secret</code></td>
   <td>None</td>
   <td>
-    The secret key used authentication. See above for when this configuration should be set.
+    The secret key used for authentication. See above for when this configuration should be set.
   </td>
   <td>1.0.0</td>
 </tr>
@@ -89,8 +107,8 @@ Kubernetes admin to ensure that Spark authentication is secure.
 Alternatively, one can mount authentication secrets using files and Kubernetes secrets that
 the user mounts into their pods.
 
-<table class="table">
-<tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr>
+<table class="spark-config">
+<thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr></thead>
 <tr>
   <td><code>spark.authenticate.secret.file</code></td>
   <td>None</td>
@@ -133,20 +151,94 @@ Note that when using files, Spark will not mount these files into the containers
 you to ensure that the secret files are deployed securely into your containers and that the driver's
 secret file agrees with the executors' secret file.
 
-## Encryption
+# Network Encryption
+
+Spark supports two mutually exclusive forms of encryption for RPC connections:
+
+The **preferred method** uses TLS (aka SSL) encryption via Netty's support for SSL. Enabling SSL
+requires keys and certificates to be properly configured. SSL is standardized and considered more
+secure.
+
+The legacy method is an AES-based encryption mechanism relying on a shared secret. This requires
+RPC authentication to also be enabled. This method uses a bespoke protocol and it is recommended
+to use SSL instead.
+
+One may prefer to use the SSL based encryption in scenarios where compliance mandates the usage
+of specific protocols; or to leverage the security of a more standard encryption library. However,
+the AES based encryption is simpler to configure and may be preferred if the only requirement
+is that data be encrypted in transit.
+
+If both options are enabled in the configuration, the SSL based RPC encryption takes precedence
+and the AES based encryption will not be used (and a warning message will be emitted).
+
+## SSL Encryption (Preferred)
+
+Spark supports SSL based encryption for RPC connections. Please refer to the SSL Configuration
+section below to understand how to configure it. The SSL settings are mostly similar across the UI
+and RPC, however there are a few additional settings which are specific to the RPC implementation.
+The RPC implementation uses Netty under the hood (while the UI uses Jetty), which supports a
+different set of options.
+
+Unlike the other SSL settings for the UI, the RPC SSL is *not* automatically enabled if
+`spark.ssl.enabled` is set. It must be explicitly enabled, to ensure a safe migration path for users
+upgrading Spark versions.
+
+On Kubernetes, RPC SSL passwords set in the Spark configuration are propagated to executor pods
+using environment variables, like the authentication secret described under
+[Kubernetes](#kubernetes) above, so any user who can list pods in the namespace can read them. In
+cluster mode they are also stored in plaintext in the driver's ConfigMap. To avoid both, store the
+passwords in a Kubernetes Secret and bind the following variables on the driver and the executors
+using `spark.kubernetes.driver.secretKeyRef.<name>` and
+`spark.kubernetes.executor.secretKeyRef.<name>`, instead of setting them in the Spark configuration:
+
+* `_SPARK_SSL_RPC_KEY_STORE_PASSWORD`
+* `_SPARK_SSL_RPC_KEY_PASSWORD`
+* `_SPARK_SSL_RPC_PRIVATE_KEY_PASSWORD`
+* `_SPARK_SSL_RPC_TRUST_STORE_PASSWORD`
+
+For example:
+`spark.kubernetes.executor.secretKeyRef._SPARK_SSL_RPC_KEY_STORE_PASSWORD=<secret-name>:<key>`.
+
+On the driver, these variables also take precedence over the passwords the UI inherits from
+`spark.ssl.*`. Any UI password not set in the `spark.ssl.ui` namespace or a Hadoop credential
+provider is filled from these variables, even if `spark.ssl.*` does not set it either. With
+`_SPARK_SSL_RPC_KEY_PASSWORD` bound on the driver, `spark.ssl.ui.keyPassword` has to be set as
+well, usually to the UI keystore password, or the UI cannot recover its private key and the driver
+exits. If the UI requires client authentication, `spark.ssl.ui.trustStorePassword` has to be set
+explicitly too. Set these UI passwords, and any other that differs from the RPC one, in the
+`spark.ssl.ui` namespace, for example through variable substitution
+(`spark.ssl.ui.keyStorePassword=${env:UI_KS_PASS}` with `UI_KS_PASS` bound using
+`spark.kubernetes.driver.secretKeyRef`) or a Hadoop credential provider, to keep them out of the
+driver's ConfigMap.
+
+A variable already bound on the executors, through `secretKeyRef`, `spark.executorEnv` or the
+executor pod template, is not overwritten. Passwords the driver reads from a Hadoop credential
+provider or from its environment are not propagated and must be provided to the executors
+directly. Passwords set through variable substitution, for example
+`spark.ssl.rpc.keyStorePassword=${env:KS_PASS}`, are not propagated either; bind both the
+referenced variable (`KS_PASS`) and the matching `_SPARK_SSL_RPC_*` variable on the executors.
+If the executor container in the pod template uses `envFrom`, no passwords are propagated.
+
+## AES-based Encryption (Legacy)
 
 Spark supports AES-based encryption for RPC connections. For encryption to be enabled, RPC
 authentication must also be enabled and properly configured. AES encryption uses the
 [Apache Commons Crypto](https://commons.apache.org/proper/commons-crypto/) library, and Spark's
 configuration system allows access to that library's configuration for advanced users.
 
+This legacy protocol has two mutually incompatible versions. Version 1 omits applying key derivation function
+(KDF) to the key exchange protocol's output, while version 2 applies a KDF to ensure that the derived session
+key is uniformly distributed. Version 1 is default for backward compatibility. It is **recommended to use version 2**
+for better security properties. The version can be configured by setting `spark.network.crypto.authEngineVersion` to
+1 or 2 respectively.
+
 There is also support for SASL-based encryption, although it should be considered deprecated. It
 is still required when talking to shuffle services from Spark versions older than 2.2.0.
 
 The following table describes the different options available for configuring this feature.
 
-<table class="table">
-<tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr>
+<table class="spark-config">
+<thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr></thead>
 <tr>
   <td><code>spark.network.crypto.enabled</code></td>
   <td>false</td>
@@ -156,21 +248,19 @@ The following table describes the different options available for configuring th
   <td>2.2.0</td>
 </tr>
 <tr>
-  <td><code>spark.network.crypto.keyLength</code></td>
-  <td>128</td>
+  <td><code>spark.network.crypto.cipher</code></td>
+  <td>AES/CTR/NoPadding</td>
   <td>
-    The length in bits of the encryption key to generate. Valid values are 128, 192 and 256.
+    Cipher mode to use. Defaults "AES/CTR/NoPadding" for backward compatibility, which is not authenticated. 
+    Recommended to use "AES/GCM/NoPadding", which is an authenticated encryption mode.
   </td>
-  <td>2.2.0</td>
+  <td>4.0.0, 3.5.2, 3.4.4</td>
 </tr>
 <tr>
-  <td><code>spark.network.crypto.keyFactoryAlgorithm</code></td>
-  <td>PBKDF2WithHmacSHA1</td>
-  <td>
-    The key factory algorithm to use when generating encryption keys. Should be one of the
-    algorithms supported by the javax.crypto.SecretKeyFactory class in the JRE being used.
-  </td>
-  <td>2.2.0</td>
+  <td><code>spark.network.crypto.authEngineVersion</code></td>
+  <td>1</td>
+  <td>Version of AES-based RPC encryption to use. Valid versions are 1 or 2. Version 2 is recommended.</td>
+  <td>4.0.0</td>
 </tr>
 <tr>
   <td><code>spark.network.crypto.config.*</code></td>
@@ -212,7 +302,6 @@ The following table describes the different options available for configuring th
 </tr>
 </table>
 
-
 # Local Storage Encryption
 
 Spark supports encrypting temporary data written to local disks. This covers shuffle files, shuffle
@@ -222,13 +311,13 @@ encrypting output data generated by applications with APIs such as `saveAsHadoop
 
 The following settings cover enabling encryption for data written to disk:
 
-<table class="table">
-<tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr>
+<table class="spark-config">
+<thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr></thead>
 <tr>
   <td><code>spark.io.encryption.enabled</code></td>
   <td>false</td>
   <td>
-    Enable local disk I/O encryption. Currently supported by all modes except Mesos. It's strongly
+    Enable local disk I/O encryption. Currently supported by all modes. It's strongly
     recommended that RPC encryption be enabled when using this feature.
   </td>
   <td>2.1.0</td>
@@ -268,7 +357,7 @@ The following settings cover enabling encryption for data written to disk:
 
 ## Authentication and Authorization
 
-Enabling authentication for the Web UIs is done using [javax servlet filters](https://docs.oracle.com/javaee/6/api/javax/servlet/Filter.html).
+Enabling authentication for the Web UIs is done using [jakarta servlet filters](https://jakarta.ee/specifications/servlet/5.0/apidocs/jakarta/servlet/filter).
 You will need a filter that implements the authentication method you want to deploy. Spark does not
 provide any built-in authentication filters.
 
@@ -290,12 +379,26 @@ below.
 
 The following options control the authentication of Web UIs:
 
-<table class="table">
-<tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr>
+<table class="spark-config">
+<thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr></thead>
+<tr>
+  <td><code>spark.ui.allowFramingFrom</code></td>
+  <td><code>SAMEORIGIN</code></td>
+  <td>Allow framing for a specific named URI via CSP <code>frame-ancestors</code> directive. By default, allow only from the same origin. Requires <code>spark.ui.contentSecurityPolicy.enabled=true</code> to take effect. When CSP is disabled, <code>X-Frame-Options: SAMEORIGIN</code> is used regardless of this setting.</td>
+  <td>1.6.0</td>
+</tr>
+<tr>
+  <td><code>spark.ui.contentSecurityPolicy.frameAncestors.enabled</code></td>
+  <td><code>true</code></td>
+  <td>Whether to include the <code>frame-ancestors</code> directive in the CSP header when <code>spark.ui.contentSecurityPolicy.enabled=true</code>. When enabled, the <code>frame-ancestors</code> directive enforces the <code>spark.ui.allowFramingFrom</code> setting. This setting is ignored when CSP is disabled.</td>
+  <td>4.3.0</td>
+</tr>
 <tr>
   <td><code>spark.ui.filters</code></td>
   <td>None</td>
   <td>
+    Spark supports HTTP <code>Authorization</code> header with a cryptographically signed
+    JSON Web Token via <code>org.apache.spark.ui.JWSFilter</code>. <br />
     See the <a href="configuration.html#spark-ui">Spark UI</a> configuration for how to configure
     filters.
   </td>
@@ -388,8 +491,8 @@ servlet filters.
 
 To enable authorization in the SHS, a few extra options are used:
 
-<table class="table">
-<tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr>
+<table class="spark-config">
+<thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr></thead>
 <tr>
   <td><code>spark.history.ui.acls.enable</code></td>
   <td>false</td>
@@ -434,14 +537,18 @@ application configurations will be ignored.
 Configuration for SSL is organized hierarchically. The user can configure the default SSL settings
 which will be used for all the supported communication protocols unless they are overwritten by
 protocol-specific settings. This way the user can easily provide the common settings for all the
-protocols without disabling the ability to configure each one individually. The following table
-describes the SSL configuration namespaces:
+protocols without disabling the ability to configure each one individually. Note that all settings 
+are inherited this way, *except* for `spark.ssl.rpc.enabled` which must be explicitly set.
 
-<table class="table">
+The following table describes the SSL configuration namespaces:
+
+<table>
+  <thead>
   <tr>
     <th>Config Namespace</th>
     <th>Component</th>
   </tr>
+  </thead>
   <tr>
     <td><code>spark.ssl</code></td>
     <td>
@@ -461,17 +568,22 @@ describes the SSL configuration namespaces:
     <td><code>spark.ssl.historyServer</code></td>
     <td>History Server Web UI</td>
   </tr>
+  <tr>
+    <td><code>spark.ssl.rpc</code></td>
+    <td>Spark RPC communication</td>
+  </tr>
 </table>
 
 The full breakdown of available SSL options can be found below. The `${ns}` placeholder should be
 replaced with one of the above namespaces.
 
-<table class="table">
-<tr><th>Property Name</th><th>Default</th><th>Meaning</th></tr>
+<table>
+<thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Supported Namespaces</th></tr></thead>
   <tr>
     <td><code>${ns}.enabled</code></td>
     <td>false</td>
     <td>Enables SSL. When enabled, <code>${ns}.ssl.protocol</code> is required.</td>
+    <td>ui,standalone,historyServer,rpc</td>
   </tr>
   <tr>
     <td><code>${ns}.port</code></td>
@@ -485,6 +597,7 @@ replaced with one of the above namespaces.
       <br />When not set, the SSL port will be derived from the non-SSL port for the
       same service. A value of "0" will make the service bind to an ephemeral port.
     </td>
+    <td>ui,standalone,historyServer</td>
   </tr>
   <tr>
     <td><code>${ns}.enabledAlgorithms</code></td>
@@ -493,12 +606,13 @@ replaced with one of the above namespaces.
       A comma-separated list of ciphers. The specified ciphers must be supported by JVM.
 
       <br />The reference list of protocols can be found in the "JSSE Cipher Suite Names" section
-      of the Java security guide. The list for Java 8 can be found at
-      <a href="https://docs.oracle.com/javase/8/docs/technotes/guides/security/StandardNames.html#ciphersuites">this</a>
+      of the Java security guide. The list for Java 21 can be found at
+      <a href="https://docs.oracle.com/en/java/javase/21/docs/specs/security/standard-names.html#jsse-cipher-suite-names">this</a>
       page.
 
       <br />Note: If not set, the default cipher suite for the JRE will be used.
     </td>
+    <td>ui,standalone,historyServer,rpc</td>
   </tr>
   <tr>
     <td><code>${ns}.keyPassword</code></td>
@@ -506,6 +620,7 @@ replaced with one of the above namespaces.
     <td>
       The password to the private key in the key store.
     </td>
+    <td>ui,standalone,historyServer,rpc</td>
   </tr>
   <tr>
     <td><code>${ns}.keyStore</code></td>
@@ -514,16 +629,19 @@ replaced with one of the above namespaces.
       Path to the key store file. The path can be absolute or relative to the directory in which the
       process is started.
     </td>
+    <td>ui,standalone,historyServer,rpc</td>
   </tr>
   <tr>
     <td><code>${ns}.keyStorePassword</code></td>
     <td>None</td>
     <td>Password to the key store.</td>
+    <td>ui,standalone,historyServer,rpc</td>
   </tr>
   <tr>
     <td><code>${ns}.keyStoreType</code></td>
     <td>JKS</td>
     <td>The type of the key store.</td>
+    <td>ui,standalone,historyServer</td>
   </tr>
   <tr>
     <td><code>${ns}.protocol</code></td>
@@ -532,15 +650,19 @@ replaced with one of the above namespaces.
       TLS protocol to use. The protocol must be supported by JVM.
 
       <br />The reference list of protocols can be found in the "Additional JSSE Standard Names"
-      section of the Java security guide. For Java 8, the list can be found at
-      <a href="https://docs.oracle.com/javase/8/docs/technotes/guides/security/StandardNames.html#jssenames">this</a>
+      section of the Java security guide. For Java 21, the list can be found at
+      <a href="https://docs.oracle.com/en/java/javase/21/docs/specs/security/standard-names.html#additional-jsse-standard-names">this</a>
       page.
     </td>
+    <td>ui,standalone,historyServer,rpc</td>
   </tr>
   <tr>
     <td><code>${ns}.needClientAuth</code></td>
     <td>false</td>
-    <td>Whether to require client authentication.</td>
+    <td>
+      Whether to require client authentication.
+    </td>
+    <td>ui,standalone,historyServer</td>
   </tr>
   <tr>
     <td><code>${ns}.trustStore</code></td>
@@ -549,16 +671,76 @@ replaced with one of the above namespaces.
       Path to the trust store file. The path can be absolute or relative to the directory in which
       the process is started.
     </td>
+    <td>ui,standalone,historyServer,rpc</td>
   </tr>
   <tr>
     <td><code>${ns}.trustStorePassword</code></td>
     <td>None</td>
     <td>Password for the trust store.</td>
+    <td>ui,standalone,historyServer,rpc</td>
   </tr>
   <tr>
     <td><code>${ns}.trustStoreType</code></td>
     <td>JKS</td>
     <td>The type of the trust store.</td>
+    <td>ui,standalone,historyServer</td>
+  </tr>
+  <tr>
+    <td><code>${ns}.openSSLEnabled</code></td>
+    <td>false</td>
+    <td>
+      Whether to use OpenSSL for cryptographic operations instead of the JDK SSL provider.
+      This setting requires the `certChain` and `privateKey` settings to be set.
+      This takes precedence over the `keyStore` and `trustStore` settings if both are specified.
+      If the OpenSSL library is not available at runtime, we will fall back to the JDK provider.
+    </td>
+    <td>rpc</td>
+  </tr>
+  <tr>
+    <td><code>${ns}.privateKey</code></td>
+    <td>None</td>
+    <td>
+      Path to the private key file in PEM format. The path can be absolute or relative to the 
+      directory in which the process is started. 
+      This setting is required when using the OpenSSL implementation.
+    </td>
+    <td>rpc</td>
+  </tr>
+  <tr>
+    <td><code>${ns}.privateKeyPassword</code></td>
+    <td>None</td>
+    <td>
+      The password to the above private key file in PEM format.
+    </td>
+    <td>rpc</td>
+  </tr>
+  <tr>
+    <td><code>${ns}.certChain</code></td>
+    <td>None</td>
+    <td>
+      Path to the certificate chain file in PEM format. The path can be absolute or relative to the 
+      directory in which the process is started. 
+      This setting is required when using the OpenSSL implementation.
+    </td>
+    <td>rpc</td>
+  </tr>
+  <tr>
+    <td><code>${ns}.trustStoreReloadingEnabled</code></td>
+    <td>false</td>
+    <td>
+      Whether the trust store should be reloaded periodically.
+      This setting is mostly only useful in standalone deployments, not k8s or yarn deployments.
+    </td>
+    <td>rpc</td>
+  </tr>
+  <tr>
+    <td><code>${ns}.trustStoreReloadIntervalMs</code></td>
+    <td>10000</td>
+    <td>
+      The interval at which the trust store should be reloaded (in milliseconds).
+      This setting is mostly only useful in standalone deployments, not k8s or yarn deployments.
+    </td>
+    <td>rpc</td>
   </tr>
 </table>
 
@@ -586,7 +768,7 @@ Or via SparkConf "spark.hadoop.hadoop.security.credential.provider.path=jceks://
 ## Preparing the key stores
 
 Key stores can be generated by `keytool` program. The reference documentation for this tool for
-Java 8 is [here](https://docs.oracle.com/javase/8/docs/technotes/tools/unix/keytool.html).
+Java 21 is [here](https://docs.oracle.com/en/java/javase/21/docs/specs/man/keytool.html).
 The most basic steps to configure the key stores and the trust store for a Spark Standalone
 deployment mode is as follows:
 
@@ -616,36 +798,24 @@ The user may allow the executors to use the SSL settings inherited from the work
 can be accomplished by setting `spark.ssl.useNodeLocalConf` to `true`. In that case, the settings
 provided by the user on the client side are not used.
 
-### Mesos mode
-
-Mesos 1.3.0 and newer supports `Secrets` primitives as both file-based and environment based
-secrets. Spark allows the specification of file-based and environment variable based secrets with
-`spark.mesos.driver.secret.filenames` and `spark.mesos.driver.secret.envkeys`, respectively.
-
-Depending on the secret store backend secrets can be passed by reference or by value with the
-`spark.mesos.driver.secret.names` and `spark.mesos.driver.secret.values` configuration properties,
-respectively.
-
-Reference type secrets are served by the secret store and referred to by name, for example
-`/mysecret`. Value type secrets are passed on the command line and translated into their
-appropriate files or environment variables.
-
 ## HTTP Security Headers
 
 Apache Spark can be configured to include HTTP headers to aid in preventing Cross Site Scripting
 (XSS), Cross-Frame Scripting (XFS), MIME-Sniffing, and also to enforce HTTP Strict Transport
 Security.
 
-<table class="table">
-<tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr>
+<table class="spark-config">
+<thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr></thead>
 <tr>
   <td><code>spark.ui.xXssProtection</code></td>
-  <td><code>1; mode=block</code></td>
+  <td><code>0</code></td>
   <td>
-    Value for HTTP X-XSS-Protection response header. You can choose appropriate value
-    from below:
+    Value for HTTP X-XSS-Protection response header. The default is <code>0</code> which
+    disables the browser's XSS Auditor. The XSS Auditor has been removed from Chrome and
+    Edge, and was never implemented in Firefox. In browsers that still support it (Safari),
+    it can introduce side-channel vulnerabilities. Use Content-Security-Policy instead.
     <ul>
-      <li><code>0</code> (Disables XSS filtering)</li>
+      <li><code>0</code> (Disables XSS filtering. Recommended.)</li>
       <li><code>1</code> (Enables XSS filtering. If a cross-site scripting attack is detected,
         the browser will sanitize the page.)</li>
       <li><code>1; mode=block</code> (Enables XSS filtering. The browser will prevent rendering
@@ -677,6 +847,16 @@ Security.
   </td>
   <td>2.3.0</td>
 </tr>
+<tr>
+  <td><code>spark.ui.contentSecurityPolicy.enabled</code></td>
+  <td><code>true</code></td>
+  <td>
+    When enabled, the Content-Security-Policy (CSP) HTTP response header is set for the Spark UI,
+    restricting the sources from which the browser is allowed to load resources as a
+    defense-in-depth measure against cross-site scripting (XSS).
+  </td>
+  <td>4.2.0</td>
+</tr>
 </table>
 
 
@@ -687,16 +867,24 @@ They are generally private services, and should only be accessible within the ne
 organization that deploys Spark. Access to the hosts and ports used by Spark services should
 be limited to origin hosts that need to access the services.
 
+However, like the REST Submission port, Spark also supports HTTP `Authorization` header
+with a cryptographically signed JSON Web Token (JWT) for all UI ports.
+To use it, a user needs to configure
+`spark.ui.filters=org.apache.spark.ui.JWSFilter` and
+`spark.org.apache.spark.ui.JWSFilter.param.secretKey=BASE64URL-ENCODED-KEY`.
+
 Below are the primary ports that Spark uses for its communication and how to
 configure those ports.
 
 ## Standalone mode only
 
-<table class="table">
+<table>
+  <thead>
   <tr>
     <th>From</th><th>To</th><th>Default Port</th><th>Purpose</th><th>Configuration
     Setting</th><th>Notes</th>
   </tr>
+  </thead>
   <tr>
     <td>Browser</td>
     <td>Standalone Master</td>
@@ -741,11 +929,13 @@ configure those ports.
 
 ## All cluster managers
 
-<table class="table">
+<table>
+  <thead>
   <tr>
     <th>From</th><th>To</th><th>Default Port</th><th>Purpose</th><th>Configuration
     Setting</th><th>Notes</th>
   </tr>
+  </thead>
   <tr>
     <td>Browser</td>
     <td>Application</td>
@@ -788,9 +978,8 @@ In most cases, Spark relies on the credentials of the current logged in user whe
 to Kerberos-aware services. Such credentials can be obtained by logging in to the configured KDC
 with tools like `kinit`.
 
-When talking to Hadoop-based services, Spark needs to obtain delegation tokens so that non-local
-processes can authenticate. Spark ships with support for HDFS and other Hadoop file systems, Hive
-and HBase.
+When talking to Hadoop-based services, Spark needs to obtain delegation tokens so that processes
+can authenticate. Spark ships with support for HDFS and other Hadoop file systems, Hive and HBase.
 
 When using a Hadoop filesystem (such HDFS or WebHDFS), Spark will acquire the relevant tokens
 for the service hosting the user's home directory.
@@ -810,13 +999,13 @@ mechanism (see `java.util.ServiceLoader`). Implementations of
 `org.apache.spark.security.HadoopDelegationTokenProvider` can be made available to Spark
 by listing their names in the corresponding file in the jar's `META-INF/services` directory.
 
-Delegation token support is currently only supported in YARN and Mesos modes. Consult the
-deployment-specific page for more information.
+Delegation token support is currently only supported in Local, YARN and Kubernetes modes.
+Consult the deployment-specific page for more information.
 
 The following options provides finer-grained control for this feature:
 
-<table class="table">
-<tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr>
+<table class="spark-config">
+<thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr></thead>
 <tr>
   <td><code>spark.security.credentials.${service}.enabled</code></td>
   <td><code>true</code></td>
@@ -829,12 +1018,29 @@ The following options provides finer-grained control for this feature:
   <td>2.3.0</td>
 </tr>
 <tr>
+  <td><code>spark.security.directCredentialProviders.enabled</code></td>
+  <td><code>false</code></td>
+  <td>
+    When true, enables credential collection and renewal without Kerberos. Providers
+    registered via <code>HadoopDelegationTokenProvider</code> are called directly (without
+    <code>doLogin</code>/<code>doAs</code>) and participate in the same renewal and
+    distribution lifecycle as Kerberos delegation token providers. Providers that require
+    Kerberos self-gate via their <code>delegationTokensRequired</code> method.
+    Requires RPC channel encryption: either <code>spark.ssl.rpc.enabled=true</code>,
+    or <code>spark.authenticate=true</code> together with
+    <code>spark.network.crypto.enabled</code> or
+    <code>spark.authenticate.enableSaslEncryption</code>.
+    Supported on YARN, Kubernetes, and local mode. Not supported on standalone clusters.
+  </td>
+  <td>4.3.0</td>
+</tr>
+<tr>
   <td><code>spark.kerberos.access.hadoopFileSystems</code></td>
   <td>(none)</td>
   <td>
     A comma-separated list of secure Hadoop filesystems your Spark application is going to access. For
-    example, <code>spark.kerberos.access.hadoopFileSystems=hdfs://nn1.com:8032,hdfs://nn2.com:8032,
-    webhdfs://nn3.com:50070</code>. The Spark application must have access to the filesystems listed
+    example, <code>spark.kerberos.access.hadoopFileSystems=hdfs://nn1.example.com:8032,hdfs://nn2.example.com:8032,
+    webhdfs://nn3.example.com:50070</code>. The Spark application must have access to the filesystems listed
     and Kerberos must be properly configured to be able to access them (either in the same realm
     or in a trusted realm). Spark acquires security tokens for each of the filesystems so that
     the Spark application can access those remote Hadoop filesystems.
@@ -852,7 +1058,7 @@ Long-running applications may run into issues if their run time exceeds the maxi
 token lifetime configured in services it needs to access.
 
 This feature is not available everywhere. In particular, it's only implemented
-on YARN and Kubernetes (both client and cluster modes), and on Mesos when using client mode.
+on YARN and Kubernetes (both client and cluster modes).
 
 Spark supports automatically creating new tokens for these applications. There are two ways to
 enable this functionality.
@@ -878,10 +1084,32 @@ It's up to the user to maintain an updated ticket cache that Spark can use.
 The location of the ticket cache can be customized by setting the `KRB5CCNAME` environment
 variable.
 
+## Proxy User
+
+Spark also provides `--proxy-user` parameter for `spark-submit` to enable Hadoop's
+[Proxy user](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-common/Superusers.html) feature.
+
+If the target cluster, e.g., YARN, HDFS, is running in Secure Mode, the superuser must have a valid
+Kerberos ticket to log in. The impersonated user (proxy-user) does not need to have a Kerberos ticket.
+In addition, the superuser must be configured in the cluster to be allowed to impersonate the
+proxy user.
+
+The authentication happens on the target cluster side, and once the authentication is successful, the cluster will
+do resource allocation and file system access on behalf of the proxy user.
+
+Note that, depending on Spark's deployment mode, the proxy user might behave differently. For cluster mode, the JVM
+running the driver will be started by the proxy user, while for client mode, it will be started by the superuser instead. This is due to
+the Driver being initialized inside the progress of `SparkSubmit` client. This makes a difference in file system access
+for local file permissions. This is not considered a CVE issue, but users should be aware of this difference.
+
+Nowadays, many projects, such as Apache Kyuubi, provide a multi-tenant Spark service with impersonation. To prevent
+server-side local files from reading and leaking by superuser to other tenants, it is recommended to refer to their
+documentation to find out instructions on how to ensure cluster mode is used for a more secure purpose.
+
 ## Secure Interaction with Kubernetes
 
 When talking to Hadoop-based services behind Kerberos, it was noted that Spark needs to obtain delegation tokens
-so that non-local processes can authenticate. These delegation tokens in Kubernetes are stored in Secrets that are
+so that processes can authenticate. These delegation tokens in Kubernetes are stored in Secrets that are
 shared by the Driver and its Executors. As such, there are three ways of submitting a Kerberos job:
 
 In all cases you must define the environment variable: `HADOOP_CONF_DIR` or
@@ -954,6 +1182,371 @@ achieved by setting `spark.kubernetes.hadoop.configMapName` to a pre-existing Co
     local:///opt/spark/examples/jars/spark-examples_<VERSION>.jar \
     <HDFS_FILE_LOCATION>
 ```
+
+# OIDC Credential Propagation
+
+Spark supports propagating short-lived, per-workload or per-user credentials to executors in
+environments that use OIDC / OAuth 2.0 for authentication, such as Spark on Kubernetes accessing
+cloud object storage. This generalizes the delegation-token propagation model described in the
+[Kerberos](#kerberos) section above to OIDC-based systems: instead of obtaining Hadoop delegation
+tokens from a KDC, the driver reads an OIDC identity token (a JWT), exchanges it for short-lived
+service credentials, and distributes those credentials to executors, refreshing them automatically
+for long-running applications.
+
+This feature is disabled by default. It is enabled by setting `spark.security.oidc.enabled=true`
+and providing an identity token file via `spark.security.oidc.identityToken.file`. When disabled,
+none of the components described below are started and existing applications are unaffected.
+
+As with the Kerberos path, Spark's role here is limited to propagating delegated credentials, not
+to authenticating users or enforcing access control. The downstream service (for example, a cloud
+IAM system or an object store) performs authorization using the credential Spark propagates. The
+raw identity token is consumed only on the driver; executors receive only the short-lived service
+credentials derived from it.
+
+## How it works
+
+When enabled, credential propagation runs on independent threads alongside the Kerberos delegation
+token machinery, and the two coexist without interfering with each other. A cluster that accesses
+HDFS via Kerberos and cloud storage via OIDC at the same time is a supported configuration.
+
+Credential propagation targets Spark on Kubernetes accessing cloud object storage, which is the
+deployment this feature is designed and documented for. See
+[Running Spark on Kubernetes](running-on-kubernetes.html#oidc-credential-propagation) for complete
+configuration examples.
+
+1. On the driver, a token ingestor reads the OIDC identity token from the configured file and
+   produces a driver-only user context. Kubernetes projected ServiceAccount tokens (which are
+   rotated automatically by the kubelet) and externally-injected per-user tokens are both supported,
+   because the ingestor detects file rotation and reloads the token.
+1. A driver-side credential manager (a sibling of the Kerberos delegation token manager) passes the
+   user context to a `CredentialProvider` for each configured scheme, obtaining a short-lived service
+   credential.
+1. The service credentials are serialized and distributed to all registered executors via an RPC
+   message. Newly-registered executors (for example, those created by dynamic allocation) receive
+   the current credentials as part of their registration response, and each launched task also
+   carries the current credentials in its `TaskDescription`, so executors have valid credentials
+   before running any task. All of these delivery paths travel over Spark's RPC channels and are
+   covered by the same RPC encryption.
+1. The manager schedules the next renewal ahead of the earliest expiry (the minimum of the identity
+   token expiry and the service credential expiry, minus a configurable safety margin), and retries
+   with exponential backoff on failure.
+1. On the executor, connector-specific code reads the current service credential from an in-memory
+   store on each access, so credential refreshes are picked up without restarting tasks or
+   invalidating filesystem caches.
+
+The components mirror the existing Kerberos delegation token path:
+
+| OIDC path | Kerberos path |
+|---|---|
+| OIDC identity token file | Keytab / ticket cache |
+| Driver-side credential manager | `HadoopDelegationTokenManager` |
+| `CredentialProvider.resolve()` | `HadoopDelegationTokenProvider.obtainDelegationTokens()` |
+| `UpdateUserCredentials` RPC | `UpdateDelegationTokens` RPC |
+| Executor credential store | `SparkEnv` delegation credentials |
+
+## Security model
+
+The security model closely follows the Kerberos delegation token model, where executors receive
+delegation tokens rather than the original ticket-granting ticket.
+
+* The raw identity token never leaves the driver. Executors receive only short-lived, scoped
+  service credentials produced by a `CredentialProvider`. A service credential is narrower and
+  shorter-lived than the original identity token, but should still be treated as sensitive.
+* The driver-side user context that holds the raw token is never serialized or transmitted (it is
+  not `Serializable`), and it redacts the raw token in its `toString()` representation, so the token
+  is not written to logs.
+* Service credentials are not written to shuffle files, event logs, or checkpoints.
+* Credentials are carried over Spark's RPC channels and therefore rely on Spark's existing RPC
+  encryption configuration. Operators are strongly encouraged to enable RPC encryption whenever
+  credential propagation is enabled. If credential propagation is enabled while RPC encryption is
+  not configured, Spark logs a warning at startup, since credentials would otherwise be transmitted
+  to executors over an unencrypted channel. To turn this into a hard requirement, set
+  `spark.security.oidc.requireRpcEncryption=true`, which makes Spark refuse to start unless RPC
+  encryption is configured. See [Network Encryption](#network-encryption) for
+  details.
+
+## Custom CredentialProvider
+
+The credential exchange step is pluggable. Spark discovers implementations of
+[`CredentialProvider`](api/java/org/apache/spark/security/CredentialProvider.html) using the Java
+Services mechanism (see `java.util.ServiceLoader`): an implementation is made available to Spark by
+listing its fully-qualified class name in the corresponding file in the jar's `META-INF/services`
+directory, exactly as with custom `HadoopDelegationTokenProvider` implementations for the Kerberos
+path.
+
+A `CredentialProvider` declares the URI schemes it supports (for example, `s3a`) and exchanges the
+driver-side user context for a
+[`ServiceCredential`](api/java/org/apache/spark/security/ServiceCredential.html) scoped to a target
+URI. When more than one provider is registered for the same scheme, the provider used for that
+scheme is selected via `spark.security.oidc.provider.<scheme>`. The configuration passed to a
+provider is scoped to keys starting with `spark.security.oidc.`, so unrelated configuration is not
+exposed to third-party providers.
+
+The `CredentialProvider` SPI and its related types
+([`UserContext`](api/java/org/apache/spark/security/UserContext.html),
+[`ServiceCredential`](api/java/org/apache/spark/security/ServiceCredential.html), and
+[`UserCredentials`](api/java/org/apache/spark/security/UserCredentials.html)) are annotated
+`@DeveloperApi` and may evolve in minor releases.
+
+Spark ships a reference implementation for AWS S3 / STS-compatible endpoints in an optional module.
+See [AWS reference provider](#aws-reference-provider) below for how to enable and configure it, and
+[Running Spark on Kubernetes](running-on-kubernetes.html#oidc-credential-propagation) for complete
+configuration examples using Kubernetes projected ServiceAccount tokens and per-user identity tokens.
+
+## Provider-declared configuration and driver-side access
+
+A `CredentialProvider` may declare additional Spark configuration properties that should be set
+whenever it is selected (via `CredentialProvider.additionalSparkProperties()`), for example the
+Hadoop credentials-provider class for a filesystem scheme. Spark applies these properties on both
+the driver and the executors -- only for keys the user has not already set explicitly -- before the
+components that consume them are initialized. This means that, with the feature enabled and no
+explicit provider wiring configured, both the driver and the executors access storage using the
+propagated OIDC credentials.
+
+There are two situations, both specific to accessing storage from the *driver* very early in
+startup, where the propagated credentials are not yet available. Both only matter when the driver
+itself accesses cloud storage (a common case in cluster mode: output-path existence checks, the
+commit protocol, and schema inference all run on the driver).
+
+* **Access during `SparkContext` construction.** The provider wiring is applied early in
+  `SparkContext` initialization, but the credentials it points at are not resolved until the
+  scheduler backend starts, slightly later in the same initialization. Any driver-side storage
+  access that happens in between runs before the credentials exist and therefore cannot use them.
+  This affects resources fetched or validated during construction from a scheme served by a
+  `CredentialProvider` (for example `s3a://`): `spark.jars`, `spark.files`, `spark.archives`, and
+  `spark.checkpoint.dir`. Note the two failure shapes: `spark.files` / `spark.archives` and
+  `spark.checkpoint.dir` propagate the error and fail `SparkContext` construction, while
+  `spark.jars` swallows it (the jar is silently dropped, and tasks later fail with
+  `ClassNotFoundException`). Prefer `local://` for such resources, or stage them through a location
+  that does not require the propagated credentials.
+
+* **Hadoop `FileSystem` cache in Kubernetes cluster mode.** In cluster mode on Kubernetes the driver
+  pod runs `SparkSubmit` in the same JVM as `SparkContext`. When `SparkSubmit` downloads the
+  application resource, `--jars`, or `--files` from a bucket (for example
+  `--jars s3a://BUCKET/app.jar`), it does so before provider selection runs, and the resulting
+  `FileSystem` instance is cached (the cache key is scheme + authority + user). A later driver-side
+  access to the *same* bucket -- such as writing job output to it -- reuses that cached
+  `FileSystem`, which still uses the default credential chain (typically the pod's service account)
+  rather than the propagated OIDC identity. The job does not fail; instead the driver's access to
+  that bucket runs under a different identity than the executors, which is easy to overlook. To
+  avoid this, use `local://` for `--jars` / `--files`, or disable the S3A filesystem cache (for
+  example, `spark.hadoop.fs.s3a.impl.disable.cache=true`), so the driver builds a fresh
+  `FileSystem` that picks up the propagated provider. Note that this disables the cache for the
+  entire `s3a` scheme (not just one bucket), which has a performance cost because a new
+  `FileSystem` is created per access instead of being reused.
+
+## Configuration
+
+The following options control the core (cloud-agnostic) credential propagation framework.
+Provider-specific options (such as those for the AWS reference provider) are documented alongside
+each provider.
+
+<table class="spark-config">
+<thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr></thead>
+<tr>
+  <td><code>spark.security.oidc.enabled</code></td>
+  <td><code>false</code></td>
+  <td>
+    Whether to enable OIDC credential propagation. When enabled, the driver reads an identity
+    token from a file, exchanges it for short-lived service credentials via
+    <code>CredentialProvider</code> implementations, and propagates those credentials to executors.
+    When disabled (the default), the feature's components are not started.
+  </td>
+  <td>4.4.0</td>
+</tr>
+<tr>
+  <td><code>spark.security.oidc.requireRpcEncryption</code></td>
+  <td><code>false</code></td>
+  <td>
+    When OIDC credential propagation is enabled, whether to require RPC channel encryption. By
+    default (<code>false</code>), Spark only logs a warning if credential propagation is enabled
+    without RPC encryption, since credentials would then travel over the RPC channel in cleartext.
+    When set to <code>true</code>, Spark instead refuses to start unless RPC encryption is
+    configured. Leave it <code>false</code> if the channel is protected outside Spark (for
+    example, a service mesh or a private network).
+  </td>
+  <td>4.4.0</td>
+</tr>
+<tr>
+  <td><code>spark.security.oidc.identityToken.file</code></td>
+  <td>(none)</td>
+  <td>
+    Path to the OIDC identity token file on the driver. Required when
+    <code>spark.security.oidc.enabled</code> is <code>true</code>. The file should contain a JWT
+    (for example, a Kubernetes projected ServiceAccount token). The file is re-read when it is
+    rotated, so automatically-rotated tokens are supported.
+  </td>
+  <td>4.4.0</td>
+</tr>
+<tr>
+  <td><code>spark.security.oidc.provider.&lt;scheme&gt;</code></td>
+  <td>(none)</td>
+  <td>
+    Selects the <code>CredentialProvider</code> to use for a given URI scheme (for example,
+    <code>s3a</code>) when more than one provider is registered for that scheme. The value is the
+    fully-qualified class name of the provider. When only one provider is registered for a scheme,
+    this option is not required.
+  </td>
+  <td>4.4.0</td>
+</tr>
+<tr>
+  <td><code>spark.security.oidc.renewal.safetyMargin</code></td>
+  <td><code>60s</code></td>
+  <td>
+    How long before credential expiry to trigger renewal. Credentials are refreshed at
+    <code>min(identity token expiry, service credential expiry)</code> minus this margin.
+  </td>
+  <td>4.4.0</td>
+</tr>
+<tr>
+  <td><code>spark.security.oidc.renewal.minInterval</code></td>
+  <td><code>30s</code></td>
+  <td>
+    Minimum interval between credential renewal attempts. This prevents tight renewal loops when
+    credentials have very short lifetimes or when repeated failures would otherwise cause rapid
+    retries.
+  </td>
+  <td>4.4.0</td>
+</tr>
+</table>
+
+## AWS reference provider
+
+Spark ships a reference `CredentialProvider` implementation for Amazon S3 and any STS-compatible
+endpoint (such as MinIO or Ceph) in the optional `credential-aws` module. It calls
+`sts:AssumeRoleWithWebIdentity` with the identity token and a configured IAM role, and returns
+temporary credentials as the `fs.s3a.access.key`, `fs.s3a.secret.key`, and `fs.s3a.session.token`
+properties consumed by the S3A connector.
+
+### Enabling the AWS reference provider
+
+The reference provider is packaged in the `credential-aws` module, which is not part of the default
+Spark distribution (it is kept separate so that the AWS SDK is not added to the core classpath).
+
+The recommended way to make it available (especially for cluster deployments such as Spark on
+Kubernetes) is to build a custom Spark distribution or container image that includes the module,
+using the `-Pcredential-aws` profile. Reading and writing S3 data additionally requires the S3A
+connector (`hadoop-aws`), provided by the `hadoop-cloud` module (the `-Phadoop-cloud` profile); the
+two modules are designed to be used together and pin the AWS SDK to the same version, so build with
+both:
+
+```
+./dev/make-distribution.sh --pip -Pkubernetes -Pcredential-aws -Phadoop-cloud
+```
+
+Baking the module into the image keeps executor startup self-contained and avoids each executor
+resolving artifacts from a remote repository at launch time, which matters when many executors
+start (for example, with dynamic allocation).
+
+Alternatively, for interactive use or one-off jobs, the module can be fetched from Maven Central at
+submit time with `--packages` (this also works in Kubernetes cluster mode):
+
+```
+--packages org.apache.spark:spark-credential-aws_{{site.SCALA_BINARY_VERSION}}:{{site.SPARK_VERSION_SHORT}}
+```
+
+Once the module is on the classpath, the provider is discovered automatically via `ServiceLoader`.
+Enable credential propagation and point Spark at the identity token file (on Kubernetes this is
+typically a projected ServiceAccount token), then configure the IAM role to assume:
+
+```
+spark.security.oidc.enabled                 true
+spark.security.oidc.identityToken.file      /var/run/secrets/oidc/token
+spark.security.oidc.aws.roleArn             arn:aws:iam::123456789012:role/spark-data-access
+```
+
+When credential propagation is enabled and you have not set
+`spark.hadoop.fs.s3a.aws.credentials.provider` in your Spark configuration, Spark automatically
+configures the S3A connector on the driver and executors to read the propagated credentials by
+setting:
+
+```
+spark.hadoop.fs.s3a.aws.credentials.provider org.apache.spark.security.aws.SparkOidcAwsCredentialsProvider
+```
+
+Only the `spark.hadoop.fs.s3a.aws.credentials.provider` key in the Spark configuration is
+considered. If you set it yourself, Spark does not override it. A value set elsewhere -- for
+example `fs.s3a.aws.credentials.provider` in `core-site.xml` -- is not detected, and the injected
+`spark.hadoop.*` value takes precedence over it.
+
+For complete, deployment-ready examples on Kubernetes (including how to mount a projected
+ServiceAccount token for workload-level identity, or an externally-injected per-user identity token),
+see [OIDC Credential Propagation](running-on-kubernetes.html#oidc-credential-propagation) on the
+Kubernetes page.
+
+### Using a non-AWS STS-compatible endpoint
+
+The provider works with any STS-compatible endpoint by setting
+`spark.security.oidc.aws.stsEndpoint` (and, if needed, `spark.security.oidc.aws.region`). For
+example, to target a MinIO STS endpoint:
+
+```
+spark.security.oidc.aws.stsEndpoint https://minio.example.com
+spark.security.oidc.aws.region      us-east-1
+```
+
+### AWS reference provider configuration
+
+These options are read by the AWS reference provider (from the `credential-aws` module) and are
+only relevant when it is on the classpath and credential propagation is enabled.
+
+<table class="spark-config">
+<thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr></thead>
+<tr>
+  <td><code>spark.security.oidc.aws.roleArn</code></td>
+  <td>(none)</td>
+  <td>
+    The ARN of the IAM role to assume via <code>AssumeRoleWithWebIdentity</code>. Required when the
+    AWS reference provider is used. The role's trust policy must allow the identity provider that
+    issued the token (for example, the Kubernetes cluster's OIDC issuer).
+  </td>
+  <td>4.4.0</td>
+</tr>
+<tr>
+  <td><code>spark.security.oidc.aws.sessionName</code></td>
+  <td>(derived from the token principal)</td>
+  <td>
+    The role session name attached to the assumed-role session. It appears in CloudTrail records
+    and can be used for auditing. Must match <code>[a-zA-Z0-9_+=,.@-]{2,64}</code>. When unset, the
+    session name is derived from the identity token's principal (sanitized to satisfy the allowed
+    character set and length); if no usable principal is available, it falls back to
+    <code>spark-oidc</code>.
+  </td>
+  <td>4.4.0</td>
+</tr>
+<tr>
+  <td><code>spark.security.oidc.aws.durationSeconds</code></td>
+  <td>(STS default, 3600)</td>
+  <td>
+    The requested lifetime, in seconds, of the temporary credentials. Must be between
+    <code>900</code> (15 minutes) and <code>43200</code> (12 hours), subject to the maximum
+    session duration configured on the IAM role. When unset, the STS default (1 hour) applies.
+  </td>
+  <td>4.4.0</td>
+</tr>
+<tr>
+  <td><code>spark.security.oidc.aws.region</code></td>
+  <td>(SDK default)</td>
+  <td>
+    The AWS region for the STS client. When unset and no custom endpoint is configured, the AWS
+    SDK's default region resolution applies (for example, the <code>AWS_REGION</code> environment
+    variable or the shared config profile). When a custom endpoint is set without a region,
+    <code>us-east-1</code> is used as a placeholder.
+  </td>
+  <td>4.4.0</td>
+</tr>
+<tr>
+  <td><code>spark.security.oidc.aws.stsEndpoint</code></td>
+  <td>(none)</td>
+  <td>
+    A custom STS endpoint URL. Set this to target an STS-compatible endpoint other than AWS STS,
+    such as MinIO or Ceph. When unset, the AWS SDK's default STS endpoint for the resolved region
+    is used.
+  </td>
+  <td>4.4.0</td>
+</tr>
+</table>
+
 # Event Logging
 
 If your applications are using event logging, the directory where the event logs go

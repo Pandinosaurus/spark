@@ -22,16 +22,25 @@ from collections import namedtuple
 
 # To avoid adding a new direct dependency, we import markdown from within mkdocs.
 from mkdocs.structure.pages import markdown
-
 from pyspark.java_gateway import launch_gateway
-
 
 ExpressionInfo = namedtuple("ExpressionInfo", "name usage examples group")
 
 groups = {
     "agg_funcs", "array_funcs", "datetime_funcs",
     "json_funcs", "map_funcs", "window_funcs",
+    "math_funcs", "conditional_funcs", "generator_funcs",
+    "predicate_funcs", "string_funcs", "misc_funcs",
+    "bitwise_funcs", "conversion_funcs", "csv_funcs",
+    "xml_funcs", "lambda_funcs", "collection_funcs",
+    "url_funcs", "hash_funcs", "struct_funcs",
+    "table_funcs", "variant_funcs", "protobuf_funcs", "sketch_funcs",
+    "st_funcs", "vector_funcs"
 }
+
+
+def _print_red(text):
+    print('\033[31m' + text + '\033[0m')
 
 
 def _list_grouped_function_infos(jvm):
@@ -45,13 +54,18 @@ def _list_grouped_function_infos(jvm):
 
     for jinfo in filter(lambda x: x.getGroup() in groups, jinfos):
         name = jinfo.getName()
+        if (name == "raise_error"):
+            continue
+
+        group = jinfo.getGroup()
+
         usage = jinfo.getUsage()
         usage = usage.replace("_FUNC_", name) if usage is not None else usage
         infos.append(ExpressionInfo(
             name=name,
             usage=usage,
             examples=jinfo.getExamples().replace("_FUNC_", name),
-            group=jinfo.getGroup()))
+            group=group))
 
     # Groups expression info by each group value
     grouped_infos = itertools.groupby(sorted(infos, key=lambda x: x.group), key=lambda x: x.group)
@@ -108,7 +122,18 @@ def _make_pretty_usage(infos):
         # Expected formats are as follows;
         #  - `_FUNC_(...) - description`, or
         #  - `_FUNC_ - description`
-        usages = iter(re.split(r"(%s.*) - " % info.name, info.usage.strip())[1:])
+        func_name = info.name
+        if (info.name == "*" or info.name == "+"):
+            func_name = "\\" + func_name
+        elif (info.name == "when"):
+            func_name = "CASE WHEN"
+        expr_usages = re.split(r"(.*%s.*) - " % func_name, info.usage.strip())
+        if len(expr_usages) <= 1:
+            _print_red("\nThe `usage` of %s is not standardized, please correct it. "
+                       "Refer to: `AesDecrypt`" % (func_name))
+            os._exit(-1)
+        usages = iter(expr_usages[1:])
+
         for (sig, description) in zip(usages, usages):
             result.append("    <tr>")
             result.append("      <td>%s</td>" % sig)
@@ -145,7 +170,8 @@ def _make_pretty_examples(jspark, infos):
 
     pretty_output = ""
     for info in infos:
-        if info.examples.startswith("\n    Examples:"):
+        if (info.examples.startswith("\n    Examples:") and info.name.lower() not in
+                ("from_avro", "to_avro", "from_protobuf", "to_protobuf", "measure")):
             output = []
             output.append("-- %s" % info.name)
             query_examples = filter(lambda x: x.startswith("      > "), info.examples.split("\n"))
@@ -210,6 +236,10 @@ def generate_functions_examples_html(jvm, jspark, html_output_dir):
     </pre></div>
 
     """
+    print("Enabling TIME data type")
+    jspark.sql("SET spark.sql.timeType.enabled = true")
+    print("Enabling parse_sql function")
+    jspark.sql("SET spark.sql.function.parseSql.enabled = true")
     print("Running SQL examples to generate formatted output.")
     for key, infos in _list_grouped_function_infos(jvm):
         examples = _make_pretty_examples(jspark, infos)

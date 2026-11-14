@@ -18,9 +18,9 @@
 package org.apache.spark.sql.execution.columnar
 
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeMap, AttributeReference}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeMap, AttributeReference, UnsafeArrayData, UnsafeMapData, UnsafeRow}
 import org.apache.spark.sql.types._
-import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.unsafe.types.{BinaryView, TimestampNanosVal, UTF8String}
 
 class ColumnStatisticsSchema(a: Attribute) extends Serializable {
   val upperBound = AttributeReference(a.name + ".upperBound", a.dataType, nullable = true)()
@@ -80,7 +80,7 @@ private[columnar] final class NoopColumnStats extends ColumnStats {
     if (!row.isNullAt(ordinal)) {
       count += 1
     } else {
-      gatherNullStats
+      gatherNullStats()
     }
   }
 
@@ -96,7 +96,7 @@ private[columnar] final class BooleanColumnStats extends ColumnStats {
       val value = row.getBoolean(ordinal)
       gatherValueStats(value)
     } else {
-      gatherNullStats
+      gatherNullStats()
     }
   }
 
@@ -120,7 +120,7 @@ private[columnar] final class ByteColumnStats extends ColumnStats {
       val value = row.getByte(ordinal)
       gatherValueStats(value)
     } else {
-      gatherNullStats
+      gatherNullStats()
     }
   }
 
@@ -144,7 +144,7 @@ private[columnar] final class ShortColumnStats extends ColumnStats {
       val value = row.getShort(ordinal)
       gatherValueStats(value)
     } else {
-      gatherNullStats
+      gatherNullStats()
     }
   }
 
@@ -168,7 +168,7 @@ private[columnar] final class IntColumnStats extends ColumnStats {
       val value = row.getInt(ordinal)
       gatherValueStats(value)
     } else {
-      gatherNullStats
+      gatherNullStats()
     }
   }
 
@@ -192,7 +192,7 @@ private[columnar] final class LongColumnStats extends ColumnStats {
       val value = row.getLong(ordinal)
       gatherValueStats(value)
     } else {
-      gatherNullStats
+      gatherNullStats()
     }
   }
 
@@ -216,7 +216,7 @@ private[columnar] final class FloatColumnStats extends ColumnStats {
       val value = row.getFloat(ordinal)
       gatherValueStats(value)
     } else {
-      gatherNullStats
+      gatherNullStats()
     }
   }
 
@@ -240,7 +240,7 @@ private[columnar] final class DoubleColumnStats extends ColumnStats {
       val value = row.getDouble(ordinal)
       gatherValueStats(value)
     } else {
-      gatherNullStats
+      gatherNullStats()
     }
   }
 
@@ -255,23 +255,25 @@ private[columnar] final class DoubleColumnStats extends ColumnStats {
     Array[Any](lower, upper, nullCount, count, sizeInBytes)
 }
 
-private[columnar] final class StringColumnStats extends ColumnStats {
+private[columnar] final class StringColumnStats(collationId: Int) extends ColumnStats {
+  def this(dt: StringType) = this(dt.collationId)
+
   protected var upper: UTF8String = null
   protected var lower: UTF8String = null
 
   override def gatherStats(row: InternalRow, ordinal: Int): Unit = {
     if (!row.isNullAt(ordinal)) {
       val value = row.getUTF8String(ordinal)
-      val size = STRING.actualSize(row, ordinal)
+      val size = STRING(collationId).actualSize(row, ordinal)
       gatherValueStats(value, size)
     } else {
-      gatherNullStats
+      gatherNullStats()
     }
   }
 
   def gatherValueStats(value: UTF8String, size: Int): Unit = {
-    if (upper == null || value.compareTo(upper) > 0) upper = value.clone()
-    if (lower == null || value.compareTo(lower) < 0) lower = value.clone()
+    if (upper == null || value.semanticCompare(upper, collationId) > 0) upper = value.clone()
+    if (lower == null || value.semanticCompare(lower, collationId) < 0) lower = value.clone()
     sizeInBytes += size
     count += 1
   }
@@ -287,7 +289,44 @@ private[columnar] final class BinaryColumnStats extends ColumnStats {
       sizeInBytes += size
       count += 1
     } else {
-      gatherNullStats
+      gatherNullStats()
+    }
+  }
+
+  override def collectedStatistics: Array[Any] =
+    Array[Any](null, null, nullCount, count, sizeInBytes)
+}
+
+/**
+ * Size collector for Geometry/Geography columns. Their Catalyst physical value is a
+ * [[BinaryView]] (this is what ArrowWriter consumes via getBinaryView), so BinaryColumnStats,
+ * which reads row.getBinary, would throw a ClassCastException on a row that actually stores a
+ * BinaryView (e.g. a GenericInternalRow from a row-based reader or direct serializer use). Read
+ * the value through getBinaryView and use its byte length for the size; no min/max bounds.
+ */
+private[columnar] final class GeoColumnStats extends ColumnStats {
+  override def gatherStats(row: InternalRow, ordinal: Int): Unit = {
+    if (!row.isNullAt(ordinal)) {
+      val view: BinaryView = row.getBinaryView(ordinal)
+      sizeInBytes += view.numBytes() + 4
+      count += 1
+    } else {
+      gatherNullStats()
+    }
+  }
+
+  override def collectedStatistics: Array[Any] =
+    Array[Any](null, null, nullCount, count, sizeInBytes)
+}
+
+private[columnar] final class VariantColumnStats extends ColumnStats {
+  override def gatherStats(row: InternalRow, ordinal: Int): Unit = {
+    if (!row.isNullAt(ordinal)) {
+      val size = VARIANT.actualSize(row, ordinal)
+      sizeInBytes += size
+      count += 1
+    } else {
+      gatherNullStats()
     }
   }
 
@@ -301,12 +340,36 @@ private[columnar] final class IntervalColumnStats extends ColumnStats {
       sizeInBytes += CALENDAR_INTERVAL.actualSize(row, ordinal)
       count += 1
     } else {
-      gatherNullStats
+      gatherNullStats()
     }
   }
 
   override def collectedStatistics: Array[Any] =
     Array[Any](null, null, nullCount, count, sizeInBytes)
+}
+
+private[columnar] final class TimestampNanosColumnStats extends ColumnStats {
+  protected var upper: TimestampNanosVal = null
+  protected var lower: TimestampNanosVal = null
+
+  override def gatherStats(row: InternalRow, ordinal: Int): Unit = {
+    if (!row.isNullAt(ordinal)) {
+      // TimestampNanosVal has a total order matching calendar order, so collect min/max bounds
+      // (like DecimalColumnStats, not IntervalColumnStats) to enable partition pruning, matching
+      // the micro-precision timestamp path (LongColumnStats). NTZ and LTZ share the same physical
+      // payload, so a single getter reads the value for both.
+      val value = row.getTimestampNTZNanos(ordinal)
+      if (upper == null || value.compareTo(upper) > 0) upper = value
+      if (lower == null || value.compareTo(lower) < 0) lower = value
+      sizeInBytes += TimestampNanosVal.SIZE_IN_BYTES
+      count += 1
+    } else {
+      gatherNullStats()
+    }
+  }
+
+  override def collectedStatistics: Array[Any] =
+    Array[Any](lower, upper, nullCount, count, sizeInBytes)
 }
 
 private[columnar] final class DecimalColumnStats(precision: Int, scale: Int) extends ColumnStats {
@@ -321,7 +384,7 @@ private[columnar] final class DecimalColumnStats(precision: Int, scale: Int) ext
       // TODO: this is not right for DecimalType with precision > 18
       gatherValueStats(value)
     } else {
-      gatherNullStats
+      gatherNullStats()
     }
   }
 
@@ -341,11 +404,33 @@ private[columnar] final class ObjectColumnStats(dataType: DataType) extends Colu
 
   override def gatherStats(row: InternalRow, ordinal: Int): Unit = {
     if (!row.isNullAt(ordinal)) {
-      val size = columnType.actualSize(row, ordinal)
+      // Read the value once: columnar complex values (ColumnarArray/ColumnarMap/ColumnarRow)
+      // are views into ColumnVectors and do not expose getSizeInBytes, so fall back to the
+      // type's default size estimate instead of recording zero bytes for them (which would
+      // underestimate the relation's sizeInBytes and could make it wrongly eligible for
+      // broadcast). The Unsafe* match also guards other non-Unsafe values such as
+      // GenericArrayData, which columnType.actualSize would reject with a ClassCastException.
+      val size = columnType match {
+        case _: ARRAY => row.getArray(ordinal) match {
+          case unsafe: UnsafeArrayData => 4 + unsafe.getSizeInBytes
+          case _ => columnType.defaultSize
+        }
+        case _: MAP => row.getMap(ordinal) match {
+          case unsafe: UnsafeMapData => 4 + unsafe.getSizeInBytes
+          case _ => columnType.defaultSize
+        }
+        case struct: STRUCT =>
+          row.getStruct(ordinal, struct.dataType.fields.length) match {
+            case unsafe: UnsafeRow => 4 + unsafe.getSizeInBytes
+            case _ => columnType.defaultSize
+          }
+        case _ => columnType.actualSize(row, ordinal)
+      }
       sizeInBytes += size
+
       count += 1
     } else {
-      gatherNullStats
+      gatherNullStats()
     }
   }
 

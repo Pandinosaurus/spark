@@ -16,18 +16,20 @@
 #
 
 import sys
+from typing import Any, Generic, List, NamedTuple, TypeVar
 
-from collections import namedtuple
-
-from pyspark import since
+from pyspark import SparkContext, since
+from pyspark.core.rdd import RDD
 from pyspark.mllib.common import JavaModelWrapper, callMLlibFunc
-from pyspark.mllib.util import JavaSaveable, JavaLoader, inherit_doc
+from pyspark.mllib.util import JavaLoader, JavaSaveable, inherit_doc
 
 __all__ = ["FPGrowth", "FPGrowthModel", "PrefixSpan", "PrefixSpanModel"]
 
+T = TypeVar("T")
+
 
 @inherit_doc
-class FPGrowthModel(JavaModelWrapper, JavaSaveable, JavaLoader):
+class FPGrowthModel(JavaModelWrapper, JavaSaveable, JavaLoader["FPGrowthModel"]):
     """
     A FP-Growth model for mining frequent itemsets
     using the Parallel FP-Growth algorithm.
@@ -49,7 +51,7 @@ class FPGrowthModel(JavaModelWrapper, JavaSaveable, JavaLoader):
     """
 
     @since("1.4.0")
-    def freqItemsets(self):
+    def freqItemsets(self) -> RDD["FPGrowth.FreqItemset"]:
         """
         Returns the frequent itemsets of this model.
         """
@@ -57,16 +59,17 @@ class FPGrowthModel(JavaModelWrapper, JavaSaveable, JavaLoader):
 
     @classmethod
     @since("2.0.0")
-    def load(cls, sc, path):
+    def load(cls, sc: SparkContext, path: str) -> "FPGrowthModel":
         """
         Load a model from the given path.
         """
         model = cls._load_java(sc, path)
+        assert sc._jvm is not None
         wrapper = sc._jvm.org.apache.spark.mllib.api.python.FPGrowthModelWrapper(model)
         return FPGrowthModel(wrapper)
 
 
-class FPGrowth(object):
+class FPGrowth:
     """
     A Parallel FP-growth algorithm to mine frequent itemsets.
 
@@ -74,7 +77,9 @@ class FPGrowth(object):
     """
 
     @classmethod
-    def train(cls, data, minSupport=0.3, numPartitions=-1):
+    def train(
+        cls, data: RDD[List[T]], minSupport: float = 0.3, numPartitions: int = -1
+    ) -> "FPGrowthModel":
         """
         Computes an FP-Growth model that contains frequent itemsets.
 
@@ -95,16 +100,19 @@ class FPGrowth(object):
         model = callMLlibFunc("trainFPGrowthModel", data, float(minSupport), int(numPartitions))
         return FPGrowthModel(model)
 
-    class FreqItemset(namedtuple("FreqItemset", ["items", "freq"])):
+    class FreqItemset(NamedTuple):
         """
         Represents an (items, freq) tuple.
 
         .. versionadded:: 1.4.0
         """
 
+        items: List[Any]
+        freq: int
+
 
 @inherit_doc
-class PrefixSpanModel(JavaModelWrapper):
+class PrefixSpanModel(JavaModelWrapper, Generic[T]):
     """
     Model fitted by PrefixSpan
 
@@ -124,12 +132,12 @@ class PrefixSpanModel(JavaModelWrapper):
     """
 
     @since("1.6.0")
-    def freqSequences(self):
+    def freqSequences(self) -> RDD["PrefixSpan.FreqSequence"]:
         """Gets frequent sequences"""
         return self.call("getFreqSequences").map(lambda x: PrefixSpan.FreqSequence(x[0], x[1]))
 
 
-class PrefixSpan(object):
+class PrefixSpan:
     """
     A parallel PrefixSpan algorithm to mine frequent sequential patterns.
     The PrefixSpan algorithm is described in Jian Pei et al (2001) [1]_
@@ -144,7 +152,13 @@ class PrefixSpan(object):
     """
 
     @classmethod
-    def train(cls, data, minSupport=0.1, maxPatternLength=10, maxLocalProjDBSize=32000000):
+    def train(
+        cls,
+        data: RDD[List[List[T]]],
+        minSupport: float = 0.1,
+        maxPatternLength: int = 10,
+        maxLocalProjDBSize: int = 32000000,
+    ) -> PrefixSpanModel[T]:
         """
         Finds the complete set of frequent sequential patterns in the
         input sequences of itemsets.
@@ -177,18 +191,22 @@ class PrefixSpan(object):
         )
         return PrefixSpanModel(model)
 
-    class FreqSequence(namedtuple("FreqSequence", ["sequence", "freq"])):
+    class FreqSequence(NamedTuple):
         """
         Represents a (sequence, freq) tuple.
 
         .. versionadded:: 1.6.0
         """
 
+        sequence: List[List[Any]]
+        freq: int
 
-def _test():
+
+def _test() -> None:
     import doctest
-    from pyspark.sql import SparkSession
+
     import pyspark.mllib.fpm
+    from pyspark.sql import SparkSession
 
     globs = pyspark.mllib.fpm.__dict__.copy()
     spark = SparkSession.builder.master("local[4]").appName("mllib.fpm tests").getOrCreate()
@@ -198,7 +216,7 @@ def _test():
     temp_path = tempfile.mkdtemp()
     globs["temp_path"] = temp_path
     try:
-        (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+        failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
         spark.stop()
     finally:
         from shutil import rmtree

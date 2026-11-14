@@ -17,28 +17,44 @@
 
 package org.apache.spark.sql.catalyst.util
 
+import org.apache.spark.QueryContext
 import org.apache.spark.sql.errors.QueryExecutionErrors
+import org.apache.spark.sql.types.{ByteType, DataType, IntegerType, LongType, ShortType}
 import org.apache.spark.unsafe.types.UTF8String
 
 /**
- * Helper functions for casting string to numeric values.
+ * Helper functions for casting string to primitive values under ANSI mode.
  */
 object UTF8StringUtils {
 
-  def toLongExact(s: UTF8String): Long = withException(s.toLongExact)
+  def toLongExact(s: UTF8String, context: QueryContext): Long =
+    withException(s.toLongExact, context, LongType, s)
 
-  def toIntExact(s: UTF8String): Int = withException(s.toIntExact)
+  def toIntExact(s: UTF8String, context: QueryContext): Int =
+    withException(s.toIntExact, context, IntegerType, s)
 
-  def toShortExact(s: UTF8String): Short = withException(s.toShortExact)
+  def toShortExact(s: UTF8String, context: QueryContext): Short =
+    withException(s.toShortExact, context, ShortType, s)
 
-  def toByteExact(s: UTF8String): Byte = withException(s.toByteExact)
+  def toByteExact(s: UTF8String, context: QueryContext): Byte =
+    withException(s.toByteExact, context, ByteType, s)
 
-  private def withException[A](f: => A): A = {
+  def toBooleanExact(s: UTF8String, context: QueryContext): Boolean = {
+    if (StringUtils.isTrueString(s)) true
+    else if (StringUtils.isFalseString(s)) false
+    else throw QueryExecutionErrors.invalidInputSyntaxForBooleanError(s, context)
+  }
+
+  private def withException[A](
+      f: => A,
+      context: QueryContext,
+      to: DataType,
+      s: UTF8String): A = {
     try {
       f
     } catch {
       case e: NumberFormatException =>
-        throw QueryExecutionErrors.invalidInputSyntaxForNumericError(e)
+        throw QueryExecutionErrors.invalidInputInCastToNumberError(to, s, context)
     }
   }
 }

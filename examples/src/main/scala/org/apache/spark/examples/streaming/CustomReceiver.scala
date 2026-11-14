@@ -73,7 +73,7 @@ class CustomReceiver(host: String, port: Int)
 
   def onStop(): Unit = {
    // There is nothing much to do as the thread calling receive()
-   // is designed to stop by itself isStopped() returns false
+   // is designed to stop by itself when isStopped() returns true
   }
 
   /** Create a socket connection and receive data until receiver is stopped */
@@ -87,7 +87,7 @@ class CustomReceiver(host: String, port: Int)
      val reader = new BufferedReader(
        new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))
      userInput = reader.readLine()
-     while(!isStopped && userInput != null) {
+     while (!isStopped() && userInput != null) {
        store(userInput)
        userInput = reader.readLine()
      }

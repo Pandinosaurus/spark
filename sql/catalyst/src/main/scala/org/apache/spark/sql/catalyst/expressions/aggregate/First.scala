@@ -36,6 +36,13 @@ import org.apache.spark.sql.types._
   usage = """
     _FUNC_(expr[, isIgnoreNull]) - Returns the first value of `expr` for a group of rows.
       If `isIgnoreNull` is true, returns only non-null values.""",
+  arguments = """
+    Arguments:
+      * expr - The expression to return the first value of.
+        An expression of any type.
+      * isIgnoreNull - Whether to ignore null values and return only the first non-null value.
+        An expression that evaluates to a boolean. Must be a constant.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(col) FROM VALUES (10), (5), (20) AS tab(col);
@@ -104,7 +111,7 @@ case class First(child: Expression, ignoreNulls: Boolean)
 
   override lazy val mergeExpressions: Seq[Expression] = {
     // For first, we can just check if valueSet.left is set to true. If it is set
-    // to true, we use first.right. If not, we use first.right (even if valueSet.right is
+    // to true, we use first.left. If not, we use first.right (even if valueSet.right is
     // false, we are safe to do so because first.right will be null in this case).
     Seq(
       /* first = */ If(valueSet.left, first.left, first.right),

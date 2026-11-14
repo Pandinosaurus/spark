@@ -14,30 +14,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from datetime import datetime, timedelta
 import hashlib
 import os
 import random
 import tempfile
 import time
+import unittest
+from datetime import datetime, timedelta
 from glob import glob
 
 from py4j.protocol import Py4JJavaError
 
-from pyspark import shuffle, RDD
+from pyspark import RDD, shuffle
 from pyspark.resource import ExecutorResourceRequests, ResourceProfileBuilder, TaskResourceRequests
 from pyspark.serializers import (
-    CloudPickleSerializer,
     BatchedSerializer,
-    PickleSerializer,
+    CloudPickleSerializer,
+    CPickleSerializer,
     MarshalSerializer,
-    UTF8Deserializer,
     NoOpSerializer,
+    UTF8Deserializer,
 )
-from pyspark.testing.utils import ReusedPySparkTestCase, SPARK_HOME, QuietTest
+from pyspark.sql import SparkSession
+from pyspark.testing.sqlutils import SPARK_HOME
+from pyspark.testing.utils import QuietTest, ReusedPySparkTestCase, have_numpy, have_pandas
 
-
-global_func = lambda: "Hi"
+global_func = lambda: "Hi"  # noqa: E731
 
 
 class RDDTests(ReusedPySparkTestCase):
@@ -94,7 +96,7 @@ class RDDTests(ReusedPySparkTestCase):
 
     def test_save_as_textfile_with_unicode(self):
         # Regression test for SPARK-970
-        x = "\u00A1Hola, mundo!"
+        x = "\u00a1Hola, mundo!"
         data = self.sc.parallelize([x])
         tempFile = tempfile.NamedTemporaryFile(delete=True)
         tempFile.close()
@@ -103,7 +105,7 @@ class RDDTests(ReusedPySparkTestCase):
         self.assertEqual(x, raw_contents.strip().decode("utf-8"))
 
     def test_save_as_textfile_with_utf8(self):
-        x = "\u00A1Hola, mundo!"
+        x = "\u00a1Hola, mundo!"
         data = self.sc.parallelize([x.encode("utf-8")])
         tempFile = tempfile.NamedTemporaryFile(delete=True)
         tempFile.close()
@@ -116,7 +118,7 @@ class RDDTests(ReusedPySparkTestCase):
         rdd1 = self.sc.parallelize([1, 2])
         rdd2 = self.sc.parallelize([3, 4])
         cart = rdd1.cartesian(rdd2)
-        result = cart.map(lambda x_y3: x_y3[0] + x_y3[1]).collect()
+        cart.map(lambda x_y3: x_y3[0] + x_y3[1]).collect()
 
     def test_transforming_pickle_file(self):
         # Regression test for SPARK-2601
@@ -132,7 +134,7 @@ class RDDTests(ReusedPySparkTestCase):
         path = os.path.join(SPARK_HOME, "python/test_support/hello/hello.txt")
         a = self.sc.textFile(path)
         result = a.cartesian(a).collect()
-        (x, y) = result[0]
+        x, y = result[0]
         self.assertEqual("Hello World!", x.strip())
         self.assertEqual("Hello World!", y.strip())
 
@@ -446,7 +448,7 @@ class RDDTests(ReusedPySparkTestCase):
         a = self.sc.parallelize(range(5))
         b = self.sc.parallelize(range(100, 105))
         self.assertEqual(a.zip(b).collect(), [(0, 100), (1, 101), (2, 102), (3, 103), (4, 104)])
-        a = a._reserialize(BatchedSerializer(PickleSerializer(), 2))
+        a = a._reserialize(BatchedSerializer(CPickleSerializer(), 2))
         b = b._reserialize(MarshalSerializer())
         self.assertEqual(a.zip(b).collect(), [(0, 100), (1, 101), (2, 102), (3, 103), (4, 104)])
         # regression test for SPARK-4841
@@ -615,12 +617,12 @@ class RDDTests(ReusedPySparkTestCase):
     def test_repartition_no_skewed(self):
         num_partitions = 20
         a = self.sc.parallelize(range(int(1000)), 2)
-        l = a.repartition(num_partitions).glom().map(len).collect()
-        zeros = len([x for x in l if x == 0])
-        self.assertTrue(zeros == 0)
-        l = a.coalesce(num_partitions, True).glom().map(len).collect()
-        zeros = len([x for x in l if x == 0])
-        self.assertTrue(zeros == 0)
+        xs = a.repartition(num_partitions).glom().map(len).collect()
+        zeros = len([x for x in xs if x == 0])
+        self.assertEqual(zeros, 0)
+        xs = a.coalesce(num_partitions, True).glom().map(len).collect()
+        zeros = len([x for x in xs if x == 0])
+        self.assertEqual(zeros, 0)
 
     def test_repartition_on_textfile(self):
         path = os.path.join(SPARK_HOME, "python/test_support/hello/hello.txt")
@@ -635,6 +637,36 @@ class RDDTests(ReusedPySparkTestCase):
         result = rdd.distinct(5)
         self.assertEqual(result.getNumPartitions(), 5)
         self.assertEqual(result.count(), 3)
+
+    def test_count_approx_respects_timeout(self):
+        def slow(x):
+            time.sleep(1)
+            return x
+
+        rdd = self.sc.parallelize(range(20), 20).map(slow)
+        start = time.time()
+        rdd.countApprox(timeout=100)
+        elapsed = time.time() - start
+        self.assertLess(elapsed, 2)
+        # Cancel the background approximate job before subsequent tests run.
+        self.sc.cancelAllJobs()
+
+    def test_count_approx_returns_exact_when_completed(self):
+        rdd = self.sc.parallelize(range(1000), 8)
+        self.assertEqual(rdd.countApprox(timeout=5000), 1000)
+
+    def test_mean_approx_respects_timeout(self):
+        def slow(x):
+            time.sleep(1)
+            return float(x)
+
+        rdd = self.sc.parallelize(range(20), 20).map(slow)
+        start = time.time()
+        rdd.meanApprox(timeout=100)
+        elapsed = time.time() - start
+        self.assertLess(elapsed, 2)
+        # Cancel the background approximate job before subsequent tests run.
+        self.sc.cancelAllJobs()
 
     def test_external_group_by_key(self):
         self.sc._conf.set("spark.python.worker.memory", "1m")
@@ -696,6 +728,41 @@ class RDDTests(ReusedPySparkTestCase):
     def test_take_on_jrdd(self):
         rdd = self.sc.parallelize(range(1 << 20)).map(lambda x: str(x))
         rdd._jrdd.first()
+
+    @unittest.skipIf(not have_numpy or not have_pandas, "NumPy or Pandas not installed")
+    def test_take_on_jrdd_with_large_rows_should_not_cause_deadlock(self):
+        # Regression test for SPARK-38677.
+        #
+        # Create a DataFrame with many columns, call a Python function on each row, and take only
+        # the first result row.
+        #
+        # This produces large rows that trigger a deadlock involving the following three threads:
+        #
+        # 1. The Scala task executor thread. During task execution, this is responsible for reading
+        #    output produced by the Python process. However, in this case the task has finished
+        #    early, and this thread is no longer reading output produced by the Python process.
+        #    Instead, it is waiting for the Scala WriterThread to exit so that it can finish the
+        #    task.
+        #
+        # 2. The Scala WriterThread. This is trying to send a large row to the Python process, and
+        #    is waiting for the Python process to read that row.
+        #
+        # 3. The Python process. This is trying to send a large output to the Scala task executor
+        #    thread, and is waiting for that thread to read that output.
+        #
+        # For this test to succeed rather than hanging, the Scala MonitorThread must detect this
+        # deadlock and kill the Python worker.
+        import numpy as np
+        import pandas as pd
+
+        num_rows = 100000
+        num_columns = 134
+        data = np.zeros((num_rows, num_columns))
+        columns = map(str, range(num_columns))
+        df = SparkSession(self.sc).createDataFrame(pd.DataFrame(data, columns=columns))
+        actual = CPickleSerializer().loads(df.rdd.map(list)._jrdd.first())
+        expected = [list(data[0])]
+        self.assertEqual(expected, actual)
 
     def test_sortByKey_uses_all_partitions_not_only_first_and_last(self):
         # Regression test for SPARK-5969
@@ -764,7 +831,7 @@ class RDDTests(ReusedPySparkTestCase):
         # Regression test for SPARK-27000
         global global_func
         self.assertEqual(self.sc.parallelize([1]).map(lambda _: global_func()).first(), "Hi")
-        global_func = lambda: "Yeah"
+        global_func = lambda: "Yeah"  # noqa: E731
         self.assertEqual(self.sc.parallelize([1]).map(lambda _: global_func()).first(), "Yeah")
 
     def test_to_local_iterator_failure(self):
@@ -889,13 +956,6 @@ class RDDTests(ReusedPySparkTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.tests.test_rdd import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

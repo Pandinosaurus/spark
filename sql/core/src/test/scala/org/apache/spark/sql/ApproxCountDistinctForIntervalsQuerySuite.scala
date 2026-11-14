@@ -25,7 +25,7 @@ import org.apache.spark.sql.catalyst.plans.logical.Aggregate
 import org.apache.spark.sql.execution.QueryExecution
 import org.apache.spark.sql.test.SharedSparkSession
 
-class ApproxCountDistinctForIntervalsQuerySuite extends QueryTest with SharedSparkSession {
+class ApproxCountDistinctForIntervalsQuerySuite extends SharedSparkSession {
   import testImplicits._
 
   // ApproxCountDistinctForIntervals is used in equi-height histogram generation. An equi-height
@@ -82,7 +82,9 @@ class ApproxCountDistinctForIntervalsQuerySuite extends QueryTest with SharedSpa
         ApproxCountDistinctForIntervals(dtAttr, CreateArray(endpoints.map(Literal(_))))
       val dtAggExpr = dtAggFunc.toAggregateExpression()
       val dtNamedExpr = Alias(dtAggExpr, dtAggExpr.toString)()
-      val result = Dataset.ofRows(spark, Aggregate(Nil, Seq(ymNamedExpr, dtNamedExpr), relation))
+      val result = classic.Dataset.ofRows(
+        spark,
+        Aggregate(Nil, Seq(ymNamedExpr, dtNamedExpr), relation))
       checkAnswer(result, Row(Array(1, 1, 1, 1, 1), Array(1, 1, 1, 1, 1)))
     }
   }

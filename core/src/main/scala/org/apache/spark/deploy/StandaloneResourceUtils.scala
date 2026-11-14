@@ -23,12 +23,14 @@ import java.nio.file.Files
 import scala.collection.mutable
 import scala.util.control.NonFatal
 
-import org.json4s.{DefaultFormats, Extraction}
+import org.json4s.{DefaultFormats, Extraction, Formats}
 import org.json4s.jackson.JsonMethods.{compact, render}
 
 import org.apache.spark.SparkException
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys.COMPONENT
 import org.apache.spark.resource.{ResourceAllocation, ResourceID, ResourceInformation, ResourceRequirement}
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 private[spark] object StandaloneResourceUtils extends Logging {
@@ -96,26 +98,27 @@ private[spark] object StandaloneResourceUtils extends Logging {
     val compShortName = componentName.substring(componentName.lastIndexOf(".") + 1)
     val tmpFile = Utils.tempFileWith(dir)
     val allocations = resources.map { case (rName, rInfo) =>
-      ResourceAllocation(new ResourceID(componentName, rName), rInfo.addresses)
+      ResourceAllocation(new ResourceID(componentName, rName), rInfo.addresses.toImmutableArraySeq)
     }.toSeq
     try {
-      writeResourceAllocationJson(componentName, allocations, tmpFile)
+      writeResourceAllocationJson(allocations, tmpFile)
     } catch {
       case NonFatal(e) =>
-        val errMsg = s"Exception threw while preparing resource file for $compShortName"
+        val errMsg =
+          log"Exception threw while preparing resource file for ${MDC(COMPONENT, compShortName)}"
         logError(errMsg, e)
-        throw new SparkException(errMsg, e)
+        throw new SparkException(errMsg.message, e)
     }
-    val resourcesFile = File.createTempFile(s"resource-$compShortName-", ".json", dir)
+    val resourcesFile = Files.createTempFile(dir.toPath, s"resource-$compShortName-", ".json")
+      .toFile
     tmpFile.renameTo(resourcesFile)
     Some(resourcesFile)
   }
 
   private def writeResourceAllocationJson[T](
-      componentName: String,
       allocations: Seq[T],
       jsonFile: File): Unit = {
-    implicit val formats = DefaultFormats
+    implicit val formats: Formats = DefaultFormats
     val allocationJson = Extraction.decompose(allocations)
     Files.write(jsonFile.toPath, compact(render(allocationJson)).getBytes())
   }

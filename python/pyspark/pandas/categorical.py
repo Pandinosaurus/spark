@@ -14,15 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from typing import Any, Callable, List, Optional, Union, TYPE_CHECKING, cast
-import warnings
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Union, cast
 
 import pandas as pd
-from pandas.api.types import CategoricalDtype, is_dict_like, is_list_like
+from pandas.api.types import (
+    CategoricalDtype,
+    is_dict_like,
+    is_list_like,
+)
 
-from pyspark.pandas.internal import InternalField
-from pyspark.pandas.spark import functions as SF
 from pyspark.pandas.data_type_ops.categorical_ops import _to_cat
+from pyspark.pandas.internal import InternalField
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructField
 
@@ -30,7 +32,7 @@ if TYPE_CHECKING:
     import pyspark.pandas as ps
 
 
-class CategoricalAccessor(object):
+class CategoricalAccessor:
     """
     Accessor object for categorical properties of the Series values.
 
@@ -169,9 +171,7 @@ class CategoricalAccessor(object):
             ),
         ).rename()
 
-    def add_categories(
-        self, new_categories: Union[pd.Index, Any, List], inplace: bool = False
-    ) -> Optional["ps.Series"]:
+    def add_categories(self, new_categories: Union[pd.Index, Any, List]) -> Optional["ps.Series"]:
         """
         Add new categories.
 
@@ -182,16 +182,11 @@ class CategoricalAccessor(object):
         ----------
         new_categories : category or list-like of category
            The new categories to be included.
-        inplace : bool, default False
-           Whether or not to add the categories inplace or return a copy of
-           this categorical with added categories.
-
-           .. deprecated:: 3.2.0
 
         Returns
         -------
-        Series or None
-            Categorical with new categories added or None if ``inplace=True``.
+        Series
+            Categorical with new categories added
 
         Raises
         ------
@@ -232,13 +227,6 @@ class CategoricalAccessor(object):
         """
         from pyspark.pandas.frame import DataFrame
 
-        if inplace:
-            warnings.warn(
-                "The `inplace` parameter in add_categories is deprecated "
-                "and will be removed in a future version.",
-                FutureWarning,
-            )
-
         categories: List[Any]
         if is_list_like(new_categories):
             categories = list(new_categories)
@@ -259,20 +247,13 @@ class CategoricalAccessor(object):
                 dtype=CategoricalDtype(list(self.categories) + categories, ordered=self.ordered)
             ),
         )
-        if inplace:
-            self._data._psdf._update_internal_frame(internal)
-            return None
-        else:
-            return DataFrame(internal)._psser_for(self._data._column_label).copy()
+        return DataFrame(internal)._psser_for(self._data._column_label).copy()
 
-    def _set_ordered(self, *, ordered: bool, inplace: bool) -> Optional["ps.Series"]:
+    def _set_ordered(self, *, ordered: bool) -> Optional["ps.Series"]:
         from pyspark.pandas.frame import DataFrame
 
         if self.ordered == ordered:
-            if inplace:
-                return None
-            else:
-                return self._data.copy()
+            return self._data.copy()
         else:
             internal = self._data._psdf._internal.with_new_spark_column(
                 self._data._column_label,
@@ -281,26 +262,16 @@ class CategoricalAccessor(object):
                     dtype=CategoricalDtype(categories=self.categories, ordered=ordered)
                 ),
             )
-            if inplace:
-                self._data._psdf._update_internal_frame(internal)
-                return None
-            else:
-                return DataFrame(internal)._psser_for(self._data._column_label).copy()
+            return DataFrame(internal)._psser_for(self._data._column_label).copy()
 
-    def as_ordered(self, inplace: bool = False) -> Optional["ps.Series"]:
+    def as_ordered(self) -> Optional["ps.Series"]:
         """
         Set the Categorical to be ordered.
 
-        Parameters
-        ----------
-        inplace : bool, default False
-           Whether or not to set the ordered attribute in-place or return
-           a copy of this categorical with ordered set to True.
-
         Returns
         -------
-        Series or None
-            Ordered Categorical or None if ``inplace=True``.
+        Series
+            Ordered Categorical
 
         Examples
         --------
@@ -325,22 +296,16 @@ class CategoricalAccessor(object):
         dtype: category
         Categories (3, object): ['a' < 'b' < 'c']
         """
-        return self._set_ordered(ordered=True, inplace=inplace)
+        return self._set_ordered(ordered=True)
 
-    def as_unordered(self, inplace: bool = False) -> Optional["ps.Series"]:
+    def as_unordered(self) -> Optional["ps.Series"]:
         """
         Set the Categorical to be unordered.
 
-        Parameters
-        ----------
-        inplace : bool, default False
-           Whether or not to set the ordered attribute in-place or return
-           a copy of this categorical with ordered set to False.
-
         Returns
         -------
-        Series or None
-            Unordered Categorical or None if ``inplace=True``.
+        Series
+            Unordered Categorical
 
         Examples
         --------
@@ -365,11 +330,9 @@ class CategoricalAccessor(object):
         dtype: category
         Categories (3, object): ['a', 'b', 'c']
         """
-        return self._set_ordered(ordered=False, inplace=inplace)
+        return self._set_ordered(ordered=False)
 
-    def remove_categories(
-        self, removals: Union[pd.Index, Any, List], inplace: bool = False
-    ) -> Optional["ps.Series"]:
+    def remove_categories(self, removals: Union[pd.Index, Any, List]) -> Optional["ps.Series"]:
         """
         Remove the specified categories.
 
@@ -380,16 +343,11 @@ class CategoricalAccessor(object):
         ----------
         removals : category or list of categories
            The categories which should be removed.
-        inplace : bool, default False
-           Whether or not to remove the categories inplace or return a copy of
-           this categorical with removed categories.
-
-           .. deprecated:: 3.2.0
 
         Returns
         -------
-        Series or None
-            Categorical with removed categories or None if ``inplace=True``.
+        Series
+            Categorical with removed categories
 
         Raises
         ------
@@ -427,13 +385,6 @@ class CategoricalAccessor(object):
         dtype: category
         Categories (2, object): ['a', 'c']
         """
-        if inplace:
-            warnings.warn(
-                "The `inplace` parameter in remove_categories is deprecated "
-                "and will be removed in a future version.",
-                FutureWarning,
-            )
-
         categories: List[Any]
         if is_list_like(removals):
             categories = [cat for cat in removals if cat is not None]
@@ -452,43 +403,26 @@ class CategoricalAccessor(object):
             )
 
         if len(categories) == 0:
-            if inplace:
-                return None
-            else:
-                return self._data.copy()
+            return self._data.copy()
         else:
+            data = [cat for cat in self.categories.sort_values() if cat not in categories]
+            if len(data) == 0:
+                # We should keep original dtype when even removing all categories.
+                data = pd.Index(data, dtype=self.categories.dtype)  # type: ignore[assignment]
             dtype = CategoricalDtype(
-                [cat for cat in self.categories if cat not in categories], ordered=self.ordered
+                categories=data,
+                ordered=self.ordered,
             )
-            psser = self._data.astype(dtype)
+            return self._data.astype(dtype)
 
-            if inplace:
-                internal = self._data._psdf._internal.with_new_spark_column(
-                    self._data._column_label,
-                    psser.spark.column,
-                    field=psser._internal.data_fields[0],
-                )
-                self._data._psdf._update_internal_frame(internal)
-                return None
-            else:
-                return psser
-
-    def remove_unused_categories(self, inplace: bool = False) -> Optional["ps.Series"]:
+    def remove_unused_categories(self) -> Optional["ps.Series"]:
         """
         Remove categories which are not used.
 
-        Parameters
-        ----------
-        inplace : bool, default False
-           Whether or not to drop unused categories inplace or return a copy of
-           this categorical with unused categories dropped.
-
-           .. deprecated:: 3.2.0
-
         Returns
         -------
-        cat : Series or None
-            Categorical with unused categories dropped or None if ``inplace=True``.
+        cat : Series
+            Categorical with unused categories dropped
 
         See Also
         --------
@@ -521,19 +455,16 @@ class CategoricalAccessor(object):
         dtype: category
         Categories (3, object): ['a', 'b', 'c']
         """
-        if inplace:
-            warnings.warn(
-                "The `inplace` parameter in remove_unused_categories is deprecated "
-                "and will be removed in a future version.",
-                FutureWarning,
-            )
+        observed_values = set(self._data.drop_duplicates()._to_pandas())
+        retained_categories = [cat for cat in self.categories if cat in observed_values]
+        if len(retained_categories) == len(self.categories):
+            return self._data.copy()
 
-        categories = set(self._data.drop_duplicates()._to_pandas())
-        removals = [cat for cat in self.categories if cat not in categories]
-        return self.remove_categories(removals=removals, inplace=inplace)
+        dtype = CategoricalDtype(retained_categories, ordered=self.ordered)
+        return self._data.astype(dtype)
 
     def rename_categories(
-        self, new_categories: Union[list, dict, Callable], inplace: bool = False
+        self, new_categories: Union[list, dict, Callable]
     ) -> Optional["ps.Series"]:
         """
         Rename categories.
@@ -555,16 +486,10 @@ class CategoricalAccessor(object):
             * callable : a callable that is called on all items in the old
               categories and whose return values comprise the new categories.
 
-        inplace : bool, default False
-            Whether or not to rename the categories inplace or return a copy of
-            this categorical with renamed categories.
-
-            .. deprecated:: 3.2.0
-
         Returns
         -------
-        cat : Series or None
-            Categorical with removed categories or None if ``inplace=True``.
+        cat : Series
+            Categorical with removed categories
 
         Raises
         ------
@@ -611,13 +536,6 @@ class CategoricalAccessor(object):
         """
         from pyspark.pandas.frame import DataFrame
 
-        if inplace:
-            warnings.warn(
-                "The `inplace` parameter in rename_categories is deprecated "
-                "and will be removed in a future version.",
-                FutureWarning,
-            )
-
         if is_dict_like(new_categories):
             categories = [cast(dict, new_categories).get(item, item) for item in self.categories]
         elif callable(new_categories):
@@ -639,22 +557,17 @@ class CategoricalAccessor(object):
             ),
         )
 
-        if inplace:
-            self._data._psdf._update_internal_frame(internal)
-            return None
-        else:
-            return DataFrame(internal)._psser_for(self._data._column_label).copy()
+        return DataFrame(internal)._psser_for(self._data._column_label).copy()
 
     def reorder_categories(
         self,
         new_categories: Union[pd.Index, List],
         ordered: Optional[bool] = None,
-        inplace: bool = False,
     ) -> Optional["ps.Series"]:
         """
         Reorder categories as specified in new_categories.
 
-        `new_categories` need to include all old categories and no new category
+        `new_categories` needs to include all old categories and no new category
         items.
 
         Parameters
@@ -662,18 +575,13 @@ class CategoricalAccessor(object):
         new_categories : Index-like
            The categories in new order.
         ordered : bool, optional
-           Whether or not the categorical is treated as a ordered categorical.
+           Whether or not the categorical is treated as an ordered categorical.
            If not given, do not change the ordered information.
-        inplace : bool, default False
-           Whether or not to reorder the categories inplace or return a copy of
-           this categorical with reordered categories.
-
-           .. deprecated:: 3.2.0
 
         Returns
         -------
-        cat : Series or None
-            Categorical with removed categories or None if ``inplace=True``.
+        cat : Series
+            Categorical with removed categories
 
         Raises
         ------
@@ -712,13 +620,6 @@ class CategoricalAccessor(object):
         dtype: category
         Categories (3, object): ['c' < 'b' < 'a']
         """
-        if inplace:
-            warnings.warn(
-                "The `inplace` parameter in reorder_categories is deprecated "
-                "and will be removed in a future version.",
-                FutureWarning,
-            )
-
         if not is_list_like(new_categories):
             raise TypeError(
                 "Parameter 'new_categories' must be list-like, was '{}'".format(new_categories)
@@ -732,38 +633,23 @@ class CategoricalAccessor(object):
             ordered = self.ordered
 
         if new_categories == list(self.categories) and ordered == self.ordered:
-            if inplace:
-                return None
-            else:
-                return self._data.copy()
+            return self._data.copy()
         else:
             dtype = CategoricalDtype(categories=new_categories, ordered=ordered)
-            psser = _to_cat(self._data).astype(dtype)
-
-            if inplace:
-                internal = self._data._psdf._internal.with_new_spark_column(
-                    self._data._column_label,
-                    psser.spark.column,
-                    field=psser._internal.data_fields[0],
-                )
-                self._data._psdf._update_internal_frame(internal)
-                return None
-            else:
-                return psser
+            return _to_cat(self._data).astype(dtype)
 
     def set_categories(
         self,
         new_categories: Union[pd.Index, List],
         ordered: Optional[bool] = None,
         rename: bool = False,
-        inplace: bool = False,
     ) -> Optional["ps.Series"]:
         """
         Set the categories to the specified new_categories.
 
         `new_categories` can include new categories (which will result in
         unused categories) or remove old categories (which results in values
-        set to NaN). If `rename==True`, the categories will simple be renamed
+        set to NaN). If `rename==True`, the categories will simply be renamed
         (less or more items than in old categories will result in values set to
         NaN or in unused categories respectively).
 
@@ -774,7 +660,7 @@ class CategoricalAccessor(object):
         On the other hand this methods does not do checks (e.g., whether the
         old categories are included in the new categories on a reorder), which
         can result in surprising changes, for example when using special string
-        dtypes, which does not considers a S1 string equal to a single char
+        dtypes, which does not consider a S1 string equal to a single char
         python string.
 
         Parameters
@@ -782,20 +668,15 @@ class CategoricalAccessor(object):
         new_categories : Index-like
            The categories in new order.
         ordered : bool, default False
-           Whether or not the categorical is treated as a ordered categorical.
+           Whether or not the categorical is treated as an ordered categorical.
            If not given, do not change the ordered information.
         rename : bool, default False
            Whether or not the new_categories should be considered as a rename
            of the old categories or as reordered categories.
-        inplace : bool, default False
-           Whether or not to reorder the categories in-place or return a copy
-           of this categorical with reordered categories.
-
-           .. deprecated:: 3.2.0
 
         Returns
         -------
-        Series with reordered categories or None if inplace.
+        Series with reordered categories
 
         Raises
         ------
@@ -855,13 +736,6 @@ class CategoricalAccessor(object):
         """
         from pyspark.pandas.frame import DataFrame
 
-        if inplace:
-            warnings.warn(
-                "The `inplace` parameter in set_categories is deprecated "
-                "and will be removed in a future version.",
-                FutureWarning,
-            )
-
         if not is_list_like(new_categories):
             raise TypeError(
                 "Parameter 'new_categories' must be list-like, was '{}'".format(new_categories)
@@ -875,7 +749,7 @@ class CategoricalAccessor(object):
 
         if rename:
             new_scol = (
-                F.when(scol >= len(new_categories), SF.lit(-1).cast(self._data.spark.data_type))
+                F.when(scol >= len(new_categories), F.lit(-1).cast(self._data.spark.data_type))
                 .otherwise(scol)
                 .alias(self._data._internal.data_spark_column_names[0])
             )
@@ -886,31 +760,18 @@ class CategoricalAccessor(object):
                 field=self._data._internal.data_fields[0].copy(dtype=new_dtype),
             )
 
-            if inplace:
-                self._data._psdf._update_internal_frame(internal)
-                return None
-            else:
-                return DataFrame(internal)._psser_for(self._data._column_label).copy()
+            return DataFrame(internal)._psser_for(self._data._column_label).copy()
         else:
-            psser = self._data.astype(new_dtype)
-            if inplace:
-                internal = self._data._psdf._internal.with_new_spark_column(
-                    self._data._column_label,
-                    psser.spark.column,
-                    field=psser._internal.data_fields[0],
-                )
-                self._data._psdf._update_internal_frame(internal)
-                return None
-            else:
-                return psser
+            return self._data.astype(new_dtype)
 
 
 def _test() -> None:
-    import os
     import doctest
+    import os
     import sys
-    from pyspark.sql import SparkSession
+
     import pyspark.pandas.categorical
+    from pyspark.sql import SparkSession
 
     os.chdir(os.environ["SPARK_HOME"])
 
@@ -921,7 +782,7 @@ def _test() -> None:
         .appName("pyspark.pandas.categorical tests")
         .getOrCreate()
     )
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.pandas.categorical,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

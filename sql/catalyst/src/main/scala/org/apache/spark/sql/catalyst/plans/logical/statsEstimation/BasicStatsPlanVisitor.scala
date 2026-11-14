@@ -17,7 +17,9 @@
 
 package org.apache.spark.sql.catalyst.plans.logical.statsEstimation
 
+import org.apache.spark.sql.catalyst.planning.ScanOperation
 import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
 
 /**
  * A [[LogicalPlanVisitor]] that computes the statistics for the cost-based optimizer.
@@ -53,12 +55,30 @@ object BasicStatsPlanVisitor extends LogicalPlanVisitor[Statistics] {
   override def visitExpand(p: Expand): Statistics = fallback(p)
 
   override def visitFilter(p: Filter): Statistics = {
-    FilterEstimation(p).estimate.getOrElse(fallback(p))
+    val estimate = p match {
+      case ScanOperation(projects, filtersStayUp, filtersPushDown,
+          scan: DataSourceV2ScanRelation) if scan.shouldEstimateInferredFilters =>
+        // Gather residual predicates through filters and deterministic projections, and include the
+        // fully pushed predicates. Estimate this original group and the scan's inferred predicates
+        // separately from the same unadjusted scan statistics. Since the inferred predicates are
+        // implied by the originals, use the smaller row count to avoid counting their effect twice.
+        scan.estimateStatsWithFilters(filtersPushDown ++ filtersStayUp).flatMap { stats =>
+          if (projects == scan.output) {
+            Some(stats)
+          } else {
+            ProjectEstimation.estimate(projects, stats)
+          }
+        }
+      case _ => FilterEstimation(p).estimate
+    }
+    estimate.getOrElse(fallback(p))
   }
 
   override def visitGenerate(p: Generate): Statistics = default(p)
 
   override def visitGlobalLimit(p: GlobalLimit): Statistics = fallback(p)
+
+  override def visitOffset(p: Offset): Statistics = fallback(p)
 
   override def visitIntersect(p: Intersect): Statistics = {
     val leftStats = p.left.stats
@@ -88,6 +108,8 @@ object BasicStatsPlanVisitor extends LogicalPlanVisitor[Statistics] {
 
   override def visitRepartitionByExpr(p: RepartitionByExpression): Statistics = fallback(p)
 
+  override def visitRebalancePartitions(p: RebalancePartitions): Statistics = fallback(p)
+
   override def visitSample(p: Sample): Statistics = fallback(p)
 
   override def visitScriptTransform(p: ScriptTransformation): Statistics = default(p)
@@ -98,9 +120,7 @@ object BasicStatsPlanVisitor extends LogicalPlanVisitor[Statistics] {
 
   override def visitWindow(p: Window): Statistics = fallback(p)
 
-  override def visitSort(p: Sort): Statistics = {
-    BasicStatsPlanVisitor.visit(p.child)
-  }
+  override def visitSort(p: Sort): Statistics = fallback(p)
 
   override def visitTail(p: Tail): Statistics = {
     fallback(p)

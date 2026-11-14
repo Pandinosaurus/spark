@@ -21,19 +21,20 @@ import java.io.{BufferedReader, File, InputStream, InputStreamReader, OutputStre
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 import org.apache.hadoop.conf.Configuration
 
 import org.apache.spark.{SparkFiles, TaskContext}
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Cast, Expression, GenericInternalRow, JsonToStructs, Literal, StructsToJson, UnsafeProjection}
 import org.apache.spark.sql.catalyst.plans.logical.ScriptInputOutputSchema
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
-import org.apache.spark.sql.catalyst.util.{DateTimeUtils, IntervalUtils}
+import org.apache.spark.sql.catalyst.util.{CharVarcharUtils, DateTimeUtils, IntervalUtils}
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
@@ -50,8 +51,8 @@ trait BaseScriptTransformationExec extends UnaryExecNode {
     child.output.map { in =>
       in.dataType match {
         case _: ArrayType | _: MapType | _: StructType =>
-          new StructsToJson(ioschema.inputSerdeProps.toMap, in)
-            .withTimeZone(conf.sessionLocalTimeZone)
+          StructsToJson(ioschema.inputSerdeProps.toMap, in,
+            Some(conf.sessionLocalTimeZone)).replacement
         case _ => Cast(in, StringType).withTimeZone(conf.sessionLocalTimeZone)
       }
     }
@@ -83,6 +84,12 @@ trait BaseScriptTransformationExec extends UnaryExecNode {
     val path = System.getenv("PATH") + File.pathSeparator +
       SparkFiles.getRootDirectory()
     builder.environment().put("PATH", path)
+    // if OMP_NUM_THREADS is not explicitly set, override it with the value of "spark.task.cpus"
+    // which may be fractional, so round up to an integer number of threads (at least 1).
+    if (System.getenv("OMP_NUM_THREADS") == null) {
+      val taskCpus = conf.getConfString("spark.task.cpus", "1.0").toDouble
+      builder.environment().put("OMP_NUM_THREADS", math.max(1, taskCpus.ceil.toInt).toString)
+    }
 
     val proc = builder.start()
     val inputStream = proc.getInputStream
@@ -99,6 +106,21 @@ trait BaseScriptTransformationExec extends UnaryExecNode {
       stderrBuffer,
       s"Thread-${this.getClass.getSimpleName}-STDERR-Consumer").start()
     (outputStream, proc, inputStream, stderrBuffer)
+  }
+
+  /**
+   * Starts the thread that writes the input rows to the process, and once the task completes
+   * before it reads the whole output of the process, destroys the process and interrupts the
+   * thread, as `PipedRDD` does. Otherwise, as under a LIMIT, the process blocks on writing its
+   * output, and the thread on writing the rest of the input or on reading it, e.g. from a shuffle
+   * fetch that the completed task no longer serves, so that neither ends. A process whose whole
+   * output the task read runs to its end, as it may still do work after it closes its output.
+   */
+  protected def startWriterThread(writerThread: BaseScriptTransformationWriterThread): Unit = {
+    writerThread.taskContext.addTaskCompletionListener[Unit] { context =>
+      writerThread.stopOnTaskCompletion(context.isFailed())
+    }
+    writerThread.start()
   }
 
   protected def processIterator(
@@ -123,8 +145,8 @@ trait BaseScriptTransformationExec extends UnaryExecNode {
               .map { case (data, writer) => writer(data) })
       } else {
         // In schema less mode, hive will choose first two output column as output.
-        // If output column size less then 2, it will return NULL for columns with missing values.
-        // Here we split row string and choose first 2 values, if values's size less then 2,
+        // If output column size less than 2, it will return NULL for columns with missing values.
+        // Here we split row string and choose first 2 values, if values's size less than 2,
         // we pad NULL value until 2 to make behavior same with hive.
         val kvWriter = CatalystTypeConverters.createToCatalystConverter(StringType)
         prevLine: String =>
@@ -139,6 +161,7 @@ trait BaseScriptTransformationExec extends UnaryExecNode {
             curLine = reader.readLine()
             if (curLine == null) {
               checkFailureAndPropagate(writerThread, null, proc, stderrBuffer)
+              writerThread.outputReadToEnd = true
               return false
             }
           }
@@ -159,6 +182,10 @@ trait BaseScriptTransformationExec extends UnaryExecNode {
         }
         val prevLine = curLine
         curLine = reader.readLine()
+        if (curLine == null) {
+          // The task may not call `hasNext` again, as under a LIMIT, so record the end here too.
+          writerThread.outputReadToEnd = true
+        }
         processRowWithoutSerde(prevLine)
       }
     }
@@ -185,7 +212,7 @@ trait BaseScriptTransformationExec extends UnaryExecNode {
     if (!proc.isAlive) {
       val exitCode = proc.exitValue()
       if (exitCode != 0) {
-        logError(stderrBuffer.toString) // log the stderr circular buffer
+        logError(log"${MDC(STDERR, stderrBuffer.toString)}") // log the stderr circular buffer
         throw QueryExecutionErrors.subprocessExitedError(exitCode, stderrBuffer, cause)
       }
     }
@@ -194,7 +221,13 @@ trait BaseScriptTransformationExec extends UnaryExecNode {
   private lazy val outputFieldWriters: Seq[String => Any] = output.map { attr =>
     val converter = CatalystTypeConverters.createToCatalystConverter(attr.dataType)
     attr.dataType match {
-      case StringType => wrapperConvertException(data => data, converter)
+      // CHAR/VARCHAR must not reach the script reader; AstBuilder rewrites them to
+      // unbounded STRING and applies assignment in a Project when first-class types
+      // are enabled. Reject leftover CHAR/VARCHAR, including nested (hand-built plans).
+      case dt if CharVarcharUtils.hasCharVarchar(dt) =>
+        throw QueryExecutionErrors.scriptTransformWithoutSerdeUnsupportedTypeError(dt)
+      // Match collated STRING too (CHAR/VARCHAR COLLATE rewrite via toStringType).
+      case _: StringType => wrapperConvertException(data => data, converter)
       case BooleanType => wrapperConvertException(data => data.toBoolean, converter)
       case ByteType => wrapperConvertException(data => data.toByte, converter)
       case BinaryType =>
@@ -242,11 +275,11 @@ trait BaseScriptTransformationExec extends UnaryExecNode {
       case udt: UserDefinedType[_] =>
         wrapperConvertException(data => udt.deserialize(data), converter)
       case dt =>
-        throw QueryExecutionErrors.outputDataTypeUnsupportedByNodeWithoutSerdeError(nodeName, dt)
+        throw QueryExecutionErrors.scriptTransformWithoutSerdeUnsupportedTypeError(dt)
     }
   }
 
-  // Keep consistent with Hive `LazySimpleSerde`, when there is a type case error, return null
+  // Match Hive `LazySimpleSerDe`: return null when a type cast fails.
   private val wrapperConvertException: (String => Any, Any => Any) => String => Any =
     (f: String => Any, converter: Any => Any) =>
       (data: String) => converter {
@@ -273,12 +306,41 @@ abstract class BaseScriptTransformationWriterThread extends Thread with Logging 
   def taskContext: TaskContext
   def conf: Configuration
 
+  setName(s"Thread-${this.getClass.getSimpleName}-Feed")
   setDaemon(true)
 
   @volatile protected var _exception: Throwable = null
 
   /** Contains the exception thrown while writing the parent iterator to the external process. */
   def exception: Option[Throwable] = Option(_exception)
+
+  // Whether the task read the output of the process to its end. The process is then not stopped
+  // when the task completes.
+  @volatile private[sql] var outputReadToEnd = false
+
+  // Whether the process was destroyed as a task that did not fail completed before the process
+  // ended. The task then no longer reads the output of the process, so the failure of the thread
+  // and the exit status of the process are expected, and not logged as errors.
+  @volatile private var destroyedOnTaskCompletion = false
+
+  /**
+   * Destroys the process if it is still alive, and interrupts this thread, once a task that did
+   * not read the whole output of the process completes, failed if `taskFailed`.
+   */
+  private[execution] def stopOnTaskCompletion(taskFailed: Boolean): Unit = {
+    if (!outputReadToEnd) {
+      if (proc.isAlive) {
+        destroyedOnTaskCompletion = !taskFailed
+        // `Process.destroy()` would close the input of the process, which waits for a write of
+        // this thread blocked on a full pipe, and so would block the task on a process that
+        // ignores the signal. Only signal the process instead, and close its output, which the
+        // completed task no longer reads, to stop a process blocked on writing it.
+        proc.toHandle.destroy()
+        Utils.tryLogNonFatalError(proc.getInputStream.close())
+      }
+      interrupt()
+    }
+  }
 
   protected def processRows(): Unit
 
@@ -328,12 +390,30 @@ abstract class BaseScriptTransformationWriterThread extends Thread with Logging 
         // Javadoc this call will not throw an exception:
         _exception = t
         proc.destroy()
-        logError("Thread-ScriptTransformation-Feed exit cause by: ", t)
+        if (destroyedOnTaskCompletion) {
+          logDebug(s"Thread-${this.getClass.getSimpleName}-Feed exit after the task completed", t)
+        } else {
+          logError(log"Thread-${MDC(CLASS_NAME, this.getClass.getSimpleName)}-Feed " +
+            log"exit cause by: ", t)
+        }
     } finally {
       try {
-        Utils.tryLogNonFatalError(outputStream.close())
-        if (proc.waitFor() != 0) {
-          logError(stderrBuffer.toString) // log the stderr circular buffer
+        if (destroyedOnTaskCompletion) {
+          // The stream may still hold input, which it fails to flush to the destroyed process.
+          try outputStream.close() catch {
+            case NonFatal(e) => logDebug("Failed to close the input of the destroyed process", e)
+          }
+        } else {
+          Utils.tryLogNonFatalError(outputStream.close())
+        }
+        val exitCode = try proc.waitFor() catch {
+          // The task completion listener interrupts this thread once it destroyed the process.
+          // The InterruptedException must not escape the thread, which would exit the executor
+          // (see SPARK-25158), so wait for the destroyed process again.
+          case _: InterruptedException => proc.waitFor()
+        }
+        if (exitCode != 0 && !destroyedOnTaskCompletion) {
+          logError(log"${MDC(STDERR, stderrBuffer.toString)}") // log the stderr circular buffer
         }
       } catch {
         case NonFatal(exceptionFromFinallyBlock) =>

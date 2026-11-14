@@ -18,19 +18,20 @@
 package org.apache.spark.sql.hive
 
 import java.io.File
+import java.nio.file.Files
 import java.util.Locale
 
-import com.google.common.io.Files
 import org.apache.hadoop.fs.Path
-import org.scalatest.{BeforeAndAfter, PrivateMethodTester}
+import org.scalatest.BeforeAndAfter
 
-import org.apache.spark.SparkException
+import org.apache.spark.{SparkException, SparkThrowable}
 import org.apache.spark.sql.{QueryTest, _}
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.expressions.Hex
 import org.apache.spark.sql.catalyst.parser.ParseException
-import org.apache.spark.sql.hive.execution.InsertIntoHiveTable
+import org.apache.spark.sql.hive.execution.HiveTempPath
 import org.apache.spark.sql.hive.test.TestHiveSingleton
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.test.SQLTestUtils
 import org.apache.spark.sql.types._
 import org.apache.spark.util.Utils
 
@@ -38,8 +39,7 @@ case class TestData(key: Int, value: String)
 
 case class ThreeColumnTable(key: Int, value: String, key1: String)
 
-class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
-    with SQLTestUtils  with PrivateMethodTester  {
+class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter {
   import spark.implicits._
 
   override lazy val testData = spark.sparkContext.parallelize(
@@ -51,6 +51,27 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
     hiveContext.reset()
     // Creates a temporary view with testData, which will be used in all tests.
     testData.createOrReplaceTempView("testData")
+  }
+
+  test("SPARK-60366: Dynamic partition overwrite of a converted Hive ORC table with a " +
+      "committer that is not a FileOutputCommitter") {
+    // Hadoop 3.3.5+ binds `abfs` and `gs` to the manifest committer. Converted Hive ORC tables
+    // always use dynamic partition overwrite.
+    withSQLConf(
+        "mapreduce.outputcommitter.factory.scheme.file" ->
+          "org.apache.hadoop.mapreduce.lib.output.committer.manifest.ManifestCommitterFactory",
+        "hive.exec.dynamic.partition.mode" -> "nonstrict") {
+      withTable("t") {
+        sql("CREATE TABLE t (c1 INT) PARTITIONED BY (p1 INT) STORED AS ORC")
+        sql("INSERT INTO t PARTITION (p1) VALUES (1, 1), (2, 2)")
+        val location = spark.sessionState.catalog.getTableMetadata(TableIdentifier("t")).location
+        // Unlike FileOutputCommitter, the manifest committer writes a JSON summary.
+        assert(new File(location.getPath, "_SUCCESS").length() > 0)
+
+        sql("INSERT OVERWRITE TABLE t PARTITION (p1) SELECT 3, 1")
+        checkAnswer(spark.table("t"), Seq(Row(3, 1), Row(2, 2)))
+      }
+    }
   }
 
   test("insertInto() HiveTable") {
@@ -194,7 +215,7 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
         """.stripMargin)
     checkAnswer(sql(selQuery), Row(5, 2, 3, 6))
 
-    val e = intercept[AnalysisException] {
+    val e = intercept[ParseException] {
       sql(
         s"""
            |INSERT OVERWRITE TABLE $tableName
@@ -346,21 +367,29 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
   }
 
   testPartitionedTable("partitionBy() can't be used together with insertInto()") { tableName =>
-    val cause = intercept[AnalysisException] {
-      Seq((1, 2, 3, 4)).toDF("a", "b", "c", "d").write.partitionBy("b", "c").insertInto(tableName)
-    }
-
-    assert(cause.getMessage.contains("insertInto() can't be used together with partitionBy()."))
+    checkError(
+      exception = intercept[AnalysisException] {
+        Seq((1, 2, 3, 4)).toDF("a", "b", "c", "d").write.partitionBy("b", "c").insertInto(tableName)
+      },
+      condition = "PARTITION_BY_NOT_ALLOWED_WITH_INSERT_INTO",
+      parameters = Map("tableName" -> tableName)
+    )
   }
 
   testPartitionedTable(
     "SPARK-16036: better error message when insert into a table with mismatch schema") {
     tableName =>
-      val e = intercept[AnalysisException] {
-        sql(s"INSERT INTO TABLE $tableName PARTITION(b=1, c=2) SELECT 1, 2, 3")
-      }
-      assert(e.message.contains(
-        "target table has 4 column(s) but the inserted data has 5 column(s)"))
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(s"INSERT INTO TABLE $tableName PARTITION(b=1, c=2) SELECT 1, 2, 3")
+        },
+        condition = "INSERT_PARTITION_COLUMN_ARITY_MISMATCH",
+        parameters = Map(
+          "staticPartCols" -> "`b`, `c`",
+          "tableColumns" -> "`a`, `d`, `b`, `c`",
+          "dataColumns" -> "`1`, `2`, `3`",
+          "tableName" -> s"`spark_catalog`.`default`.`${tableName}`")
+      )
   }
 
   testPartitionedTable("SPARK-16037: INSERT statement should match columns by position") {
@@ -382,8 +411,11 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
 
         sql(s"INSERT INTO TABLE $tableName PARTITION (c=11, b=10) SELECT 9, 12")
 
+        // The data is missing a column. The default value for the missing column is null.
+        sql(s"INSERT INTO TABLE $tableName PARTITION (c=15, b=16) (a) SELECT 13")
+
         // c is defined twice. Analyzer will complain.
-        intercept[AnalysisException] {
+        intercept[ParseException] {
           sql(s"INSERT INTO TABLE $tableName PARTITION (b=14, c=15, c=16) SELECT 13")
         }
 
@@ -395,11 +427,6 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
         // d is not a partitioning column. The total number of columns is correct.
         intercept[AnalysisException] {
           sql(s"INSERT INTO TABLE $tableName PARTITION (b=14, c=15, d=16) SELECT 13")
-        }
-
-        // The data is missing a column.
-        intercept[AnalysisException] {
-          sql(s"INSERT INTO TABLE $tableName PARTITION (c=15, b=16) SELECT 13")
         }
 
         // d is not a partitioning column.
@@ -436,11 +463,66 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
             Row(5, 6, 7, 8) ::
             Row(9, 10, 11, 12) ::
             Row(13, 14, 15, 16) ::
+            Row(13, 16, 15, null) ::
             Row(17, 18, 19, 20) ::
             Row(21, 22, 23, 24) ::
             Row(25, 26, 27, 28) :: Nil
         )
       }
+  }
+
+  testPartitionedTable("SPARK-54971: INSERT WITH SCHEMA EVOLUTION is currently unsupported") {
+    tableName =>
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(s"INSERT WITH SCHEMA EVOLUTION INTO TABLE $tableName SELECT 25, 26, 27, 28")
+        },
+        condition = "UNSUPPORTED_INSERT_WITH_SCHEMA_EVOLUTION"
+      )
+
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(s"INSERT WITH SCHEMA EVOLUTION INTO TABLE $tableName SELECT 25, 26, 27, 28, 29")
+        },
+        condition = "UNSUPPORTED_INSERT_WITH_SCHEMA_EVOLUTION"
+      )
+
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(s"INSERT WITH SCHEMA EVOLUTION INTO TABLE $tableName SELECT 25, 26, 27, (28, 29)")
+        },
+        condition = "UNSUPPORTED_INSERT_WITH_SCHEMA_EVOLUTION"
+      )
+  }
+
+  testPartitionedTable("INSERT INTO ... REPLACE ON is currently unsupported") {
+    tableName =>
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(s"INSERT INTO $tableName AS t REPLACE ON t.a = 1 " +
+            s"SELECT 25, 26, 27, 28")
+        },
+        condition = "UNSUPPORTED_FEATURE.TABLE_OPERATION",
+        sqlState = "0A000",
+        parameters = Map(
+          "tableName" -> s"`spark_catalog`.`default`.`$tableName`",
+          "operation" -> "INSERT INTO ... REPLACE ON/USING")
+      )
+  }
+
+  testPartitionedTable("INSERT INTO ... REPLACE USING is currently unsupported") {
+    tableName =>
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(s"INSERT INTO $tableName AS t REPLACE USING (a) " +
+            s"SELECT 25, 26, 27, 28")
+        },
+        condition = "UNSUPPORTED_FEATURE.TABLE_OPERATION",
+        sqlState = "0A000",
+        parameters = Map(
+          "tableName" -> s"`spark_catalog`.`default`.`$tableName`",
+          "operation" -> "INSERT INTO ... REPLACE ON/USING")
+      )
   }
 
   testPartitionedTable("insertInto() should match columns by position and ignore column names") {
@@ -473,13 +555,14 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
       }
   }
 
-  testPartitionedTable("insertInto() should reject missing columns") {
+  testPartitionedTable("insertInto() should reject missing columns if null default is disabled") {
     tableName =>
       withTable("t") {
         sql("CREATE TABLE t (a INT, b INT)")
-
-        intercept[AnalysisException] {
-          spark.table("t").write.insertInto(tableName)
+        withSQLConf(SQLConf.USE_NULLS_FOR_MISSING_DEFAULT_COLUMN_VALUES.key -> "false") {
+          intercept[AnalysisException] {
+            spark.table("t").write.insertInto(tableName)
+          }
         }
       }
   }
@@ -541,25 +624,24 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
     val conf = spark.sessionState.newHadoopConf()
     val inputPath = new Path("/tmp/b/c")
     var stagingDir = "tmp/b"
-    val saveHiveFile = InsertIntoHiveTable(null, Map.empty, null, false, false, null)
-    val getStagingDir = PrivateMethod[Path](Symbol("getStagingDir"))
-    var path = saveHiveFile invokePrivate getStagingDir(inputPath, conf, stagingDir)
+    val hiveTempPath = new HiveTempPath(null, conf, null)
+    var path = hiveTempPath.getStagingDir(inputPath, stagingDir)
     assert(path.toString.indexOf("/tmp/b_hive_") != -1)
 
     stagingDir = "tmp/b/c"
-    path = saveHiveFile invokePrivate getStagingDir(inputPath, conf, stagingDir)
+    path = hiveTempPath.getStagingDir(inputPath, stagingDir)
     assert(path.toString.indexOf("/tmp/b/c/.hive-staging_hive_") != -1)
 
     stagingDir = "d/e"
-    path = saveHiveFile invokePrivate getStagingDir(inputPath, conf, stagingDir)
+    path = hiveTempPath.getStagingDir(inputPath, stagingDir)
     assert(path.toString.indexOf("/tmp/b/c/.hive-staging_hive_") != -1)
 
     stagingDir = ".d/e"
-    path = saveHiveFile invokePrivate getStagingDir(inputPath, conf, stagingDir)
+    path = hiveTempPath.getStagingDir(inputPath, stagingDir)
     assert(path.toString.indexOf("/tmp/b/c/.d/e_hive_") != -1)
 
     stagingDir = "/tmp/c/"
-    path = saveHiveFile invokePrivate getStagingDir(inputPath, conf, stagingDir)
+    path = hiveTempPath.getStagingDir(inputPath, stagingDir)
     assert(path.toString.indexOf("/tmp/c_hive_") != -1)
   }
 
@@ -620,6 +702,146 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
           spark.read.orc(dir.getCanonicalPath),
           sql("select * from test_insert_table"))
       }
+    }
+  }
+
+  test("SPARK-57556: TIME type is unsupported when writing to a Hive serde directory") {
+    // Disable native data source conversion so that the write goes through the Hive serde
+    // path (HiveFileFormat) instead of a native data source that may support TIME.
+    withSQLConf(HiveUtils.CONVERT_METASTORE_INSERT_DIR.key -> "false") {
+      withTempDir { dir =>
+        // InsertIntoHiveDirCommand wraps the failure in a SparkException, so assert on the cause.
+        val e = intercept[SparkException] {
+          sql(
+            s"""
+               |INSERT OVERWRITE LOCAL DIRECTORY '${dir.toURI.getPath}'
+               |STORED AS PARQUET
+               |SELECT TIME'12:01:02' AS c
+             """.stripMargin)
+        }
+        checkError(
+          exception = e.getCause.asInstanceOf[AnalysisException],
+          condition = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
+          parameters = Map(
+            "columnName" -> "`c`",
+            "columnType" -> s"\"${TimeType().sql}\"",
+            "format" -> "Hive"))
+      }
+    }
+  }
+
+  test("SPARK-57815: nanosecond timestamp is unsupported when writing to a Hive serde directory") {
+    // Disable native data source conversion so that the write goes through the Hive serde path
+    // (HiveFileFormat) instead of a native data source that supports nanosecond timestamps.
+    withSQLConf(
+        HiveUtils.CONVERT_METASTORE_INSERT_DIR.key -> "false",
+        SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      Seq("ORC", "PARQUET").foreach { fileFormat =>
+        Seq(
+          "TIMESTAMP_NTZ(9)" -> TimestampNTZNanosType(9),
+          "TIMESTAMP_LTZ(9)" -> TimestampLTZNanosType(9)).foreach { case (typeStr, dt) =>
+          withTempDir { dir =>
+            // InsertIntoHiveDirCommand wraps the failure in a SparkException, so assert on the
+            // cause. Rejecting here avoids a silent downgrade to microsecond precision.
+            val e = intercept[SparkException] {
+              sql(
+                s"""
+                   |INSERT OVERWRITE LOCAL DIRECTORY '${dir.toURI.getPath}'
+                   |STORED AS $fileFormat
+                   |SELECT CAST('2025-01-06 12:30:45.123456789' AS $typeStr) AS c
+                 """.stripMargin)
+            }
+            checkError(
+              exception = e.getCause.asInstanceOf[AnalysisException],
+              condition = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
+              parameters = Map(
+                "columnName" -> "`c`",
+                "columnType" -> s"\"${dt.sql}\"",
+                "format" -> "Hive"))
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-60519: geospatial types are unsupported when writing to a Hive serde directory") {
+    // WKB of POINT(1 2).
+    val wkb = "0101000000000000000000F03F0000000000000040"
+    // Disable native data source conversion so that PARQUET and ORC also go through the Hive
+    // serde path (HiveFileFormat) like TEXTFILE.
+    withSQLConf(HiveUtils.CONVERT_METASTORE_INSERT_DIR.key -> "false") {
+      Seq("TEXTFILE", "PARQUET", "ORC").foreach { fileFormat =>
+        Seq(
+          s"ST_GeomFromWKB(X'$wkb', 4326)" -> GeometryType(4326),
+          s"ST_GeogFromWKB(X'$wkb')" -> GeographyType(4326),
+          s"ARRAY(ST_GeomFromWKB(X'$wkb', 4326))" -> ArrayType(GeometryType(4326))
+        ).foreach { case (expr, dt) =>
+          withTempDir { dir =>
+            // InsertIntoHiveDirCommand wraps the failure in a SparkException, so assert on the
+            // cause.
+            val e = intercept[SparkException] {
+              sql(
+                s"""
+                   |INSERT OVERWRITE LOCAL DIRECTORY '${dir.toURI.getPath}'
+                   |STORED AS $fileFormat
+                   |SELECT $expr AS c
+                 """.stripMargin)
+            }
+            checkError(
+              exception = e.getCause.asInstanceOf[AnalysisException],
+              condition = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
+              parameters = Map(
+                "columnName" -> "`c`",
+                "columnType" -> s"\"${dt.sql}\"",
+                "format" -> "Hive"))
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-60545: TIMESTAMP_NTZ type is unsupported when writing to a Hive serde directory") {
+    // Disable native data source conversion so that PARQUET and ORC also go through the Hive
+    // serde path (HiveFileFormat) like TEXTFILE.
+    withSQLConf(HiveUtils.CONVERT_METASTORE_INSERT_DIR.key -> "false") {
+      Seq("TEXTFILE", "PARQUET", "ORC").foreach { fileFormat =>
+        Seq(
+          "TIMESTAMP_NTZ'2026-01-01 00:00:00'" -> "TIMESTAMP_NTZ",
+          "ARRAY(TIMESTAMP_NTZ'2026-01-01 00:00:00')" -> "ARRAY<TIMESTAMP_NTZ>"
+        ).foreach { case (expr, columnType) =>
+          withTempDir { dir =>
+            // InsertIntoHiveDirCommand wraps the failure in a SparkException, so assert on the
+            // cause.
+            val e = intercept[SparkException] {
+              sql(
+                s"""
+                   |INSERT OVERWRITE LOCAL DIRECTORY '${dir.toURI.getPath}'
+                   |STORED AS $fileFormat
+                   |SELECT $expr AS c
+                 """.stripMargin)
+            }
+            checkError(
+              exception = e.getCause.asInstanceOf[AnalysisException],
+              condition = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
+              parameters = Map(
+                "columnName" -> "`c`",
+                "columnType" -> s""""$columnType"""",
+                "format" -> "Hive"))
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-60565: Write collated strings to a Hive serde directory") {
+    withTempDir { dir =>
+      sql(
+        s"""
+           |INSERT OVERWRITE LOCAL DIRECTORY '${dir.toURI.getPath}'
+           |ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' COLLECTION ITEMS TERMINATED BY ':'
+           |SELECT 'a' COLLATE UNICODE_CI AS c1, ARRAY('b' COLLATE UNICODE_CI, 'c') AS c2
+         """.stripMargin)
+      checkAnswer(spark.read.text(dir.getCanonicalPath), Row("a,b:c"))
     }
   }
 
@@ -706,40 +928,35 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
   test("insert overwrite to dir with mixed syntax") {
     withTempView("test_insert_table") {
       spark.range(10).selectExpr("id", "id AS str").createOrReplaceTempView("test_insert_table")
-
-      val e = intercept[ParseException] {
-        sql(
-          s"""
-             |INSERT OVERWRITE DIRECTORY 'file://tmp'
+      checkError(
+        exception = intercept[ParseException] { sql(
+          s"""INSERT OVERWRITE DIRECTORY 'file://tmp'
              |USING json
              |ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
-             |SELECT * FROM test_insert_table
-           """.stripMargin)
-      }.getMessage
-
-      assert(e.contains("mismatched input 'ROW'"))
+             |SELECT * FROM test_insert_table""".stripMargin)
+        },
+        condition = "PARSE_SYNTAX_ERROR",
+        parameters = Map("error" -> "'ROW'", "hint" -> ""))
     }
   }
 
   test("insert overwrite to dir with multi inserts") {
     withTempView("test_insert_table") {
       spark.range(10).selectExpr("id", "id AS str").createOrReplaceTempView("test_insert_table")
-
-      val e = intercept[ParseException] {
-        sql(
-          s"""
-             |INSERT OVERWRITE DIRECTORY 'file://tmp2'
-             |USING json
-             |ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
-             |SELECT * FROM test_insert_table
-             |INSERT OVERWRITE DIRECTORY 'file://tmp2'
-             |USING json
-             |ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
-             |SELECT * FROM test_insert_table
-           """.stripMargin)
-      }.getMessage
-
-      assert(e.contains("mismatched input 'ROW'"))
+      checkError(
+        exception = intercept[ParseException] {
+          sql(
+            s"""INSERT OVERWRITE DIRECTORY 'file://tmp2'
+               |USING json
+               |ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+               |SELECT * FROM test_insert_table
+               |INSERT OVERWRITE DIRECTORY 'file://tmp2'
+               |USING json
+               |ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+               |SELECT * FROM test_insert_table""".stripMargin)
+        },
+        condition = "PARSE_SYNTAX_ERROR",
+        parameters = Map("error" -> "'ROW'", "hint" -> ""))
     }
   }
 
@@ -747,11 +964,13 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
   test("insert overwrite to dir from non-existent table") {
     withTempDir { dir =>
       val path = dir.toURI.getPath
-
+      val stmt = s"INSERT OVERWRITE LOCAL DIRECTORY '${path}' TABLE nonexistent"
       val e = intercept[AnalysisException] {
-        sql(s"INSERT OVERWRITE LOCAL DIRECTORY '${path}' TABLE nonexistent")
-      }.getMessage
-      assert(e.contains("Table or view not found"))
+        sql(stmt)
+      }
+      checkErrorTableNotFound(e, "`nonexistent`",
+        ExpectedContext("nonexistent", stmt.length - "nonexistent".length,
+          stmt.length - 1))
     }
   }
 
@@ -795,15 +1014,18 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
           s"(caseSensitivity=$caseSensitivity, format=$format)") {
           withTempDir { dir =>
             withSQLConf(SQLConf.CASE_SENSITIVE.key -> s"$caseSensitivity") {
-              val m = intercept[AnalysisException] {
+              val e = intercept[AnalysisException] {
                 sql(
                   s"""
                      |INSERT OVERWRITE $local DIRECTORY '${dir.toURI}'
                      |STORED AS $format
                      |SELECT 'id', 'id2' ${if (caseSensitivity) "id" else "ID"}
                    """.stripMargin)
-              }.getMessage
-              assert(m.contains("Found duplicate column(s) when inserting into"))
+              }
+              checkError(
+                exception = e,
+                condition = "COLUMN_ALREADY_EXISTS",
+                parameters = Map("columnName" -> "`id`"))
             }
           }
         }
@@ -816,8 +1038,7 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
       withTempDir { dir =>
         val file = new File(dir, "test.hex")
         val hex = "AABBCC"
-        val bs = org.apache.commons.codec.binary.Hex.decodeHex(hex.toCharArray)
-        Files.write(bs, file)
+        Files.write(file.toPath, Hex.unhex(hex))
         val path = file.getParent
         sql(s"create table t1 (c string) STORED AS TEXTFILE location '$path'")
         checkAnswer(
@@ -843,66 +1064,97 @@ class InsertSuite extends QueryTest with TestHiveSingleton with BeforeAndAfter
           |PARTITIONED BY (d string)
           """.stripMargin)
 
-      val e = intercept[AnalysisException] {
-        spark.sql(
-          """
-            |INSERT OVERWRITE TABLE t1 PARTITION(d='')
-            |SELECT 1
-          """.stripMargin)
-      }.getMessage
-
-      assert(!e.contains("get partition: Value for key d is null or empty"))
-      assert(e.contains("Partition spec is invalid"))
+      checkError(
+        exception = intercept[AnalysisException] {
+          spark.sql(
+            """
+              |INSERT OVERWRITE TABLE t1 PARTITION(d='')
+              |SELECT 1
+            """.stripMargin)
+        },
+        condition = "INVALID_PARTITION_SPEC",
+        parameters = Map(
+          "details" -> "The spec ([d=Some()]) contains an empty partition column value")
+      )
     }
   }
 
   test("SPARK-35531: Insert data with different cases of bucket column") {
-    withTable("test1") {
-      Seq(true, false).foreach { isHiveTable =>
-        val createSpark = if (isHiveTable) {
-          """
-            |CREATE TABLE TEST1(
-            |v1 BIGINT,
-            |s1 INT)
-            |PARTITIONED BY (pk BIGINT)
-            |CLUSTERED BY (v1)
-            |SORTED BY (s1)
-            |INTO 200 BUCKETS
-            |STORED AS PARQUET
-          """.stripMargin
-        } else {
-          """
-             |CREATE TABLE test1(
-             |v1 BIGINT,
-             |s1 INT)
-             |USING PARQUET
-             |PARTITIONED BY (pk BIGINT)
-             |CLUSTERED BY (v1)
-             |SORTED BY (s1)
-             |INTO 200 BUCKETS
-          """.stripMargin
+    def testDefaultColumn: Unit = {
+      withTable("test1") {
+        Seq(true, false).foreach { isHiveTable =>
+          val createSpark = if (isHiveTable) {
+            """
+              |CREATE TABLE TEST1(
+              |v1 BIGINT,
+              |s1 INT)
+              |PARTITIONED BY (pk BIGINT)
+              |CLUSTERED BY (v1)
+              |SORTED BY (s1)
+              |INTO 200 BUCKETS
+              |STORED AS PARQUET
+              |""".stripMargin
+          } else {
+            """
+              |CREATE TABLE test1(
+              |v1 BIGINT,
+              |s1 INT)
+              |USING PARQUET
+              |PARTITIONED BY (pk BIGINT)
+              |CLUSTERED BY (v1)
+              |SORTED BY (s1)
+              |INTO 200 BUCKETS
+              |""".stripMargin
+          }
+
+          val insertString =
+            """
+              |INSERT INTO test1
+              |SELECT * FROM VALUES(1,1,1)
+              |""".stripMargin
+
+          val dropString = "DROP TABLE IF EXISTS test1"
+
+          sql(dropString)
+          sql(createSpark.toLowerCase(Locale.ROOT))
+
+          sql(insertString.toLowerCase(Locale.ROOT))
+          sql(insertString.toUpperCase(Locale.ROOT))
+
+          sql(dropString)
+          sql(createSpark.toUpperCase(Locale.ROOT))
+
+          sql(insertString.toLowerCase(Locale.ROOT))
+          sql(insertString.toUpperCase(Locale.ROOT))
         }
-
-        val insertString =
-          """
-            |INSERT INTO test1
-            |SELECT * FROM VALUES(1,1,1)
-          """.stripMargin
-
-        val dropString = "DROP TABLE IF EXISTS test1"
-
-        sql(dropString)
-        sql(createSpark.toLowerCase(Locale.ROOT))
-
-        sql(insertString.toLowerCase(Locale.ROOT))
-        sql(insertString.toUpperCase(Locale.ROOT))
-
-        sql(dropString)
-        sql(createSpark.toUpperCase(Locale.ROOT))
-
-        sql(insertString.toLowerCase(Locale.ROOT))
-        sql(insertString.toUpperCase(Locale.ROOT))
       }
+    }
+    withSQLConf(SQLConf.ENABLE_DEFAULT_COLUMNS.key -> "false") {
+      testDefaultColumn
+    }
+    withSQLConf(SQLConf.ENABLE_DEFAULT_COLUMNS.key -> "true",
+      SQLConf.USE_NULLS_FOR_MISSING_DEFAULT_COLUMN_VALUES.key -> "false") {
+      testDefaultColumn
+    }
+    withSQLConf(SQLConf.ENABLE_DEFAULT_COLUMNS.key -> "true",
+      SQLConf.USE_NULLS_FOR_MISSING_DEFAULT_COLUMN_VALUES.key -> "true") {
+      testDefaultColumn
+    }
+  }
+
+  test("SPARK-60360: INSERT OVERWRITE into a converted table keeps the existing data when " +
+      "it fails on an invalid write option") {
+    Seq("parquet" -> "parquet.compression", "orc" -> "orc.compress").foreach {
+      case (format, compressionProperty) =>
+        withTable("t") {
+          sql(s"CREATE TABLE t (id INT) STORED AS $format")
+          sql("INSERT INTO t VALUES (1)")
+          sql(s"ALTER TABLE t SET TBLPROPERTIES ('$compressionProperty' = 'bogus')")
+          assert(intercept[SparkThrowable](sql("INSERT OVERWRITE TABLE t SELECT 2"))
+            .getCondition === "CODEC_NOT_AVAILABLE.WITH_AVAILABLE_CODECS_SUGGESTION")
+          sql(s"ALTER TABLE t UNSET TBLPROPERTIES ('$compressionProperty')")
+          checkAnswer(spark.table("t"), Row(1))
+        }
     }
   }
 }

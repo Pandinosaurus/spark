@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-/* global $, getBaseURI */
+/* global $, uiRoot */
 
 var baseParams;
 
@@ -49,8 +49,8 @@ function disableMoreButton() {
 
 function noNewAlert() {
   var alert = $(".no-new-alert");
-  alert.css("display", "block");
-  window.setTimeout(function () {alert.css("display", "none");}, 4000);
+  alert.removeClass("d-none");
+  window.setTimeout(function () {alert.addClass("d-none");}, 4000);
 }
 
 
@@ -58,12 +58,12 @@ function getRESTEndPoint() {
   // If the worker is served from the master through a proxy (see doc on spark.ui.reverseProxy), 
   // we need to retain the leading ../proxy/<workerid>/ part of the URL when making REST requests.
   // Similar logic is contained in executorspage.js function createRESTEndPoint.
-  var words = getBaseURI().split('/');
+  var words = (document.baseURI || document.URL).split('/');
   var ind = words.indexOf("proxy");
   if (ind > 0) {
     return words.slice(0, ind + 2).join('/') + "/log";
   }
-  return "/log"
+  return uiRoot + "/log";
 }
 
 /* eslint-disable no-unused-vars */
@@ -85,7 +85,7 @@ function loadMore() {
       if (retStartByte == 0) {
         disableMoreButton();
       }
-      $("pre", ".log-content").prepend(cleanData);
+      $("pre", ".log-content").prepend(document.createTextNode(cleanData));
 
       curLogLength = curLogLength + (startByte - retStartByte);
       startByte = retStartByte;
@@ -115,7 +115,7 @@ function loadNew() {
             var retLogLength = dataInfo[2];
 
             var cleanData = data.substring(newlineIndex + 1);
-            $("pre", ".log-content").append(cleanData);
+            $("pre", ".log-content").append(document.createTextNode(cleanData));
 
             curLogLength = curLogLength + (retEndByte - retStartByte);
             endByte = retEndByte;

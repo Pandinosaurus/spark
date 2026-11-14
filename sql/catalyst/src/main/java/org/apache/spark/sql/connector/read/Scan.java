@@ -17,8 +17,12 @@
 
 package org.apache.spark.sql.connector.read;
 
+import java.util.Map;
+
+import org.apache.spark.SparkUnsupportedOperationException;
 import org.apache.spark.annotation.Evolving;
 import org.apache.spark.sql.connector.metric.CustomMetric;
+import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 import org.apache.spark.sql.connector.read.streaming.ContinuousStream;
 import org.apache.spark.sql.connector.read.streaming.MicroBatchStream;
 import org.apache.spark.sql.types.StructType;
@@ -29,11 +33,11 @@ import org.apache.spark.sql.connector.catalog.TableCapability;
  * A logical representation of a data source scan. This interface is used to provide logical
  * information, like what the actual read schema is.
  * <p>
- * This logical representation is shared between batch scan, micro-batch streaming scan and
- * continuous streaming scan. Data sources must implement the corresponding methods in this
- * interface, to match what the table promises to support. For example, {@link #toBatch()} must be
- * implemented, if the {@link Table} that creates this {@link Scan} returns
- * {@link TableCapability#BATCH_READ} support in its {@link Table#capabilities()}.
+ * This logical representation is shared between batch scan, micro-batch streaming scan,
+ * continuous streaming scan and external lookup. Data sources must implement the corresponding
+ * methods in this interface, to match what the table promises to support. For example,
+ * {@link #toBatch()} must be implemented, if the {@link Table} that creates this {@link Scan}
+ * returns {@link TableCapability#BATCH_READ} support in its {@link Table#capabilities()}.
  * </p>
  *
  * @since 3.0.0
@@ -66,14 +70,36 @@ public interface Scan {
    * {@link Table} that creates this scan returns {@link TableCapability#BATCH_READ} support in its
    * {@link Table#capabilities()}.
    * <p>
-   * If the scan supports runtime filtering and implements {@link SupportsRuntimeFiltering},
-   * this method may be called multiple times. Therefore, implementations can cache some state
-   * to avoid planning the job twice.
+   * Spark may call this method more than once for the same scan, for instance when it plans the
+   * scan again for runtime filtering or for a storage filter. Therefore, implementations can cache
+   * some state to avoid planning the job twice.
    *
    * @throws UnsupportedOperationException
    */
   default Batch toBatch() {
-    throw new UnsupportedOperationException(description() + ": Batch scan are not supported");
+    throw new SparkUnsupportedOperationException(
+      "DATA_SOURCE_BATCH_SCAN_NOT_SUPPORTED", Map.of("description", description()));
+  }
+
+  /**
+   * Returns the physical representation of this scan for external lookup. The default throws
+   * {@code DATA_SOURCE_EXTERNAL_LOOKUP_NOT_SUPPORTED}; data sources must override it if the table
+   * reports {@link TableCapability#EXTERNAL_LOOKUP}. Spark calls it at most once, on the driver.
+   * {@link #readSchema()} describes the returned value rows and must list only top-level table
+   * columns, each at most once, with the table's name and data type; its nullability may differ
+   * from the table's, at any nested level. Returned values must satisfy both, nested values
+   * included: a field, array element or map value that the table or the read schema declares NOT
+   * NULL, and any map key, must never hold a null, or the task fails. The columns may be in any
+   * order.
+   * They must include every column passed to {@link SupportsPushDownRequiredColumns#pruneColumns},
+   * or every table column if the builder was not pruned.
+   *
+   * @throws UnsupportedOperationException
+   * @since 4.4.0
+   */
+  default ExternalLookup toExternalLookup() {
+    throw new SparkUnsupportedOperationException(
+      "DATA_SOURCE_EXTERNAL_LOOKUP_NOT_SUPPORTED", Map.of("description", description()));
   }
 
   /**
@@ -89,7 +115,8 @@ public interface Scan {
    * @throws UnsupportedOperationException
    */
   default MicroBatchStream toMicroBatchStream(String checkpointLocation) {
-    throw new UnsupportedOperationException(description() + ": Micro-batch scan are not supported");
+    throw new SparkUnsupportedOperationException(
+      "DATA_SOURCE_MICRO_BATCH_SCAN_NOT_SUPPORTED", Map.of("description", description()));
   }
 
   /**
@@ -105,7 +132,8 @@ public interface Scan {
    * @throws UnsupportedOperationException
    */
   default ContinuousStream toContinuousStream(String checkpointLocation) {
-    throw new UnsupportedOperationException(description() + ": Continuous scan are not supported");
+    throw new SparkUnsupportedOperationException(
+      "DATA_SOURCE_CONTINUOUS_SCAN_NOT_SUPPORTED", Map.of("description", description()));
   }
 
   /**
@@ -114,5 +142,40 @@ public interface Scan {
    */
   default CustomMetric[] supportedCustomMetrics() {
     return new CustomMetric[]{};
+  }
+
+  /**
+   * Returns an array of custom metrics which are collected with values at the driver side only.
+   * Note that these metrics must be included in the supported custom metrics reported by
+   * `supportedCustomMetrics`.
+   *
+   * @since 3.4.0
+   */
+  default CustomTaskMetric[] reportDriverMetrics() {
+    return new CustomTaskMetric[]{};
+  }
+
+  /**
+   * This enum defines how the columnar support for the partitions of the data source
+   * should be determined. The default value is `PARTITION_DEFINED` which indicates that each
+   * partition can determine if it should be columnar or not. SUPPORTED and UNSUPPORTED provide
+   * default shortcuts to indicate support for columnar data or not.
+   *
+   * @since 3.5.0
+   */
+  enum ColumnarSupportMode {
+    PARTITION_DEFINED,
+    SUPPORTED,
+    UNSUPPORTED
+  }
+
+  /**
+   * Subclasses can implement this method to indicate if the support for columnar data should
+   * be determined by each partition or is set as a default for the whole scan.
+   *
+   * @since 3.5.0
+   */
+  default ColumnarSupportMode columnarSupportMode() {
+    return ColumnarSupportMode.PARTITION_DEFINED;
   }
 }

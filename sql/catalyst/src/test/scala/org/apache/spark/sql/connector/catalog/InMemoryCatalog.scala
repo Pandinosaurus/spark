@@ -20,20 +20,31 @@ package org.apache.spark.sql.connector.catalog
 import java.util
 import java.util.concurrent.ConcurrentHashMap
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark.sql.catalyst.analysis.{NoSuchFunctionException, NoSuchNamespaceException}
 import org.apache.spark.sql.connector.catalog.functions.UnboundFunction
+import org.apache.spark.sql.connector.catalog.procedures.UnboundProcedure
 
-class InMemoryCatalog extends InMemoryTableCatalog with FunctionCatalog {
+class InMemoryCatalog extends InMemoryTableCatalog with FunctionCatalog with ProcedureCatalog {
+  override def dropNamespace(namespace: Array[String], cascade: Boolean): Boolean = {
+    if (cascade) {
+      // SPARK-55982: Remove functions and procedures in this namespace before dropping.
+      // Only needed for cascade=true because without cascade, super.dropNamespace
+      // will fail if the namespace still contains tables or child namespaces.
+      listFunctions(namespace).foreach(ident => functions.remove(ident))
+      procedures.keySet.asScala
+        .filter(_.namespace.sameElements(namespace))
+        .foreach(ident => procedures.remove(ident))
+    }
+    super.dropNamespace(namespace, cascade)
+  }
+
   protected val functions: util.Map[Identifier, UnboundFunction] =
     new ConcurrentHashMap[Identifier, UnboundFunction]()
 
-  override protected def allNamespaces: Seq[Seq[String]] = {
-    (tables.keySet.asScala.map(_.namespace.toSeq) ++
-      functions.keySet.asScala.map(_.namespace.toSeq) ++
-      namespaces.keySet.asScala).toSeq.distinct
-  }
+  override protected def allNamespaces: Seq[Seq[String]] =
+    (super.allNamespaces ++ functions.keySet.asScala.map(_.namespace.toSeq)).distinct
 
   override def listFunctions(namespace: Array[String]): Array[Identifier] = {
     if (namespace.isEmpty || namespaceExists(namespace)) {
@@ -54,5 +65,21 @@ class InMemoryCatalog extends InMemoryTableCatalog with FunctionCatalog {
 
   def createFunction(ident: Identifier, fn: UnboundFunction): UnboundFunction = {
     functions.put(ident, fn)
+  }
+
+  def dropFunction(ident: Identifier): Unit = {
+    functions.remove(ident)
+  }
+
+  def clearFunctions(): Unit = {
+    functions.clear()
+  }
+
+  def createProcedure(ident: Identifier, procedure: UnboundProcedure): UnboundProcedure = {
+    procedures.put(ident, procedure)
+  }
+
+  def clearProcedures(): Unit = {
+    procedures.clear()
   }
 }

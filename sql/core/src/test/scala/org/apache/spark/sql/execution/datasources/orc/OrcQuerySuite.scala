@@ -23,7 +23,7 @@ import java.sql.Timestamp
 import java.time.{LocalDateTime, ZoneOffset}
 
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.Path
+import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.hadoop.mapreduce.{JobID, TaskAttemptID, TaskID, TaskType}
 import org.apache.hadoop.mapreduce.lib.input.FileSplit
 import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl
@@ -35,13 +35,18 @@ import org.apache.orc.mapreduce.OrcInputFormat
 import org.apache.spark.{SparkConf, SparkException}
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.expressions.Literal
+import org.apache.spark.sql.catalyst.util.DateTimeTestUtils
+import org.apache.spark.sql.catalyst.util.TimestampNanosTestUtils.foreachNanosPrecision
 import org.apache.spark.sql.execution.FileSourceScanExec
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation, RecordReaderIterator}
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
+import org.apache.spark.tags.ExtendedSQLTest
 import org.apache.spark.util.Utils
+import org.apache.spark.util.collection.Utils.createArray
 
 case class AllDataTypesWithNonPrimitiveType(
     stringField: String,
@@ -189,7 +194,7 @@ abstract class OrcQueryTest extends OrcTest {
     // Respect `orc.compress` (i.e., OrcConf.COMPRESS).
     withTempPath { file =>
       spark.range(0, 10).write
-        .option(COMPRESS.getAttribute, "ZLIB")
+        .option(COMPRESS.getAttribute, OrcCompressionCodec.ZLIB.name())
         .orc(file.getCanonicalPath)
 
       val maybeOrcFile = file.listFiles().find(_.getName.endsWith(".zlib.orc"))
@@ -198,15 +203,15 @@ abstract class OrcQueryTest extends OrcTest {
       val orcFilePath = new Path(maybeOrcFile.get.getAbsolutePath)
       val conf = OrcFile.readerOptions(new Configuration())
       Utils.tryWithResource(OrcFile.createReader(orcFilePath, conf)) { reader =>
-        assert("ZLIB" === reader.getCompressionKind.name)
+        assert(OrcCompressionCodec.ZLIB.name() === reader.getCompressionKind.name)
       }
     }
 
     // `compression` overrides `orc.compress`.
     withTempPath { file =>
       spark.range(0, 10).write
-        .option("compression", "ZLIB")
-        .option(COMPRESS.getAttribute, "SNAPPY")
+        .option("compression", OrcCompressionCodec.ZLIB.name())
+        .option(COMPRESS.getAttribute, OrcCompressionCodec.SNAPPY.name())
         .orc(file.getCanonicalPath)
 
       val maybeOrcFile = file.listFiles().find(_.getName.endsWith(".zlib.orc"))
@@ -215,7 +220,7 @@ abstract class OrcQueryTest extends OrcTest {
       val orcFilePath = new Path(maybeOrcFile.get.getAbsolutePath)
       val conf = OrcFile.readerOptions(new Configuration())
       Utils.tryWithResource(OrcFile.createReader(orcFilePath, conf)) { reader =>
-        assert("ZLIB" === reader.getCompressionKind.name)
+        assert(OrcCompressionCodec.ZLIB.name() === reader.getCompressionKind.name)
       }
     }
   }
@@ -223,7 +228,7 @@ abstract class OrcQueryTest extends OrcTest {
   test("Compression options for writing to an ORC file (SNAPPY, ZLIB and NONE)") {
     withTempPath { file =>
       spark.range(0, 10).write
-        .option("compression", "ZLIB")
+        .option("compression", OrcCompressionCodec.ZLIB.name())
         .orc(file.getCanonicalPath)
 
       val maybeOrcFile = file.listFiles().find(_.getName.endsWith(".zlib.orc"))
@@ -232,13 +237,13 @@ abstract class OrcQueryTest extends OrcTest {
       val orcFilePath = new Path(maybeOrcFile.get.getAbsolutePath)
       val conf = OrcFile.readerOptions(new Configuration())
       Utils.tryWithResource(OrcFile.createReader(orcFilePath, conf)) { reader =>
-        assert("ZLIB" === reader.getCompressionKind.name)
+        assert(OrcCompressionCodec.ZLIB.name() === reader.getCompressionKind.name)
       }
     }
 
     withTempPath { file =>
       spark.range(0, 10).write
-        .option("compression", "SNAPPY")
+        .option("compression", OrcCompressionCodec.SNAPPY.name())
         .orc(file.getCanonicalPath)
 
       val maybeOrcFile = file.listFiles().find(_.getName.endsWith(".snappy.orc"))
@@ -247,13 +252,13 @@ abstract class OrcQueryTest extends OrcTest {
       val orcFilePath = new Path(maybeOrcFile.get.getAbsolutePath)
       val conf = OrcFile.readerOptions(new Configuration())
       Utils.tryWithResource(OrcFile.createReader(orcFilePath, conf)) { reader =>
-        assert("SNAPPY" === reader.getCompressionKind.name)
+        assert(OrcCompressionCodec.SNAPPY.name() === reader.getCompressionKind.name)
       }
     }
 
     withTempPath { file =>
       spark.range(0, 10).write
-        .option("compression", "NONE")
+        .option("compression", OrcCompressionCodec.NONE.name())
         .orc(file.getCanonicalPath)
 
       val maybeOrcFile = file.listFiles().find(_.getName.endsWith(".orc"))
@@ -262,7 +267,7 @@ abstract class OrcQueryTest extends OrcTest {
       val orcFilePath = new Path(maybeOrcFile.get.getAbsolutePath)
       val conf = OrcFile.readerOptions(new Configuration())
       Utils.tryWithResource(OrcFile.createReader(orcFilePath, conf)) { reader =>
-        assert("NONE" === reader.getCompressionKind.name)
+        assert(OrcCompressionCodec.NONE.name() === reader.getCompressionKind.name)
       }
     }
   }
@@ -371,7 +376,7 @@ abstract class OrcQueryTest extends OrcTest {
     withTempPath { dir =>
       val path = dir.getCanonicalPath
 
-      spark.range(0, 10).select('id as "Acol").write.orc(path)
+      spark.range(0, 10).select($"id" as "Acol").write.orc(path)
       spark.read.orc(path).schema("Acol")
       intercept[IllegalArgumentException] {
         spark.read.orc(path).schema("acol")
@@ -412,23 +417,23 @@ abstract class OrcQueryTest extends OrcTest {
           // results. So, this checks if the number of result is less than the original count
           // of data, and then checks if it contains the expected data.
           assert(
-            sourceDf.count < 10 && expectedData.subsetOf(data),
+            sourceDf.count() < 10 && expectedData.subsetOf(data),
             s"No data was filtered for predicate: $pred")
         }
 
-        checkPredicate('a === 5, List(5).map(Row(_, null)))
-        checkPredicate('a <=> 5, List(5).map(Row(_, null)))
-        checkPredicate('a < 5, List(1, 3).map(Row(_, null)))
-        checkPredicate('a <= 5, List(1, 3, 5).map(Row(_, null)))
-        checkPredicate('a > 5, List(7, 9).map(Row(_, null)))
-        checkPredicate('a >= 5, List(5, 7, 9).map(Row(_, null)))
-        checkPredicate('a.isNull, List(null).map(Row(_, null)))
-        checkPredicate('b.isNotNull, List())
-        checkPredicate('a.isin(3, 5, 7), List(3, 5, 7).map(Row(_, null)))
-        checkPredicate('a > 0 && 'a < 3, List(1).map(Row(_, null)))
-        checkPredicate('a < 1 || 'a > 8, List(9).map(Row(_, null)))
-        checkPredicate(!('a > 3), List(1, 3).map(Row(_, null)))
-        checkPredicate(!('a > 0 && 'a < 3), List(3, 5, 7, 9).map(Row(_, null)))
+        checkPredicate($"a" === 5, List(5).map(Row(_, null)))
+        checkPredicate($"a" <=> 5, List(5).map(Row(_, null)))
+        checkPredicate($"a" < 5, List(1, 3).map(Row(_, null)))
+        checkPredicate($"a" <= 5, List(1, 3, 5).map(Row(_, null)))
+        checkPredicate($"a" > 5, List(7, 9).map(Row(_, null)))
+        checkPredicate($"a" >= 5, List(5, 7, 9).map(Row(_, null)))
+        checkPredicate($"a".isNull, List(null).map(Row(_, null)))
+        checkPredicate($"b".isNotNull, List())
+        checkPredicate($"a".isin(3, 5, 7), List(3, 5, 7).map(Row(_, null)))
+        checkPredicate($"a" > 0 && $"a" < 3, List(1).map(Row(_, null)))
+        checkPredicate($"a" < 1 || $"a" > 8, List(9).map(Row(_, null)))
+        checkPredicate(!($"a" > 3), List(1, 3).map(Row(_, null)))
+        checkPredicate(!($"a" > 0 && $"a" < 3), List(3, 5, 7, 9).map(Row(_, null)))
       }
     }
   }
@@ -507,7 +512,7 @@ abstract class OrcQueryTest extends OrcTest {
       conf.setBoolean("hive.io.file.read.all.columns", false)
 
       val orcRecordReader = {
-        val file = new File(path).listFiles().find(_.getName.endsWith(".snappy.orc")).head
+        val file = new File(path).listFiles().find(_.getName.endsWith(".orc")).head
         val split = new FileSplit(new Path(file.toURI), 0, file.length, Array.empty[String])
         val attemptId = new TaskAttemptID(new TaskID(new JobID(), TaskType.MAP, 0), 0)
         val hadoopAttemptContext = new TaskAttemptContextImpl(conf, attemptId)
@@ -589,10 +594,13 @@ abstract class OrcQueryTest extends OrcTest {
     withSQLConf(SQLConf.IGNORE_CORRUPT_FILES.key -> "true") {
       testIgnoreCorruptFiles()
       testIgnoreCorruptFilesWithoutSchemaInfer()
-      val m1 = intercept[AnalysisException] {
-        testAllCorruptFiles()
-      }.getMessage
-      assert(m1.contains("Unable to infer schema for ORC"))
+      checkError(
+        exception = intercept[AnalysisException] {
+          testAllCorruptFiles()
+        },
+        condition = "UNABLE_TO_INFER_SCHEMA",
+        parameters = Map("format" -> "ORC")
+      )
       testAllCorruptFilesWithoutSchemaInfer()
     }
 
@@ -600,19 +608,99 @@ abstract class OrcQueryTest extends OrcTest {
       val e1 = intercept[SparkException] {
         testIgnoreCorruptFiles()
       }
-      assert(e1.getMessage.contains("Malformed ORC file"))
+      assert(e1.getCondition.startsWith("FAILED_READ_FILE"))
+      assert(e1.getCause.getMessage.contains("Malformed ORC file") ||
+        // Hive ORC table scan uses a different code path and has one more error stack
+        e1.getCause.getCause.getMessage.contains("Malformed ORC file"))
       val e2 = intercept[SparkException] {
         testIgnoreCorruptFilesWithoutSchemaInfer()
       }
-      assert(e2.getMessage.contains("Malformed ORC file"))
-      val e3 = intercept[SparkException] {
-        testAllCorruptFiles()
-      }
-      assert(e3.getMessage.contains("Could not read footer for file"))
+      assert(e2.getCondition.startsWith("FAILED_READ_FILE"))
+      assert(e2.getCause.getMessage.contains("Malformed ORC file") ||
+        // Hive ORC table scan uses a different code path and has one more error stack
+        e2.getCause.getCause.getMessage.contains("Malformed ORC file"))
+      checkErrorMatchPVals(
+        exception = intercept[SparkException] {
+          testAllCorruptFiles()
+        },
+        condition = "FAILED_READ_FILE.CANNOT_READ_FILE_FOOTER",
+        parameters = Map("path" -> "file:.*")
+      )
       val e4 = intercept[SparkException] {
         testAllCorruptFilesWithoutSchemaInfer()
       }
-      assert(e4.getMessage.contains("Malformed ORC file"))
+      assert(e4.getCondition.startsWith("FAILED_READ_FILE"))
+      assert(e4.getCause.getMessage.contains("Malformed ORC file") ||
+        // Hive ORC table scan uses a different code path and has one more error stack
+        e4.getCause.getCause.getMessage.contains("Malformed ORC file"))
+    }
+  }
+
+  test("SPARK-55857: Enabling/disabling ignoreMissingFiles") {
+    def testIgnoreMissingFiles(options: Map[String, String]): Unit = {
+      withTempDir { dir =>
+        val basePath = dir.getCanonicalPath
+        val fs = FileSystem.get(spark.sessionState.newHadoopConf())
+        val path1 = new Path(basePath, "first")
+        val path2 = new Path(basePath, "second")
+        spark.range(1).toDF("a").write.orc(path1.toString)
+        spark.range(1, 2).toDF("a").write.orc(path2.toString)
+        // Create DataFrame before deleting to capture file references in the query plan,
+        // then delete to simulate a race condition between listing and reading.
+        val df = spark.read.options(options).orc(path1.toString, path2.toString)
+        fs.listStatus(path1)
+          .filter(f => f.isFile && !f.getPath.getName.startsWith("_"))
+          .foreach(f => fs.delete(f.getPath, false))
+        checkAnswer(df, Seq(Row(1)))
+      }
+    }
+
+    def testIgnoreMissingFilesWithoutSchemaInfer(options: Map[String, String]): Unit = {
+      withTempDir { dir =>
+        val basePath = dir.getCanonicalPath
+        val fs = FileSystem.get(spark.sessionState.newHadoopConf())
+        val path1 = new Path(basePath, "first")
+        val path2 = new Path(basePath, "second")
+        spark.range(1).toDF("a").write.orc(path1.toString)
+        spark.range(1, 2).toDF("a").write.orc(path2.toString)
+        val df = spark.read.schema("a long").options(options)
+          .orc(path1.toString, path2.toString)
+        fs.listStatus(path1)
+          .filter(f => f.isFile && !f.getPath.getName.startsWith("_"))
+          .foreach(f => fs.delete(f.getPath, false))
+        checkAnswer(df, Seq(Row(1)))
+      }
+    }
+
+    // Test ignoreMissingFiles = true
+    Seq("SQLConf", "FormatOption").foreach { by =>
+      val (sqlConf, options) = by match {
+        case "SQLConf" => ("true", Map.empty[String, String])
+        // Explicitly set SQLConf to false but still should ignore missing files
+        case "FormatOption" => ("false", Map("ignoreMissingFiles" -> "true"))
+      }
+      withSQLConf(SQLConf.IGNORE_MISSING_FILES.key -> sqlConf) {
+        testIgnoreMissingFiles(options)
+        testIgnoreMissingFilesWithoutSchemaInfer(options)
+      }
+    }
+
+    // Test ignoreMissingFiles = false
+    Seq("SQLConf", "FormatOption").foreach { by =>
+      val (sqlConf, options) = by match {
+        case "SQLConf" => ("false", Map.empty[String, String])
+        // Explicitly set SQLConf to true but still should not ignore missing files
+        case "FormatOption" => ("true", Map("ignoreMissingFiles" -> "false"))
+      }
+      withSQLConf(SQLConf.IGNORE_MISSING_FILES.key -> sqlConf) {
+        checkErrorMatchPVals(
+          exception = intercept[SparkException] {
+            testIgnoreMissingFiles(options)
+          },
+          condition = "FAILED_READ_FILE.FILE_NOT_EXIST",
+          parameters = Map("path" -> ".*")
+        )
+      }
     }
   }
 
@@ -639,7 +727,7 @@ abstract class OrcQuerySuite extends OrcQueryTest with SharedSparkSession {
   test("LZO compression options for writing to an ORC file") {
     withTempPath { file =>
       spark.range(0, 10).write
-        .option("compression", "LZO")
+        .option("compression", OrcCompressionCodec.LZO.name())
         .orc(file.getCanonicalPath)
 
       val maybeOrcFile = file.listFiles().find(_.getName.endsWith(".lzo.orc"))
@@ -648,7 +736,7 @@ abstract class OrcQuerySuite extends OrcQueryTest with SharedSparkSession {
       val orcFilePath = new Path(maybeOrcFile.get.getAbsolutePath)
       val conf = OrcFile.readerOptions(new Configuration())
       Utils.tryWithResource(OrcFile.createReader(orcFilePath, conf)) { reader =>
-        assert("LZO" === reader.getCompressionKind.name)
+        assert(OrcCompressionCodec.LZO.name() === reader.getCompressionKind.name)
       }
     }
   }
@@ -721,23 +809,45 @@ abstract class OrcQuerySuite extends OrcQueryTest with SharedSparkSession {
     withTempPath { dir =>
       val path = dir.getCanonicalPath
       val df = spark.range(10).map { x =>
-        val stringColumn = s"$x" * 10
-        val structColumn = (x, s"$x" * 100)
-        val arrayColumn = (0 until 5).map(i => (x + i, s"$x" * 5))
+        val stringColumn = s"$x".repeat(10)
+        val structColumn = (x, s"$x".repeat(100))
+        val arrayColumn = (0 until 5).map(i => (x + i, s"$x".repeat(5)))
         val mapColumn = Map(
-          s"$x" -> (x * 0.1, (x, s"$x" * 100)),
-          (s"$x" * 2) -> (x * 0.2, (x, s"$x" * 200)),
-          (s"$x" * 3) -> (x * 0.3, (x, s"$x" * 300)))
+          s"$x" -> (x * 0.1, (x, s"$x".repeat(100))),
+          (s"$x".repeat(2)) -> (x * 0.2, (x, s"$x".repeat(200))),
+          (s"$x".repeat(3)) -> (x * 0.3, (x, s"$x".repeat(300))))
         (x, stringColumn, structColumn, arrayColumn, mapColumn)
       }.toDF("int_col", "string_col", "struct_col", "array_col", "map_col")
       df.write.format("orc").save(path)
 
       withSQLConf(SQLConf.ORC_VECTORIZED_READER_NESTED_COLUMN_ENABLED.key -> "true") {
         val readDf = spark.read.orc(path)
-        val vectorizationEnabled = readDf.queryExecution.executedPlan.find {
+        val vectorizationEnabled = readDf.queryExecution.executedPlan.exists {
           case scan @ (_: FileSourceScanExec | _: BatchScanExec) => scan.supportsColumnar
           case _ => false
-        }.isDefined
+        }
+        assert(vectorizationEnabled)
+        checkAnswer(readDf, df)
+      }
+    }
+  }
+
+  test("SPARK-37728: Reading nested columns with ORC vectorized reader should not " +
+    "cause ArrayIndexOutOfBoundsException") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      val df = spark.range(100).map { _ =>
+        val arrayColumn = (0 until 50).map(_ => (0 until 1000).map(k => k.toString))
+        arrayColumn
+      }.toDF("record").repartition(1)
+      df.write.format("orc").save(path)
+
+      withSQLConf(SQLConf.ORC_VECTORIZED_READER_NESTED_COLUMN_ENABLED.key -> "true") {
+        val readDf = spark.read.orc(path)
+        val vectorizationEnabled = readDf.queryExecution.executedPlan.exists {
+          case scan @ (_: FileSourceScanExec | _: BatchScanExec) => scan.supportsColumnar
+          case _ => false
+        }
         assert(vectorizationEnabled)
         checkAnswer(readDf, df)
       }
@@ -748,10 +858,10 @@ abstract class OrcQuerySuite extends OrcQueryTest with SharedSparkSession {
     withTempPath { dir =>
       val path = dir.getCanonicalPath
       val df = spark.range(10).map { x =>
-        val stringColumn = s"$x" * 10
-        val structColumn = (x, s"$x" * 100)
-        val arrayColumn = (0 until 5).map(i => (x + i, s"$x" * 5))
-        val mapColumn = Map(s"$x" -> (x * 0.1, (x, s"$x" * 100)))
+        val stringColumn = s"$x".repeat(10)
+        val structColumn = (x, s"$x".repeat(100))
+        val arrayColumn = (0 until 5).map(i => (x + i, s"$x".repeat(5)))
+        val mapColumn = Map(s"$x" -> (x * 0.1, (x, s"$x".repeat(100))))
         (x, stringColumn, structColumn, arrayColumn, mapColumn)
       }.toDF("int_col", "string_col", "struct_col", "array_col", "map_col")
       df.write.format("orc").save(path)
@@ -761,10 +871,10 @@ abstract class OrcQuerySuite extends OrcQueryTest with SharedSparkSession {
           withSQLConf(SQLConf.ORC_VECTORIZED_READER_NESTED_COLUMN_ENABLED.key -> "true",
             SQLConf.WHOLESTAGE_MAX_NUM_FIELDS.key -> maxNumFields) {
             val scanPlan = spark.read.orc(path).queryExecution.executedPlan
-            assert(scanPlan.find {
+            assert(scanPlan.exists {
               case scan @ (_: FileSourceScanExec | _: BatchScanExec) => scan.supportsColumnar
               case _ => false
-            }.isDefined == vectorizedEnabled)
+            } == vectorizedEnabled)
           }
       }
     }
@@ -776,58 +886,440 @@ abstract class OrcQuerySuite extends OrcQueryTest with SharedSparkSession {
     } :+ (null, null)
 
     withOrcFile(data) { file =>
-      withAllOrcReaders {
+      withAllNativeOrcReaders {
         checkAnswer(spark.read.orc(file), data.toDF().collect())
       }
     }
   }
 
-  test("SPARK-36346: can't read TimestampLTZ as TimestampNTZ") {
-    val data = (1 to 10).map { i =>
-      val ts = new Timestamp(i)
-      Row(ts)
-    }
-    val answer = (1 to 10).map { i =>
-      // The second parameter is `nanoOfSecond`, while java.sql.Timestamp accepts milliseconds
-      // as input. So here we multiple the `nanoOfSecond` by NANOS_PER_MILLIS
-      val ts = LocalDateTime.ofEpochSecond(0, i * 1000000, ZoneOffset.UTC)
-      Row(ts)
-    }
-    val actualSchema = StructType(Seq(StructField("time", TimestampType, false)))
-    val providedSchema = StructType(Seq(StructField("time", TimestampNTZType, false)))
+  test("SPARK-37463: read/write Timestamp ntz to Orc with different time zone") {
+    DateTimeTestUtils.withDefaultTimeZone(DateTimeTestUtils.LA) {
+      val sqlText = """
+                      |select
+                      | timestamp_ntz '2021-06-01 00:00:00' ts_ntz1,
+                      | timestamp_ntz '1883-11-16 00:00:00.0' as ts_ntz2,
+                      | timestamp_ntz '2021-03-14 02:15:00.0' as ts_ntz3
+                      |""".stripMargin
 
-    withTempPath { file =>
-      val df = spark.createDataFrame(sparkContext.parallelize(data), actualSchema)
-      df.write.orc(file.getCanonicalPath)
-      withAllOrcReaders {
-        val msg = intercept[SparkException] {
-          spark.read.schema(providedSchema).orc(file.getCanonicalPath).collect()
-        }.getMessage
-        assert(msg.contains("Unable to convert timestamp of Orc to data type 'timestamp_ntz'"))
+      withTempPath { dir =>
+        val path = dir.getCanonicalPath
+        val df = sql(sqlText)
+
+        df.write.mode("overwrite").orc(path)
+
+        val query = s"select * from `orc`.`$path`"
+
+        DateTimeTestUtils.outstandingZoneIds.foreach { zoneId =>
+          DateTimeTestUtils.withDefaultTimeZone(zoneId) {
+            withAllNativeOrcReaders {
+              checkAnswer(sql(query), df)
+            }
+          }
+        }
       }
     }
   }
 
-  test("SPARK-36346: read TimestampNTZ as TimestampLTZ") {
-    val data = (1 to 10).map { i =>
-      // The second parameter is `nanoOfSecond`, while java.sql.Timestamp accepts milliseconds
-      // as input. So here we multiple the `nanoOfSecond` by NANOS_PER_MILLIS
-      val ts = LocalDateTime.ofEpochSecond(0, i * 1000000, ZoneOffset.UTC)
-      Row(ts)
-    }
-    val answer = (1 to 10).map { i =>
-      val ts = new java.sql.Timestamp(i)
-      Row(ts)
-    }
-    val actualSchema = StructType(Seq(StructField("time", TimestampNTZType, false)))
-    val providedSchema = StructType(Seq(StructField("time", TimestampType, false)))
-
-    withTempPath { file =>
-      val df = spark.createDataFrame(sparkContext.parallelize(data), actualSchema)
-      df.write.orc(file.getCanonicalPath)
-      withAllOrcReaders {
-        checkAnswer(spark.read.schema(providedSchema).orc(file.getCanonicalPath), answer)
+  test("SPARK-57455: ORC reads nanos timestamps with vectorized and non-vectorized readers") {
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      val wallClocks = Seq(
+        LocalDateTime.of(1970, 1, 1, 0, 0, 0, 0),
+        LocalDateTime.of(1970, 1, 1, 0, 0, 1, 900),
+        LocalDateTime.of(1970, 1, 1, 0, 20, 34, 567890123))
+      foreachNanosPrecision { precision =>
+        Seq(TimestampNTZNanosType(precision), TimestampLTZNanosType(precision)).foreach {
+          nanosType =>
+            val inputDf = nanosTimestampDf(nanosType, wallClocks)
+            val expected = inputDf.collect()
+            withTempPath { dir =>
+              val path = dir.getCanonicalPath
+              inputDf.write.mode("overwrite").orc(path)
+              Seq(true, false).foreach { vectorized =>
+                withSQLConf(SQLConf.ORC_VECTORIZED_READER_ENABLED.key -> vectorized.toString) {
+                  checkAnswer(
+                    spark.read.schema(new StructType().add("ts", nanosType)).orc(path),
+                    expected)
+                }
+              }
+            }
+        }
       }
+    }
+  }
+
+  test("SPARK-59740: ORC round-trips a NULL nanosecond timestamp") {
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      foreachNanosPrecision { precision =>
+        Seq(TimestampNTZNanosType(precision), TimestampLTZNanosType(precision)).foreach {
+          nanosType =>
+            val schema = new StructType().add("ts", nanosType)
+            val inputDf = spark.createDataFrame(
+              spark.sparkContext.parallelize(Seq(Row(null))), schema)
+            withTempPath { dir =>
+              val path = dir.getCanonicalPath
+              inputDf.write.mode("overwrite").orc(path)
+              Seq(true, false).foreach { vectorized =>
+                withSQLConf(SQLConf.ORC_VECTORIZED_READER_ENABLED.key -> vectorized.toString) {
+                  checkAnswer(spark.read.schema(schema).orc(path), Row(null))
+                }
+              }
+            }
+        }
+      }
+    }
+  }
+
+  test("SPARK-57455: nanos timestamps survive a time-zone change across ORC write/read") {
+    // The NTZ wall clock stays zone-independent and the LTZ instant is preserved even when the
+    // writer's and reader's JVM default time zones differ: NTZ goes through an ORC TIMESTAMP
+    // (which preserves the local wall-clock fields) via the default-zone valueOf/toLocalDateTime
+    // on both ends, and LTZ goes through an ORC TIMESTAMP_INSTANT (instant-preserving) via
+    // epoch-based conversions, so neither depends on the default zone matching across the round
+    // trip.
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      val wallClock = Seq(LocalDateTime.of(1970, 1, 1, 0, 20, 34, 567890123))
+      foreachNanosPrecision { precision =>
+        Seq(TimestampNTZNanosType(precision), TimestampLTZNanosType(precision)).foreach {
+          nanosType =>
+            val inputDf = nanosTimestampDf(nanosType, wallClock)
+            val expected = inputDf.collect()
+            withTempPath { dir =>
+              val path = dir.getCanonicalPath
+              DateTimeTestUtils.withDefaultTimeZone(DateTimeTestUtils.LA) {
+                inputDf.write.mode("overwrite").orc(path)
+              }
+              Seq(true, false).foreach { vectorized =>
+                withSQLConf(SQLConf.ORC_VECTORIZED_READER_ENABLED.key -> vectorized.toString) {
+                  DateTimeTestUtils.withDefaultTimeZone(DateTimeTestUtils.UTC) {
+                    checkAnswer(
+                      spark.read.schema(new StructType().add("ts", nanosType)).orc(path),
+                      expected)
+                  }
+                }
+              }
+            }
+        }
+      }
+    }
+  }
+
+  test("SPARK-57455: nanos timestamp type is inferred from ORC without an explicit schema") {
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      val wallClock = Seq(LocalDateTime.of(1970, 1, 1, 0, 20, 34, 567890123))
+      foreachNanosPrecision { precision =>
+        Seq(TimestampNTZNanosType(precision), TimestampLTZNanosType(precision)).foreach {
+          nanosType =>
+            val inputDf = nanosTimestampDf(nanosType, wallClock)
+            withTempPath { dir =>
+              val path = dir.getCanonicalPath
+              inputDf.write.mode("overwrite").orc(path)
+              // Read without supplying a schema: the nanos type is recovered from the
+              // spark.sql.catalyst.type attribute stored in the ORC type description.
+              val readBack = spark.read.orc(path)
+              assert(readBack.schema("ts").dataType === nanosType)
+              checkAnswer(readBack, inputDf)
+            }
+        }
+      }
+    }
+  }
+
+  test("SPARK-57455: ORC round-trips the min/max values of nanos timestamp types") {
+    // The documented range is [0001-01-01T00:00:00.000000000, 9999-12-31T23:59:59.999999999]
+    // (at UTC for LTZ); check both ends round-trip through ORC with both readers, at every
+    // supported precision (the max's sub-micro digits are truncated to the precision).
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      val bounds = Seq(
+        LocalDateTime.of(1, 1, 1, 0, 0, 0, 0),
+        LocalDateTime.of(9999, 12, 31, 23, 59, 59, 999999999))
+      foreachNanosPrecision { precision =>
+        Seq(TimestampNTZNanosType(precision), TimestampLTZNanosType(precision)).foreach {
+          nanosType =>
+            val inputDf = nanosTimestampDf(nanosType, bounds)
+            val expected = inputDf.collect()
+            withTempPath { dir =>
+              val path = dir.getCanonicalPath
+              inputDf.write.mode("overwrite").orc(path)
+              Seq(true, false).foreach { vectorized =>
+                withSQLConf(SQLConf.ORC_VECTORIZED_READER_ENABLED.key -> vectorized.toString) {
+                  checkAnswer(
+                    spark.read.schema(new StructType().add("ts", nanosType)).orc(path),
+                    expected)
+                }
+              }
+            }
+        }
+      }
+    }
+  }
+
+  test("SPARK-57823: ORC predicate pushdown returns correct results for nanos timestamps") {
+    // One wall clock per second across a minute so each row lands in a distinct stripe below, all
+    // carrying sub-microsecond digits so the nanosecond fraction participates in the comparison.
+    val numRows = 60
+    val wallClocks = (0 until numRows).map { s =>
+      LocalDateTime.of(2020, 5, 25, 10, 0, s, 123456789)
+    }
+    def checkNanosPushdown(): Unit = {
+      foreachNanosPrecision { precision =>
+        Seq(TimestampNTZNanosType(precision), TimestampLTZNanosType(precision)).foreach {
+          nanosType =>
+            val inputDf = nanosTimestampDf(nanosType, wallClocks)
+            // A boundary literal (row 30) expressed as the nanos external type, so a `< threshold`
+            // predicate keeps exactly the first 30 rows.
+            val boundary = nanosType match {
+              case _: TimestampNTZNanosType => Literal.create(wallClocks(30), nanosType)
+              case _: TimestampLTZNanosType =>
+                Literal.create(wallClocks(30).toInstant(ZoneOffset.UTC), nanosType)
+            }
+            // Rebuilt against each DataFrame's own `ts` attribute so the filter resolves cleanly.
+            def keepFirstHalf(df: DataFrame): Column = df("ts") < Column(boundary)
+            withTempPath { dir =>
+              val path = dir.getCanonicalPath
+              // Repartition so the rows are spread over several ORC files/stripes, giving the
+              // pushed-down search argument something to skip.
+              inputDf.repartition(numRows).write.orc(path)
+              Seq(true, false).foreach { vectorized =>
+                withSQLConf(
+                    SQLConf.ORC_VECTORIZED_READER_ENABLED.key -> vectorized.toString,
+                    SQLConf.ORC_FILTER_PUSHDOWN_ENABLED.key -> "true") {
+                  val read = spark.read.schema(new StructType().add("ts", nanosType)).orc(path)
+
+                  // Results are correct: the pushdown must not drop or corrupt matching rows.
+                  checkAnswer(
+                    read.where(keepFirstHalf(read)), inputDf.where(keepFirstHalf(inputDf)))
+
+                  // Pushdown actually skips data: with the Spark-side filter removed, fewer than
+                  // all rows survive, proving the ORC search argument pruned stripes.
+                  assert(stripSparkFilter(read.where(keepFirstHalf(read))).count() < numRows)
+                }
+              }
+            }
+        }
+      }
+    }
+
+    // The LTZ column stores the UTC instant; the JVM default zone enters only at comparison time,
+    // when ORC evaluates the pushed predicate against the non-UTC timestamp statistics. So a
+    // literal built in the wrong frame would only diverge from the stripe stats outside UTC. Run
+    // under zones with both offset signs so timezone handling is exercised, not just UTC where such
+    // a bug is masked.
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      Seq(DateTimeTestUtils.UTC, DateTimeTestUtils.LA, DateTimeTestUtils.JST).foreach { zoneId =>
+        DateTimeTestUtils.withDefaultTimeZone(zoneId)(checkNanosPushdown())
+      }
+    }
+  }
+
+  test("SPARK-57823: LTZ nanos pushdown stays correct across a DST spring-forward gap") {
+    // Timestamp.valueOf maps a wall clock inside the JVM zone's spring-forward gap one hour ahead,
+    // so for instants whose UTC wall clock lands in that gap the literal frame is non-monotonic.
+    // Under America/Los_Angeles the gap is 2020-03-08 02:00..03:00, so lay data one minute apart
+    // straddling it (UTC wall clocks 01:30..03:29) with a boundary at 02:45. checkAnswer must hold:
+    // in the gap the pushed predicate may only turn conservative (skip fewer stripes), never prune
+    // a stripe that holds matching rows.
+    val numRows = 120
+    val base = LocalDateTime.of(2020, 3, 8, 1, 30, 0, 123456789)
+    val wallClocks = (0 until numRows).map(m => base.plusMinutes(m))
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      DateTimeTestUtils.withDefaultTimeZone(DateTimeTestUtils.LA) {
+        foreachNanosPrecision { precision =>
+          val nanosType = TimestampLTZNanosType(precision)
+          val inputDf = nanosTimestampDf(nanosType, wallClocks)
+          val boundary = Literal.create(
+            LocalDateTime.of(2020, 3, 8, 2, 45, 0, 0).toInstant(ZoneOffset.UTC), nanosType)
+          def keepBeforeGapBoundary(df: DataFrame): Column = df("ts") < Column(boundary)
+          withTempPath { dir =>
+            val path = dir.getCanonicalPath
+            inputDf.repartition(numRows).write.orc(path)
+            Seq(true, false).foreach { vectorized =>
+              withSQLConf(
+                  SQLConf.ORC_VECTORIZED_READER_ENABLED.key -> vectorized.toString,
+                  SQLConf.ORC_FILTER_PUSHDOWN_ENABLED.key -> "true") {
+                val read = spark.read.schema(new StructType().add("ts", nanosType)).orc(path)
+                checkAnswer(
+                  read.where(keepBeforeGapBoundary(read)),
+                  inputDf.where(keepBeforeGapBoundary(inputDf)))
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-60436: ORC predicate pushdown on timestamps with sub-millisecond digits") {
+    // Each value is written to its own file, so a pushed down predicate that skips a file with a
+    // matching row changes the result. `00:00:00.123` is `value` truncated to milliseconds.
+    val types = TimestampType +:
+      (TimestampNTZNanosType.MIN_PRECISION to TimestampNTZNanosType.MAX_PRECISION).flatMap { p =>
+        Seq(TimestampNTZNanosType(p), TimestampLTZNanosType(p))
+      }
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      types.foreach { dataType =>
+        def ts(time: String): String = s"CAST('2020-01-01 $time' AS ${dataType.sql})"
+        val value = ts("00:00:00.123456789")
+        val input = sql(s"SELECT ${ts("00:00:00.123")} AS ts UNION ALL SELECT $value " +
+          s"UNION ALL SELECT ${ts("00:00:01")}")
+        withTempPath { dir =>
+          val path = dir.getCanonicalPath
+          input.coalesce(1).write.option("maxRecordsPerFile", 1).orc(path)
+          Seq(true, false).foreach { vectorized =>
+            withSQLConf(SQLConf.ORC_VECTORIZED_READER_ENABLED.key -> vectorized.toString) {
+              val df = spark.read.schema(input.schema).orc(path)
+              Seq(
+                s"ts = $value",
+                s"ts <=> $value",
+                s"ts IN ($value, ${ts("00:00:01")})",
+                s"ts < $value",
+                s"ts <= $value",
+                s"ts > $value",
+                s"ts >= $value",
+                s"ts != $value",
+                s"ts NOT IN ($value, ${ts("00:00:01")})"
+              ).foreach { condition =>
+                checkAnswer(df.where(condition), input.where(condition))
+              }
+              // The pushed down value keeps its sub-millisecond digits and skips the other files.
+              checkAnswer(
+                stripSparkFilter(df.where(s"ts = $value")), input.where(s"ts = $value"))
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-57455: ORC round-trips nanos timestamps in nested/complex types") {
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      val wallClocks = Seq(LocalDateTime.of(1970, 1, 1, 0, 20, 34, 567890123))
+      foreachNanosPrecision { precision =>
+        Seq(TimestampNTZNanosType(precision), TimestampLTZNanosType(precision)).foreach {
+          nanosType =>
+            withTempView("nanos_input") {
+              nanosTimestampDf(nanosType, wallClocks).createOrReplaceTempView("nanos_input")
+              val nested = sql(
+                """SELECT
+                  |  named_struct('ts', ts) AS struct_ts,
+                  |  array(ts) AS array_ts,
+                  |  map('k', ts) AS map_ts
+                  |FROM nanos_input
+                  |""".stripMargin)
+              withTempPath { dir =>
+                val path = dir.getCanonicalPath
+                nested.write.mode("overwrite").orc(path)
+                Seq(true, false).foreach { vectorized =>
+                  withSQLConf(SQLConf.ORC_VECTORIZED_READER_ENABLED.key -> vectorized.toString) {
+                    val readBack = spark.read.schema(nested.schema).orc(path)
+                    checkAnswer(readBack, nested)
+                  }
+                }
+              }
+            }
+        }
+      }
+    }
+  }
+
+  // SPARK-39519: Ignore this case because it requires more than 4g heap memory to ensure test
+  // stability when use Java 11. Should test it manually when upgrading `hive-storage-api`
+  ignore("SPARK-39387: BytesColumnVector should not throw RuntimeException due to overflow") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      val df = spark.range(1, 22, 1, 1).map { _ =>
+        val byteData = createArray[Byte](1024 * 1024, 'X')
+        val mapData = (1 to 100).map(i => (i, byteData))
+        mapData
+      }.toDF()
+      df.write.format("orc").save(path)
+    }
+  }
+
+  test("SPARK-39381: Make vectorized orc columar writer batch size configurable") {
+    Seq(10, 100).foreach(batchSize => {
+      withSQLConf(SQLConf.ORC_VECTORIZED_WRITER_BATCH_SIZE.key -> batchSize.toString) {
+        withTempPath { dir =>
+          val path = dir.getCanonicalPath
+          val df = spark.range(1, 1024, 1, 1).map { _ =>
+            val byteData = createArray[Byte](5 * 1024 * 1024, 'X')
+            byteData
+          }.toDF()
+          df.write.format("orc").save(path)
+        }
+      }
+    })
+  }
+
+  test("SPARK-39830: Reading ORC table that requires type promotion may throw AIOOBE") {
+    withSQLConf(SQLConf.ORC_VECTORIZED_WRITER_BATCH_SIZE.key -> "1",
+      "orc.stripe.size" -> "10240",
+      "orc.rows.between.memory.checks" -> "1") {
+      withTempPath { dir =>
+        val path = dir.getCanonicalPath
+        val df = spark.range(1, 1 + 512, 1, 1).map { i =>
+          if (i == 1) {
+            (i, createArray[Byte](5 * 1024 * 1024, 'X'))
+          } else {
+            (i, createArray[Byte](1, 'X'))
+          }
+        }.toDF("c1", "c2")
+        df.write.format("orc").save(path)
+        withTable("t1") {
+          spark.sql(s"create table t1 (c1 string,c2 binary) using orc location '$path'")
+          spark.sql("select * from t1").collect()
+        }
+      }
+    }
+  }
+
+  test("TIME type support for ORC format") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      val df = spark.sql("""
+        SELECT
+          id,
+          TIME'09:30:00' as morning,
+          TIME'14:45:30.123456' as afternoon,
+          TIME'23:59:59.999999' as end_of_day,
+          TIME'00:00:00' as midnight,
+          CASE WHEN id % 2 = 0 THEN TIME'12:30:00' ELSE NULL END as nullable_time
+        FROM VALUES (1), (2), (3) AS t(id)
+      """)
+
+      df.write.mode("overwrite").orc(path)
+      val result = spark.read.orc(path)
+
+      Seq("morning", "afternoon", "end_of_day", "midnight", "nullable_time").foreach { col =>
+        assert(result.schema(col).dataType == TimeType(6))
+      }
+      checkAnswer(result, df)
+    }
+  }
+
+  test("TIME type with different precisions in ORC") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      val df = spark.sql("""
+        SELECT
+          CAST(TIME'12:34:56' AS TIME(0)) as time_p0,
+          CAST(TIME'12:34:56.1' AS TIME(1)) as time_p1,
+          CAST(TIME'12:34:56.12' AS TIME(2)) as time_p2,
+          CAST(TIME'12:34:56.123' AS TIME(3)) as time_p3,
+          CAST(TIME'12:34:56.1234' AS TIME(4)) as time_p4,
+          CAST(TIME'12:34:56.12345' AS TIME(5)) as time_p5,
+          CAST(TIME'12:34:56.123456' AS TIME(6)) as time_p6,
+          CAST(TIME'12:34:56.1234567' AS TIME(7)) as time_p7,
+          CAST(TIME'12:34:56.12345678' AS TIME(8)) as time_p8,
+          CAST(TIME'12:34:56.123456789' AS TIME(9)) as time_p9
+      """)
+
+      df.write.mode("overwrite").orc(path)
+      val result = spark.read.orc(path)
+
+      (0 to TimeType.MAX_PRECISION).foreach { p =>
+        assert(result.schema(s"time_p$p").dataType == TimeType(p))
+      }
+      checkAnswer(result, df)
     }
   }
 }
@@ -839,6 +1331,7 @@ class OrcV1QuerySuite extends OrcQuerySuite {
       .set(SQLConf.USE_V1_SOURCE_LIST, "orc")
 }
 
+@ExtendedSQLTest
 class OrcV2QuerySuite extends OrcQuerySuite {
   override protected def sparkConf: SparkConf =
     super

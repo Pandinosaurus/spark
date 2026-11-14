@@ -17,6 +17,8 @@
 
 package org.apache.spark.ml.feature
 
+import java.io.{DataInputStream, DataOutputStream}
+
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.annotation.Since
@@ -26,7 +28,6 @@ import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.stat.Summarizer
 import org.apache.spark.ml.util._
-import org.apache.spark.mllib.util.MLUtils
 import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{StructField, StructType}
@@ -61,10 +62,10 @@ private[feature] trait StandardScalerParams extends Params with HasInputCol with
 
   /** Validates and transforms the input schema. */
   protected def validateAndTransformSchema(schema: StructType): StructType = {
-    SchemaUtils.checkColumnType(schema, $(inputCol), new VectorUDT)
+    SchemaUtils.checkColumnType(schema, $(inputCol), SQLDataTypes.VectorType)
     require(!schema.fieldNames.contains($(outputCol)),
       s"Output column ${$(outputCol)} already exists.")
-    val outputFields = schema.fields :+ StructField($(outputCol), new VectorUDT, false)
+    val outputFields = schema.fields :+ StructField($(outputCol), SQLDataTypes.VectorType, false)
     StructType(outputFields)
   }
 
@@ -147,6 +148,20 @@ class StandardScalerModel private[ml] (
 
   import StandardScalerModel._
 
+  // For ml connect only
+  private[ml] def this() = this("", Vectors.empty, Vectors.empty)
+
+  private[spark] override def estimatedSize: Long = {
+    var size = estimateMatadataSize
+    if (std != null) {
+      size += std.getSizeInBytes
+    }
+    if (mean != null) {
+      size += mean.getSizeInBytes
+    }
+    size
+  }
+
   /** @group setParam */
   @Since("1.2.0")
   def setInputCol(value: String): this.type = set(inputCol, value)
@@ -198,17 +213,29 @@ class StandardScalerModel private[ml] (
 
 @Since("1.6.0")
 object StandardScalerModel extends MLReadable[StandardScalerModel] {
+  private[ml] case class Data(std: Vector, mean: Vector)
+
+  private[ml] def serializeData(data: Data, dos: DataOutputStream): Unit = {
+    import ReadWriteUtils._
+    serializeVector(data.std, dos)
+    serializeVector(data.mean, dos)
+  }
+
+  private[ml] def deserializeData(dis: DataInputStream): Data = {
+    import ReadWriteUtils._
+    val std = deserializeVector(dis)
+    val mean = deserializeVector(dis)
+    Data(std, mean)
+  }
 
   private[StandardScalerModel]
   class StandardScalerModelWriter(instance: StandardScalerModel) extends MLWriter {
 
-    private case class Data(std: Vector, mean: Vector)
-
     override protected def saveImpl(path: String): Unit = {
-      DefaultParamsWriter.saveMetadata(instance, path, sc)
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
       val data = Data(instance.std, instance.mean)
       val dataPath = new Path(path, "data").toString
-      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
+      ReadWriteUtils.saveObject[Data](dataPath, data, sparkSession, serializeData)
     }
   }
 
@@ -217,13 +244,10 @@ object StandardScalerModel extends MLReadable[StandardScalerModel] {
     private val className = classOf[StandardScalerModel].getName
 
     override def load(path: String): StandardScalerModel = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val dataPath = new Path(path, "data").toString
-      val data = sparkSession.read.parquet(dataPath)
-      val Row(std: Vector, mean: Vector) = MLUtils.convertVectorColumnsToML(data, "std", "mean")
-        .select("std", "mean")
-        .head()
-      val model = new StandardScalerModel(metadata.uid, std, mean)
+      val data = ReadWriteUtils.loadObject[Data](dataPath, sparkSession, deserializeData)
+      val model = new StandardScalerModel(metadata.uid, data.std, data.mean)
       metadata.getAndSetParams(model)
       model
     }

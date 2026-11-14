@@ -18,12 +18,16 @@
 __all__ = ["SparkConf"]
 
 import sys
-from typing import Dict, List, Optional, Tuple, cast, overload
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, cast, overload
 
-from py4j.java_gateway import JVMView, JavaObject  # type: ignore[import]
+from pyspark.errors import PySparkRuntimeError
+from pyspark.util import is_remote_only
+
+if TYPE_CHECKING:
+    from py4j.java_gateway import JavaObject, JVMView
 
 
-class SparkConf(object):
+class SparkConf:
     """
     Configuration for a Spark application. Used to set various Spark
     parameters as key-value pairs.
@@ -58,8 +62,7 @@ class SparkConf(object):
 
     Examples
     --------
-    >>> from pyspark.conf import SparkConf
-    >>> from pyspark.context import SparkContext
+    >>> from pyspark import SparkConf, SparkContext
     >>> conf = SparkConf()
     >>> conf.setMaster("local").setAppName("My app")
     <pyspark.conf.SparkConf object at ...>
@@ -107,14 +110,14 @@ class SparkConf(object):
     spark.home=/path
     """
 
-    _jconf: Optional[JavaObject]
+    _jconf: Optional["JavaObject"]
     _conf: Optional[Dict[str, str]]
 
     def __init__(
         self,
         loadDefaults: bool = True,
-        _jvm: Optional[JVMView] = None,
-        _jconf: Optional[JavaObject] = None,
+        _jvm: Optional["JVMView"] = None,
+        _jconf: Optional["JavaObject"] = None,
     ):
         """
         Create a new Spark configuration.
@@ -122,13 +125,15 @@ class SparkConf(object):
         if _jconf:
             self._jconf = _jconf
         else:
-            from pyspark.context import SparkContext
+            jvm = None
+            if not is_remote_only():
+                from pyspark.core.context import SparkContext
 
-            _jvm = _jvm or SparkContext._jvm  # type: ignore[attr-defined]
+                jvm = _jvm or SparkContext._jvm
 
-            if _jvm is not None:
+            if jvm is not None:
                 # JVM is created, so create self._jconf directly through JVM
-                self._jconf = _jvm.SparkConf(loadDefaults)
+                self._jconf = jvm.SparkConf(loadDefaults)
                 self._conf = None
             else:
                 # JVM is not created, so store data in self._conf first
@@ -167,12 +172,10 @@ class SparkConf(object):
         return self
 
     @overload
-    def setExecutorEnv(self, key: str, value: str) -> "SparkConf":
-        ...
+    def setExecutorEnv(self, key: str, value: str) -> "SparkConf": ...
 
     @overload
-    def setExecutorEnv(self, *, pairs: List[Tuple[str, str]]) -> "SparkConf":
-        ...
+    def setExecutorEnv(self, *, pairs: List[Tuple[str, str]]) -> "SparkConf": ...
 
     def setExecutorEnv(
         self,
@@ -182,11 +185,14 @@ class SparkConf(object):
     ) -> "SparkConf":
         """Set an environment variable to be passed to executors."""
         if (key is not None and pairs is not None) or (key is None and pairs is None):
-            raise RuntimeError("Either pass one key-value pair or a list of pairs")
+            raise PySparkRuntimeError(
+                errorClass="KEY_VALUE_PAIR_REQUIRED",
+                messageParameters={},
+            )
         elif key is not None:
             self.set("spark.executorEnv.{}".format(key), cast(str, value))
         elif pairs is not None:
-            for (k, v) in pairs:
+            for k, v in pairs:
                 self.set("spark.executorEnv.{}".format(k), v)
         return self
 
@@ -199,9 +205,18 @@ class SparkConf(object):
         pairs : iterable of tuples
             list of key-value pairs to set
         """
-        for (k, v) in pairs:
+        for k, v in pairs:
             self.set(k, v)
         return self
+
+    @overload
+    def get(self, key: str) -> Optional[str]: ...
+
+    @overload
+    def get(self, key: str, defaultValue: None) -> Optional[str]: ...
+
+    @overload
+    def get(self, key: str, defaultValue: str) -> str: ...
 
     def get(self, key: str, defaultValue: Optional[str] = None) -> Optional[str]:
         """Get the configured value for some key, or return a default otherwise."""
@@ -223,6 +238,8 @@ class SparkConf(object):
     def getAll(self) -> List[Tuple[str, str]]:
         """Get all values as a list of key-value pairs."""
         if self._jconf is not None:
+            from py4j.java_gateway import JavaObject
+
             return [(elem._1(), elem._2()) for elem in cast(JavaObject, self._jconf).getAll()]
         else:
             assert self._conf is not None
@@ -251,7 +268,7 @@ class SparkConf(object):
 def _test() -> None:
     import doctest
 
-    (failure_count, test_count) = doctest.testmod(optionflags=doctest.ELLIPSIS)
+    failure_count, test_count = doctest.testmod(optionflags=doctest.ELLIPSIS)
     if failure_count:
         sys.exit(-1)
 

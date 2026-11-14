@@ -17,6 +17,9 @@
 
 package org.apache.spark.sql.jdbc
 
+import java.sql.{Connection, SQLException}
+
+import org.apache.spark.sql.execution.datasources.jdbc.JDBCOptions
 import org.apache.spark.sql.types.{DataType, MetadataBuilder}
 
 /**
@@ -26,7 +29,8 @@ import org.apache.spark.sql.types.{DataType, MetadataBuilder}
  *
  * @param dialects List of dialects.
  */
-private class AggregatedDialect(dialects: List[JdbcDialect]) extends JdbcDialect {
+private class AggregatedDialect(dialects: List[JdbcDialect])
+  extends JdbcDialect with NoLegacyJDBCError {
 
   require(dialects.nonEmpty)
 
@@ -42,6 +46,8 @@ private class AggregatedDialect(dialects: List[JdbcDialect]) extends JdbcDialect
     dialects.flatMap(_.getJDBCType(dt)).headOption
   }
 
+  override def timestampNTZAsWallClock: Boolean = dialects.exists(_.timestampNTZAsWallClock)
+
   override def quoteIdentifier(colName: String): String = {
     dialects.head.quoteIdentifier(colName)
   }
@@ -52,6 +58,10 @@ private class AggregatedDialect(dialects: List[JdbcDialect]) extends JdbcDialect
 
   override def getSchemaQuery(table: String): String = {
     dialects.head.getSchemaQuery(table)
+  }
+
+  override def isSyntaxErrorBestEffort(exception: SQLException): Boolean = {
+    dialects.head.isSyntaxErrorBestEffort(exception)
   }
 
   override def isCascadingTruncateTable(): Option[Boolean] = {
@@ -73,7 +83,15 @@ private class AggregatedDialect(dialects: List[JdbcDialect]) extends JdbcDialect
    */
   override def getTruncateQuery(
       table: String,
-      cascade: Option[Boolean] = isCascadingTruncateTable): String = {
+      cascade: Option[Boolean] = isCascadingTruncateTable()): String = {
     dialects.head.getTruncateQuery(table, cascade)
+  }
+
+  override def getFetchSize(options: JDBCOptions): Int = {
+    dialects.head.getFetchSize(options)
+  }
+
+  override def beforeFetch(connection: Connection, options: JDBCOptions): Unit = {
+    dialects.head.beforeFetch(connection, options)
   }
 }

@@ -32,9 +32,7 @@ class ShowPartitionsSuite extends v1.ShowPartitionsSuiteBase with CommandSuiteBa
         runShowPartitionsSql(
           s"SHOW PARTITIONS $t",
           Row("part=__HIVE_DEFAULT_PARTITION__") :: Nil)
-        checkAnswer(spark.table(t),
-          Row(0, "__HIVE_DEFAULT_PARTITION__") ::
-          Row(1, "__HIVE_DEFAULT_PARTITION__") :: Nil)
+        checkAnswer(spark.table(t), Row(0, null) :: Row(1, null) :: Nil)
       }
     }
   }
@@ -42,7 +40,7 @@ class ShowPartitionsSuite extends v1.ShowPartitionsSuiteBase with CommandSuiteBa
   test("hive client calls") {
     withNamespaceAndTable("ns", "dateTable") { t =>
       createDateTable(t)
-      checkHiveClientCalls(expected = 10) {
+      checkHiveClientCalls(expected = 6) {
         sql(s"SHOW PARTITIONS $t")
       }
     }

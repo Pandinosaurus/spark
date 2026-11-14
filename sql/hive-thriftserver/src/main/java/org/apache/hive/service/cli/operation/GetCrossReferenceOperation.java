@@ -20,10 +20,16 @@ package org.apache.hive.service.cli.operation;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
 import org.apache.hadoop.hive.metastore.api.ForeignKeysRequest;
 import org.apache.hadoop.hive.metastore.api.SQLForeignKey;
+import org.apache.hadoop.hive.ql.security.authorization.plugin.HiveOperationType;
+import org.apache.hadoop.hive.ql.security.authorization.plugin.HivePrivilegeObject;
+import org.apache.hadoop.hive.ql.security.authorization.plugin.HivePrivilegeObject.HivePrivilegeObjectType;
 import org.apache.hadoop.hive.serde2.thrift.Type;
 import org.apache.hive.service.cli.*;
 import org.apache.hive.service.cli.session.HiveSession;
+import org.apache.hive.service.rpc.thrift.TRowSet;
+import org.apache.hive.service.rpc.thrift.TTableSchema;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -115,6 +121,27 @@ public class GetCrossReferenceOperation extends MetadataOperation {
     setState(OperationState.RUNNING);
     try {
        IMetaStoreClient metastoreClient = getParentSession().getMetaStoreClient();
+      if (isAuthV2Enabled()) {
+        List<HivePrivilegeObject> privObjs = new ArrayList<>();
+        if (parentTableName != null) {
+          privObjs.add(new HivePrivilegeObject(
+              HivePrivilegeObjectType.TABLE_OR_VIEW, parentSchemaName, parentTableName));
+        }
+        if (foreignTableName != null) {
+          privObjs.add(new HivePrivilegeObject(
+              HivePrivilegeObjectType.TABLE_OR_VIEW, foreignSchemaName, foreignTableName));
+        }
+        String cmdStr = "catalog : " + parentCatalogName
+            + ", parentSchema : " + parentSchemaName + ", parentTable : " + parentTableName
+            + ", foreignSchema : " + foreignSchemaName + ", foreignTable : " + foreignTableName;
+        if (privObjs.isEmpty()) {
+          // Neither table is specified, so the request cannot be scoped to any privilege object;
+          // reject it instead of skipping the authorization check.
+          throw new HiveSQLException(
+              "Access denied: neither parent nor foreign table specified. " + cmdStr);
+        }
+        authorizeMetaGets(HiveOperationType.GET_COLUMNS, privObjs, cmdStr);
+      }
      ForeignKeysRequest fkReq = new ForeignKeysRequest(parentSchemaName, parentTableName, foreignSchemaName, foreignTableName);
      List<SQLForeignKey> fks = metastoreClient.getForeignKeys(fkReq);
       if (fks == null) {
@@ -140,21 +167,21 @@ public class GetCrossReferenceOperation extends MetadataOperation {
    * @see org.apache.hive.service.cli.Operation#getResultSetSchema()
    */
   @Override
-  public TableSchema getResultSetSchema() throws HiveSQLException {
+  public TTableSchema getResultSetSchema() throws HiveSQLException {
     assertState(OperationState.FINISHED);
-    return RESULT_SET_SCHEMA;
+    return RESULT_SET_SCHEMA.toTTableSchema();
   }
 
   /* (non-Javadoc)
    * @see org.apache.hive.service.cli.Operation#getNextRowSet(org.apache.hive.service.cli.FetchOrientation, long)
    */
   @Override
-  public RowSet getNextRowSet(FetchOrientation orientation, long maxRows) throws HiveSQLException {
+  public TRowSet getNextRowSet(FetchOrientation orientation, long maxRows) throws HiveSQLException {
     assertState(OperationState.FINISHED);
     validateDefaultFetchOrientation(orientation);
     if (orientation.equals(FetchOrientation.FETCH_FIRST)) {
       rowSet.setStartOffset(0);
     }
-    return rowSet.extractSubset((int)maxRows);
+    return rowSet.extractSubset((int)maxRows).toTRowSet();
   }
 }

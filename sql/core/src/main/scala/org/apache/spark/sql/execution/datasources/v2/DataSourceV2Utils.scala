@@ -19,19 +19,27 @@ package org.apache.spark.sql.execution.datasources.v2
 
 import java.util.regex.Pattern
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import com.fasterxml.jackson.databind.ObjectMapper
 
+import org.apache.spark.SparkContext
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.analysis.TimeTravelSpec
+import org.apache.spark.sql.catalyst.expressions.Literal
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
-import org.apache.spark.sql.connector.catalog.{CatalogV2Util, SessionConfigSupport, SupportsCatalogOptions, SupportsRead, Table, TableProvider}
-import org.apache.spark.sql.connector.catalog.TableCapability.BATCH_READ
-import org.apache.spark.sql.connector.expressions.TimeTravelSpec
-import org.apache.spark.sql.errors.QueryExecutionErrors
+import org.apache.spark.sql.connector.catalog.{CatalogV2Util, SessionConfigSupport, StagedTable, StagingTableCatalog, SupportsCatalogOptions, SupportsRead, Table, TableProvider}
+import org.apache.spark.sql.connector.catalog.TableCapability.{BATCH_READ, EXTERNAL_LOOKUP}
+import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
+import org.apache.spark.sql.execution.SQLExecution
+import org.apache.spark.sql.execution.command.DDLUtils
+import org.apache.spark.sql.execution.datasources.{DataSource, FileFormat}
+import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.sources.{RelationProvider, SchemaRelationProvider}
+import org.apache.spark.sql.types.{LongType, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 private[sql] object DataSourceV2Utils extends Logging {
@@ -98,17 +106,17 @@ private[sql] object DataSourceV2Utils extends Logging {
       userSpecifiedSchema: Option[StructType],
       extraOptions: CaseInsensitiveMap[String],
       source: String,
-      paths: String*): Option[DataFrame] = {
+      paths: String*): Option[LogicalPlan] = {
     val catalogManager = sparkSession.sessionState.catalogManager
-    val sessionOptions = DataSourceV2Utils.extractSessionConfigs(
-      source = provider, conf = sparkSession.sessionState.conf)
+    val conf = sparkSession.sessionState.conf
+    val sessionOptions = DataSourceV2Utils.extractSessionConfigs(provider, conf)
 
     val optionsWithPath = getOptionsWithPaths(extraOptions, paths: _*)
 
-    val finalOptions = sessionOptions.filterKeys(!optionsWithPath.contains(_)).toMap ++
+    val finalOptions = sessionOptions.filter { case (k, _) => !optionsWithPath.contains(k) } ++
       optionsWithPath.originalMap
     val dsOptions = new CaseInsensitiveStringMap(finalOptions.asJava)
-    val (table, catalog, ident) = provider match {
+    val (table, catalog, ident, timeTravelSpec) = provider match {
       case _: SupportsCatalogOptions if userSpecifiedSchema.nonEmpty =>
         throw new IllegalArgumentException(
           s"$source does not support user specified schema. Please don't specify the schema.")
@@ -123,25 +131,94 @@ private[sql] object DataSourceV2Utils extends Logging {
         val timestamp = hasCatalog.extractTimeTravelTimestamp(dsOptions)
 
         val timeTravelVersion = if (version.isPresent) Some(version.get) else None
-        val timeTravelTimestamp = if (timestamp.isPresent) Some(timestamp.get) else None
-        val timeTravel = TimeTravelSpec.create(timeTravelTimestamp, timeTravelVersion)
-        (CatalogV2Util.loadTable(catalog, ident, timeTravel).get, Some(catalog), Some(ident))
+        val timeTravelTimestamp = if (timestamp.isPresent) {
+          if (timestamp.get.forall(_.isDigit)) {
+            Some(Literal(timestamp.get.toLong, LongType))
+          } else {
+            Some(Literal(timestamp.get))
+          }
+        } else {
+          None
+        }
+        val timeTravel = TimeTravelSpec.create(
+          timeTravelTimestamp, timeTravelVersion, conf.sessionLocalTimeZone)
+        val tbl = CatalogV2Util.getTable(catalog, ident, timeTravel, options = dsOptions)
+        (tbl, Some(catalog), Some(ident), timeTravel)
       case _ =>
         // TODO: Non-catalog paths for DSV2 are currently not well defined.
         val tbl = DataSourceV2Utils.getTableFromProvider(provider, dsOptions, userSpecifiedSchema)
-        (tbl, None, None)
+        (tbl, None, None, None)
     }
     import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Implicits._
     table match {
       case _: SupportsRead if table.supports(BATCH_READ) =>
-        Option(Dataset.ofRows(
-          sparkSession,
-          DataSourceV2Relation.create(table, catalog, ident, dsOptions)))
+        Option(DataSourceV2Relation.create(table, catalog, ident, dsOptions, timeTravelSpec))
+      case _: SupportsRead if table.supports(EXTERNAL_LOOKUP) =>
+        // The V1 fallback would serve batch reads of a lookup-only table, which the table does
+        // not declare, so the provider must not offer one.
+        provider match {
+          case _: RelationProvider | _: SchemaRelationProvider | _: FileFormat |
+              _: FileDataSourceV2 =>
+            throw QueryCompilationErrors.invalidDataSourceExternalLookupError(
+              table.name(),
+              "LOOKUP_ONLY_TABLE_WITH_V1_READ",
+              Map("provider" -> provider.getClass.getName))
+          case _ =>
+        }
+        Option(ExternalLookupRelation(
+          DataSourceV2Relation.create(table, catalog, ident, dsOptions, timeTravelSpec)))
       case _ => None
     }
   }
 
-  private def getOptionsWithPaths(
+  /**
+   * Returns the table provider for the given format, or None if it cannot be found.
+   */
+  def getTableProvider(provider: String, conf: SQLConf): Option[TableProvider] = {
+    // Return earlier since `lookupDataSourceV2` may fail to resolve provider "hive" to
+    // `HiveFileFormat`, when running tests in sql/core.
+    if (DDLUtils.isHiveTable(Some(provider))) return None
+    DataSource.lookupDataSourceV2(provider, conf) match {
+      // TODO(SPARK-28396): Currently file source v2 can't work with tables.
+      case Some(p) if !p.isInstanceOf[FileDataSourceV2] => Some(p)
+      case _ => None
+    }
+  }
+
+  /** True when `provider` names a v2 source that a session catalog table can be created with. */
+  def isV2Provider(provider: String, conf: SQLConf): Boolean = {
+    getTableProvider(provider, conf).isDefined
+  }
+
+  /**
+   * True when a CREATE TABLE in the session catalog with neither USING nor STORED AS/ROW FORMAT
+   * creates a Hive serde table: `spark.sql.legacy.createHiveTableByDefault` is set, unless the
+   * statement is a CTAS that `spark.sql.hive.convertCTAS` converts.
+   */
+  def createsHiveTableByDefault(ctas: Boolean, conf: SQLConf): Boolean = {
+    conf.getConf(SQLConf.LEGACY_CREATE_HIVE_TABLE_BY_DEFAULT) && !(ctas && conf.convertCTAS)
+  }
+
+  /**
+   * The provider a CREATE TABLE in the session catalog creates the table with: the one in
+   * USING, Hive for STORED AS or ROW FORMAT, and otherwise as [[createsHiveTableByDefault]] says.
+   */
+  def createTableProvider(
+      provider: Option[String],
+      hasSerde: Boolean,
+      ctas: Boolean,
+      conf: SQLConf): String = {
+    provider.getOrElse {
+      if (hasSerde || createsHiveTableByDefault(ctas, conf)) {
+        DDLUtils.HIVE_PROVIDER
+      } else {
+        conf.defaultDataSourceName
+      }
+    }
+  }
+
+  private lazy val objectMapper = new ObjectMapper()
+  def getOptionsWithPaths(
       extraOptions: CaseInsensitiveMap[String],
       paths: String*): CaseInsensitiveMap[String] = {
     if (paths.isEmpty) {
@@ -149,8 +226,37 @@ private[sql] object DataSourceV2Utils extends Logging {
     } else if (paths.length == 1) {
       extraOptions + ("path" -> paths.head)
     } else {
-      val objectMapper = new ObjectMapper()
       extraOptions + ("paths" -> objectMapper.writeValueAsString(paths.toArray))
     }
+  }
+
+  /**
+   * If `table` is a StagedTable, commit the staged changes and report the commit metrics.
+   * Do nothing if the table is not a StagedTable.
+   */
+  def commitStagedChanges(
+      sparkContext: SparkContext, table: Table, metrics: Map[String, SQLMetric]): Unit = {
+    table match {
+      case stagedTable: StagedTable =>
+        stagedTable.commitStagedChanges()
+
+        val driverMetrics = stagedTable.reportDriverMetrics()
+        if (driverMetrics.nonEmpty) {
+          for (taskMetric <- driverMetrics) {
+            metrics.get(taskMetric.name()).foreach(_.set(taskMetric.value()))
+          }
+
+          val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
+          SQLMetrics.postDriverMetricUpdates(sparkContext, executionId, metrics.values.toSeq)
+        }
+      case _ =>
+    }
+  }
+
+  def commitMetrics(
+      sparkContext: SparkContext, tableCatalog: StagingTableCatalog): Map[String, SQLMetric] = {
+    tableCatalog.supportedCustomMetrics().map {
+      metric => metric.name() -> SQLMetrics.createV2CustomMetric(sparkContext, metric)
+    }.toMap
   }
 }

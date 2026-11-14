@@ -16,25 +16,32 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import datetime
+import decimal
+import pstats
 from typing import (
     Any,
     Callable,
+    Dict,
     List,
     Optional,
     Tuple,
+    TypedDict,
     TypeVar,
     Union,
 )
-from typing_extensions import Protocol
 
-import datetime
-import decimal
+from typing_extensions import Literal, Protocol
 
-from pyspark._typing import PrimitiveType
 import pyspark.sql.types
+from pyspark._typing import PrimitiveType
+from pyspark.profiler import CodeMapDict
 from pyspark.sql.column import Column
+from pyspark.sql.tvf_argument import TableValuedFunctionArgument
 
 ColumnOrName = Union[Column, str]
+TVFArgumentOrName = Union[TableValuedFunctionArgument, str]
+ColumnOrNameOrOrdinal = Union[Column, str, int]
 DecimalLiteral = decimal.Decimal
 DateTimeLiteral = Union[datetime.datetime, datetime.date]
 LiteralType = PrimitiveType
@@ -55,6 +62,17 @@ AtomicValue = TypeVar(
 
 RowLike = TypeVar("RowLike", List[Any], Tuple[Any, ...], pyspark.sql.types.Row)
 
+SQLBatchedUDFType = Literal[100]
+SQLArrowBatchedUDFType = Literal[101]
+SQLArrowElementwiseUDFType = Literal[102]
+SQLScalarPandasElementwiseUDFType = Literal[103]
+SQLScalarPandasIterElementwiseUDFType = Literal[104]
+SQLScalarArrowElementwiseUDFType = Literal[105]
+SQLScalarArrowIterElementwiseUDFType = Literal[106]
+SQLTableUDFType = Literal[300]
+SQLArrowTableUDFType = Literal[301]
+SQLArrowUDTFType = Literal[302]
+
 class SupportsOpen(Protocol):
     def open(self, partition_id: int, epoch_id: int) -> bool: ...
 
@@ -72,3 +90,12 @@ class UserDefinedFunctionLike(Protocol):
     def returnType(self) -> pyspark.sql.types.DataType: ...
     def __call__(self, *args: ColumnOrName) -> Column: ...
     def asNondeterministic(self) -> UserDefinedFunctionLike: ...
+
+ProfileResults = Dict[Union[int, str], Tuple[Optional[pstats.Stats], Optional[CodeMapDict]]]
+
+class ProfileResult(TypedDict, total=False):
+    perf: pstats.Stats
+    memory: CodeMapDict
+    sampling: dict
+
+ProfileResultsV2 = Dict[Union[int, str], ProfileResult]

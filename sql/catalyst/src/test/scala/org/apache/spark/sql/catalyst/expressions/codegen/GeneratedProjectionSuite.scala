@@ -26,6 +26,7 @@ import org.apache.spark.sql.catalyst.util.GenericArrayData
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * A test suite for generated projections
@@ -75,7 +76,7 @@ class GeneratedProjectionSuite extends SparkFunSuite with ExpressionEvalHelper {
     // test generated MutableProjection
     val exprs = nestedSchema.fields.zipWithIndex.map { case (f, i) =>
       BoundReference(i, f.dataType, true)
-    }
+    }.toImmutableArraySeq
     val mutableProj = GenerateMutableProjection.generate(exprs)
     val row1 = mutableProj(result)
     assert(result === row1)
@@ -126,7 +127,7 @@ class GeneratedProjectionSuite extends SparkFunSuite with ExpressionEvalHelper {
     // test generated MutableProjection
     val exprs = nestedSchema.fields.zipWithIndex.map { case (f, i) =>
       BoundReference(i, f.dataType, true)
-    }
+    }.toImmutableArraySeq
     val mutableProj = GenerateMutableProjection.generate(exprs)
     val row1 = mutableProj(result)
     assert(result === row1)
@@ -210,6 +211,33 @@ class GeneratedProjectionSuite extends SparkFunSuite with ExpressionEvalHelper {
     assert(row.getStruct(0, 1).getString(0).toString == "a")
   }
 
+  test("SPARK-57180: SafeProjection over statically non-nullable fields") {
+    // Non-nullable fields take the dead-branch-free path in GenerateSafeProjection (no
+    // setNullAt). Cover atomic, struct and array types and verify the projected values.
+    val fields = Array[DataType](
+      IntegerType,
+      StringType,
+      new StructType().add("i", IntegerType, nullable = false),
+      ArrayType(IntegerType, containsNull = false))
+    val refs = fields.zipWithIndex.map { case (dt, i) =>
+      BoundReference(i, dt, nullable = false)
+    }.toImmutableArraySeq
+
+    val safeProj = GenerateSafeProjection.generate(refs)
+    val unsafeProj = GenerateUnsafeProjection.generate(refs)
+    val input = InternalRow(
+      1,
+      UTF8String.fromString("a"),
+      InternalRow(2),
+      new GenericArrayData(Array(3, 4)))
+    val row = safeProj.apply(unsafeProj.apply(input))
+
+    assert(row.getInt(0) == 1)
+    assert(row.getUTF8String(1).toString == "a")
+    assert(row.getStruct(2, 1).getInt(0) == 2)
+    assert(row.getArray(3).toIntArray().sameElements(Array(3, 4)))
+  }
+
   test("SPARK-22699: GenerateSafeProjection should not use global variables for struct") {
     val safeProj = GenerateSafeProjection.generate(
       Seq(BoundReference(0, new StructType().add("i", IntegerType), true)))
@@ -240,7 +268,7 @@ class GeneratedProjectionSuite extends SparkFunSuite with ExpressionEvalHelper {
     // test generated MutableProjection
     val exprs = nestedSchema.fields.zipWithIndex.map { case (f, i) =>
       BoundReference(i, f.dataType, true)
-    }
+    }.toImmutableArraySeq
     val mutableProj = GenerateMutableProjection.generate(exprs)
     val row1 = mutableProj(result)
     assert(result === row1)

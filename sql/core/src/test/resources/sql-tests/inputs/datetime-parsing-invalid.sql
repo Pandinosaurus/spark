@@ -12,8 +12,6 @@ select to_timestamp('1234567', 'yyyyyyy'); -- the length of 'y' pattern must be 
 -- parsing invalid values with pattern 'D'
 select to_timestamp('366', 'D');
 select to_timestamp('9', 'DD');
--- in java 8 this case is invalid, but valid in java 11, disabled for jenkins
--- select to_timestamp('100', 'DD');
 select to_timestamp('366', 'DD');
 select to_timestamp('9', 'DDD');
 select to_timestamp('99', 'DDD');
@@ -39,3 +37,10 @@ select to_unix_timestamp("2020-01-27T20:06:11.847", "yyyy-MM-dd HH:mm:ss.SSS");
 select to_unix_timestamp("Unparseable", "yyyy-MM-dd HH:mm:ss.SSS");
 select cast("Unparseable" as timestamp);
 select cast("Unparseable" as date);
+
+-- TIME parse errors with `to_time`
+select to_time("24", "HH");
+select to_time("12:60", "HH:mm");
+select to_time("12:00:60", "HH:mm:ss");
+select to_time("Unparseable", "HH:mm:ss");
+select cast("Unparseable" as time);

@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
+import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
 import org.apache.spark.sql.catalyst.trees.TreePattern.{GROUPING_ANALYTICS, TreePattern}
@@ -41,10 +42,10 @@ trait BaseGroupingSets extends Expression with CodegenFallback {
   // this should be replaced first
   override lazy val resolved: Boolean = false
 
-  override def dataType: DataType = throw new UnsupportedOperationException
+  override def dataType: DataType = throw SparkUnsupportedOperationException()
   override def foldable: Boolean = false
   override def nullable: Boolean = true
-  override def eval(input: InternalRow): Any = throw new UnsupportedOperationException
+  override def eval(input: InternalRow): Any = throw SparkUnsupportedOperationException()
   final override val nodePatterns: Seq[TreePattern] = Seq(GROUPING_ANALYTICS)
 }
 
@@ -151,10 +152,25 @@ case class GroupingSets(
   override def selectedGroupByExprs: Seq[Seq[Expression]] = groupingSets
   // Includes the `userGivenGroupByExprs` in the children, which will be included in the final
   // GROUP BY expressions, so that `SELECT c ... GROUP BY (a, b, c) GROUPING SETS (a, b)` works.
-  override def children: Seq[Expression] = flatGroupingSets ++ userGivenGroupByExprs
+  // Note that, we must put `userGivenGroupByExprs` at the beginning, to preserve the order of
+  // grouping columns specified by users. For example, GROUP BY (a, b) GROUPING SETS (b, a), the
+  // final grouping columns should be (a, b).
+  override def children: Seq[Expression] =
+    if (SQLConf.get.groupingIdWithAppendedUserGroupByEnabled) {
+      flatGroupingSets ++ userGivenGroupByExprs
+    } else {
+      userGivenGroupByExprs ++ flatGroupingSets
+    }
+
   override protected def withNewChildrenInternal(
       newChildren: IndexedSeq[Expression]): GroupingSets =
-    super.legacyWithNewChildren(newChildren).asInstanceOf[GroupingSets]
+    if (SQLConf.get.groupingIdWithAppendedUserGroupByEnabled) {
+      super.legacyWithNewChildren(newChildren).asInstanceOf[GroupingSets]
+    } else {
+      copy(
+        userGivenGroupByExprs = newChildren.take(userGivenGroupByExprs.length),
+        flatGroupingSets = newChildren.drop(userGivenGroupByExprs.length))
+    }
 }
 
 object GroupingSets {
@@ -179,6 +195,11 @@ object GroupingSets {
   usage = """
     _FUNC_(col) - indicates whether a specified column in a GROUP BY is aggregated or
       not, returns 1 for aggregated or 0 for not aggregated in the result set.",
+  """,
+  arguments = """
+    Arguments:
+      * col - A grouping column referenced in the GROUP BY clause. It must exactly match one
+          of the grouping expressions of the query.
   """,
   examples = """
     Examples:
@@ -212,6 +233,12 @@ case class Grouping(child: Expression) extends Expression with Unevaluable
   usage = """
     _FUNC_([col1[, col2 ..]]) - returns the level of grouping, equals to
       `(grouping(c1) << (n-1)) + (grouping(c2) << (n-2)) + ... + grouping(cn)`
+  """,
+  arguments = """
+    Arguments:
+      * colN - An optional grouping column referenced in the GROUP BY clause. Zero or more
+          columns can be given; when provided, they must match the grouping columns exactly,
+          and when omitted all grouping columns are used.
   """,
   examples = """
     Examples:
@@ -251,32 +278,22 @@ object GroupingID {
   }
 }
 
-object GroupingAnalytics {
+object GroupingAnalytics extends AliasHelper {
   def unapply(exprs: Seq[Expression])
   : Option[(Seq[Seq[Expression]], Seq[Expression])] = {
-    if (!exprs.exists(_.isInstanceOf[BaseGroupingSets])) {
+    val exprsNoAlias = exprs.map(trimAliases)
+
+    if (!exprsNoAlias.exists(_.isInstanceOf[BaseGroupingSets])) {
       None
     } else {
-      val resolved = exprs.forall {
+      val resolved = exprsNoAlias.forall {
         case gs: BaseGroupingSets => gs.childrenResolved
         case other => other.resolved
       }
       if (!resolved) {
         None
       } else {
-        val groups = exprs.flatMap {
-          case gs: BaseGroupingSets => gs.groupByExprs
-          case other: Expression => other :: Nil
-        }
-        val unmergedSelectedGroupByExprs = exprs.map {
-          case gs: BaseGroupingSets => gs.selectedGroupByExprs
-          case other: Expression => Seq(Seq(other))
-        }
-        val selectedGroupByExprs = unmergedSelectedGroupByExprs.tail
-          .foldLeft(unmergedSelectedGroupByExprs.head) { (x, y) =>
-            for (a <- x; b <- y) yield a ++ b
-          }
-        Some(selectedGroupByExprs, BaseGroupingSets.distinctGroupByExprs(groups))
+        GroupingAnalyticsExtractor(exprsNoAlias)
       }
     }
   }

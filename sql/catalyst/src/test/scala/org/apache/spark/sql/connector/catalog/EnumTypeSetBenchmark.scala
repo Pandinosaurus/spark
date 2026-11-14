@@ -17,9 +17,8 @@
 package org.apache.spark.sql.connector.catalog
 
 import java.util
-import java.util.Collections
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark.benchmark.{Benchmark, BenchmarkBase}
 import org.apache.spark.sql.connector.catalog.TableCapability._
@@ -30,15 +29,15 @@ import org.apache.spark.sql.connector.catalog.TableCapability._
  * {{{
  *   1. without sbt:
  *      bin/spark-submit --class <this class> --jars <spark core test jar> <spark catalyst test jar>
- *   2. build/sbt "catalyst/test:runMain <this class>"
+ *   2. build/sbt "catalyst/Test/runMain <this class>"
  *   3. generate result:
- *      SPARK_GENERATE_BENCHMARK_FILES=1 build/sbt "catalyst/test:runMain <this class>"
+ *      SPARK_GENERATE_BENCHMARK_FILES=1 build/sbt "catalyst/Test/runMain <this class>"
  *      Results will be written to "benchmarks/EnumTypeSetBenchmark-results.txt".
  * }}}
  */
 object EnumTypeSetBenchmark extends BenchmarkBase {
 
-  def emptyHashSet(): util.Set[TableCapability] = Collections.emptySet()
+  def emptyHashSet(): util.Set[TableCapability] = util.Set.of()
 
   def emptyEnumSet(): util.Set[TableCapability] =
     util.EnumSet.noneOf(classOf[TableCapability])
@@ -106,7 +105,9 @@ object EnumTypeSetBenchmark extends BenchmarkBase {
     }
 
     benchmark.addCase("Use EnumSet") { _: Int =>
-      capabilities.foreach(enumSet.contains)
+      for (_ <- 0L until valuesPerIteration) {
+        capabilities.foreach(enumSet.contains)
+      }
     }
     benchmark.run()
   }
@@ -131,7 +132,9 @@ object EnumTypeSetBenchmark extends BenchmarkBase {
     }
 
     benchmark.addCase("Use EnumSet") { _: Int =>
-      capabilities.foreach(creatEnumSetFunctions.apply().contains)
+      for (_ <- 0L until valuesPerIteration) {
+        capabilities.foreach(creatEnumSetFunctions.apply().contains)
+      }
     }
     benchmark.run()
   }

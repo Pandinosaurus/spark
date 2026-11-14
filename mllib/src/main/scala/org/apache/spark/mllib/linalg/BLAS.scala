@@ -17,9 +17,7 @@
 
 package org.apache.spark.mllib.linalg
 
-import dev.ludovic.netlib.{BLAS => NetlibBLAS,
-                           JavaBLAS => NetlibJavaBLAS,
-                           NativeBLAS => NetlibNativeBLAS}
+import dev.ludovic.netlib.blas.{BLAS => NetlibBLAS, JavaBLAS => NetlibJavaBLAS, NativeBLAS => NetlibNativeBLAS}
 
 import org.apache.spark.internal.Logging
 
@@ -192,6 +190,32 @@ private[spark] object BLAS extends Serializable with Logging {
       kx += 1
     }
     sum
+  }
+
+  /**
+   * sum(abs(x))
+   */
+  def asum(x: Vector): Double = {
+    val values = x match {
+      case sx: SparseVector => sx.values
+      case dx: DenseVector => dx.values
+      case _ =>
+        throw new IllegalArgumentException(s"asum doesn't support vector type ${x.getClass}.")
+    }
+    getBLAS(values.length).dasum(values.length, values, 1)
+  }
+
+  /**
+   * sqrt(sum(x_i^2))
+   */
+  def nrm2(x: Vector): Double = {
+    val values = x match {
+      case sx: SparseVector => sx.values
+      case dx: DenseVector => dx.values
+      case _ =>
+        throw new IllegalArgumentException(s"nrm2 doesn't support vector type ${x.getClass}.")
+    }
+    getBLAS(values.length).dnrm2(values.length, values, 1)
   }
 
   /**

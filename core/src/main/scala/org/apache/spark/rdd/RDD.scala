@@ -25,7 +25,6 @@ import scala.io.Codec
 import scala.language.implicitConversions
 import scala.ref.WeakReference
 import scala.reflect.{classTag, ClassTag}
-import scala.util.hashing
 
 import com.clearspring.analytics.stream.cardinality.HyperLogLogPlus
 import org.apache.hadoop.io.{BytesWritable, NullWritable, Text}
@@ -38,6 +37,7 @@ import org.apache.spark.annotation.{DeveloperApi, Experimental, Since}
 import org.apache.spark.api.java.JavaRDD
 import org.apache.spark.errors.SparkCoreErrors
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.RDD_LIMIT_SCALE_UP_FACTOR
 import org.apache.spark.partial.BoundedDouble
@@ -46,11 +46,12 @@ import org.apache.spark.partial.GroupedCountEvaluator
 import org.apache.spark.partial.PartialResult
 import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.storage.{RDDBlockId, StorageLevel}
-import org.apache.spark.util.{BoundedPriorityQueue, Utils}
+import org.apache.spark.util.ArrayImplicits._
+import org.apache.spark.util.Utils
 import org.apache.spark.util.collection.{ExternalAppendOnlyMap, OpenHashMap,
   Utils => collectionUtils}
 import org.apache.spark.util.random.{BernoulliCellSampler, BernoulliSampler, PoissonSampler,
-  SamplingUtils}
+  SamplingUtils, XORShiftRandom}
 
 /**
  * A Resilient Distributed Dataset (RDD), the basic abstraction in Spark. Represents an immutable,
@@ -210,7 +211,12 @@ abstract class RDD[T: ClassTag](
    * @return This RDD.
    */
   def unpersist(blocking: Boolean = false): this.type = {
-    logInfo(s"Removing RDD $id from persistence list")
+    if (isLocallyCheckpointed) {
+      // This means its lineage has been truncated and cannot be recomputed once unpersisted.
+      logWarning(log"RDD ${MDC(RDD_ID, id)} was locally checkpointed, its lineage has been" +
+        log" truncated and cannot be recomputed after unpersisting")
+    }
+    logInfo(log"Removing RDD ${MDC(RDD_ID, id)} from persistence list")
     sc.unpersistRDD(id, blocking)
     storageLevel = StorageLevel.NONE
     this
@@ -224,14 +230,17 @@ abstract class RDD[T: ClassTag](
    * not use `this` because RDDs are user-visible, so users might have added their own locking on
    * RDDs; sharing that could lead to a deadlock.
    *
-   * One thread might hold the lock on many of these, for a chain of RDD dependencies; but
-   * because DAGs are acyclic, and we only ever hold locks for one path in that DAG, there is no
-   * chance of deadlock.
+   * One thread might hold the lock on many of these, for a chain of RDD dependencies. Deadlocks
+   * are possible if we try to lock another resource while holding the stateLock,
+   * and the lock acquisition sequence of these locks is not guaranteed to be the same.
+   * This can lead lead to a deadlock as one thread might first acquire the stateLock,
+   * and then the resource,
+   * while another thread might first acquire the resource, and then the stateLock.
    *
    * Executors may reference the shared fields (though they should never mutate them,
    * that only happens on the driver).
    */
-  private val stateLock = new Serializable {}
+  private[spark] val stateLock = new Serializable {}
 
   // Our dependencies and partitions will be gotten by calling subclass's methods below, and will
   // be overwritten when we're checkpointed
@@ -367,16 +376,68 @@ abstract class RDD[T: ClassTag](
   }
 
   /**
+   * Set (when verification is enabled) to mark this RDD's cache blocks for content-checksum + seal.
+   * Read in `getOrCompute`, it drives checksum computation at store time and is recorded on the
+   * executor-local `BlockInfo` so the read-side self-check enforces the seal on that block; at the
+   * checkpoint commit point it decides whether to seal. Travels with the RDD to executors because
+   * they need to know in advance - before storing/reading a block - whether to compute its checksum
+   * and later apply the read-side sealed-checksum self-check.
+   */
+  private[rdd] var verifyCheckpointChecksums: Boolean = false
+
+  /**
+   * Seal this RDD's checksummed blocks so every later read sees a single consistent version, even
+   * if Spark non-determinism plus speculation or stage retries materialized a partition into more
+   * than one divergent copy. The master picks one checksum value per partition, evicts the copies
+   * that disagree with it, and rejects future divergent registrations; reads then self-check
+   * against the sealed checksum. No-op unless this RDD is marked for verification. Relies on the
+   * per-replica checksums recorded by BlockManager at store time (see
+   * `SerializerManager.wrapForChecksum`).
+   *
+   * Called from `doCheckpoint`, after its `runJob` has materialized every partition (so all copies
+   * are registered by seal time) and just before lineage is cut. Because lineage is cut right
+   * after, there can be no later recompute producing a fresh, differently-`rddId`'d version to
+   * reconcile: the sealed copies are the only ones there will ever be, and if they are lost they
+   * are lost forever. With an eager checkpoint the RDD is fully materialized before any consumer
+   * reads it, so every read sees the sealed version. With a lazy checkpoint the seal still runs
+   * after the first job materializes the RDD, but reads *within that same job*, before
+   * finalization, may still observe an unsealed (possibly divergent) copy; only reads after
+   * finalization are guaranteed consistent.
+   *
+   * `verifyCheckpointChecksums` must be set before materialization starts; otherwise partitions
+   * materialized while it was still unset carry no checksum, cannot be sealed, and are reported by
+   * the warning below.
+   */
+  private[rdd] def sealCheckpointChecksums(): Unit = {
+    if (!verifyCheckpointChecksums) {
+      logWarning(log"sealCheckpointChecksums called on RDD ${MDC(RDD_ID, id)} that was not " +
+        log"marked for checksum verification; nothing to seal.")
+      return
+    }
+    val unverified = SparkEnv.get.blockManager.master.sealRddChecksums(id)
+    if (unverified > 0) {
+      // A partition with no checksum was materialized before this RDD was marked for verification
+      // (e.g. a prior persist() + action), or under a deserialized storage level.
+      logWarning(log"Content verification is enabled for RDD ${MDC(RDD_ID, id)} but " +
+        log"${MDC(NUM_PARTITIONS, unverified)} partition(s) were materialized before it was " +
+        log"marked and were left unverified.")
+    }
+  }
+
+  /**
    * Gets or computes an RDD partition. Used by RDD.iterator() when an RDD is cached.
    */
   private[spark] def getOrCompute(partition: Partition, context: TaskContext): Iterator[T] = {
     val blockId = RDDBlockId(id, partition.index)
     var readCachedBlock = true
     // This method is called on executors, so we need call SparkEnv.get instead of sc.env.
-    SparkEnv.get.blockManager.getOrElseUpdate(blockId, storageLevel, elementClassTag, () => {
-      readCachedBlock = false
-      computeOrReadCheckpoint(partition, context)
-    }) match {
+    SparkEnv.get.blockManager.getOrElseUpdateRDDBlock(
+      context.taskAttemptId(), blockId, storageLevel, elementClassTag, () => {
+        readCachedBlock = false
+        computeOrReadCheckpoint(partition, context)
+      },
+      verifySealedChecksum = verifyCheckpointChecksums
+    ) match {
       // Block hit.
       case Left(blockResult) =>
         if (readCachedBlock) {
@@ -412,14 +473,17 @@ abstract class RDD[T: ClassTag](
    */
   def map[U: ClassTag](f: T => U): RDD[U] = withScope {
     val cleanF = sc.clean(f)
-    new MapPartitionsRDD[U, T](this, (_, _, iter) => iter.map(cleanF))
+    new MapPartitionsRDD[U, T](
+      this,
+      (_, _, iter) => iter.map(cleanF),
+      preservesPartitionSizes = true)
   }
 
   /**
    *  Return a new RDD by first applying a function to all elements of this
    *  RDD, and then flattening the results.
    */
-  def flatMap[U: ClassTag](f: T => TraversableOnce[U]): RDD[U] = withScope {
+  def flatMap[U: ClassTag](f: T => IterableOnce[U]): RDD[U] = withScope {
     val cleanF = sc.clean(f)
     new MapPartitionsRDD[U, T](this, (_, _, iter) => iter.flatMap(cleanF))
   }
@@ -505,7 +569,7 @@ abstract class RDD[T: ClassTag](
     if (shuffle) {
       /** Distributes elements evenly across output partitions, starting from a random partition. */
       val distributePartition = (index: Int, items: Iterator[T]) => {
-        var position = new Random(hashing.byteswap32(index)).nextInt(numPartitions)
+        var position = new XORShiftRandom(index).nextInt(numPartitions)
         items.map { t =>
           // Note that the hash code of the key will just be the key itself. The HashPartitioner
           // will mod it with the number of total partitions.
@@ -547,7 +611,6 @@ abstract class RDD[T: ClassTag](
       s"Fraction must be nonnegative, but got ${fraction}")
 
     withScope {
-      require(fraction >= 0.0, "Negative fraction value: " + fraction)
       if (withReplacement) {
         new PartitionwiseSampledRDD[T, T](this, new PoissonSampler[T](fraction), true, seed)
       } else {
@@ -639,7 +702,8 @@ abstract class RDD[T: ClassTag](
           // this shouldn't happen often because we use a big multiplier for the initial size
           var numIters = 0
           while (samples.length < num) {
-            logWarning(s"Needed to re-sample due to insufficient sample size. Repeat #$numIters")
+            logWarning(log"Needed to re-sample due to insufficient sample size. " +
+              log"Repeat #${MDC(NUM_ITERATIONS, numIters)}")
             samples = this.sample(withReplacement, fraction, rand.nextInt()).collect()
             numIters += 1
           }
@@ -867,16 +931,22 @@ abstract class RDD[T: ClassTag](
    * @param isOrderSensitive whether or not the function is order-sensitive. If it's order
    *                         sensitive, it may return totally different result when the input order
    *                         is changed. Mostly stateful functions are order-sensitive.
+   * @param preservesPartitionSizes Whether the input function preserves the number of rows in each
+   *                                partition. This is true for 1:1 element mappings like `map`.
+   *                                Used to optimize `RDD.zipWithIndex` by counting rows on a
+   *                                cheaper ancestor RDD instead of the immediate parent.
    */
   private[spark] def mapPartitionsWithIndexInternal[U: ClassTag](
       f: (Int, Iterator[T]) => Iterator[U],
       preservesPartitioning: Boolean = false,
-      isOrderSensitive: Boolean = false): RDD[U] = withScope {
+      isOrderSensitive: Boolean = false,
+      preservesPartitionSizes: Boolean = false): RDD[U] = withScope {
     new MapPartitionsRDD(
       this,
       (_: TaskContext, index: Int, iter: Iterator[T]) => f(index, iter),
       preservesPartitioning = preservesPartitioning,
-      isOrderSensitive = isOrderSensitive)
+      isOrderSensitive = isOrderSensitive,
+      preservesPartitionSizes = preservesPartitionSizes)
   }
 
   /**
@@ -906,6 +976,38 @@ abstract class RDD[T: ClassTag](
       this,
       (_: TaskContext, index: Int, iter: Iterator[T]) => cleanedF(index, iter),
       preservesPartitioning)
+  }
+
+  /**
+   * Return a new RDD by applying an evaluator to each partition of this RDD. The given evaluator
+   * factory will be serialized and sent to executors, and each task will create an evaluator with
+   * the factory, and use the evaluator to transform the data of the input partition.
+   */
+  @DeveloperApi
+  @Since("3.5.0")
+  def mapPartitionsWithEvaluator[U: ClassTag](
+      evaluatorFactory: PartitionEvaluatorFactory[T, U]): RDD[U] = withScope {
+    mapPartitionsWithEvaluator(evaluatorFactory, false)
+  }
+
+  private[spark] def mapPartitionsWithEvaluator[U: ClassTag](
+      evaluatorFactory: PartitionEvaluatorFactory[T, U],
+      preservesPartitionSizes: Boolean): RDD[U] = withScope {
+    new MapPartitionsWithEvaluatorRDD(this, evaluatorFactory,
+      preservesPartitionSizes = preservesPartitionSizes)
+  }
+
+  /**
+   * Zip this RDD's partitions with another RDD and return a new RDD by applying an evaluator to
+   * the zipped partitions. Assumes that the two RDDs have the *same number of partitions*, but
+   * does *not* require them to have the same number of elements in each partition.
+   */
+  @DeveloperApi
+  @Since("3.5.0")
+  def zipPartitionsWithEvaluator[U: ClassTag](
+      rdd2: RDD[T],
+      evaluatorFactory: PartitionEvaluatorFactory[T, U]): RDD[U] = withScope {
+    new ZippedPartitionsWithEvaluatorRDD(this, rdd2, evaluatorFactory)
   }
 
   /**
@@ -1019,7 +1121,8 @@ abstract class RDD[T: ClassTag](
    */
   def collect(): Array[T] = withScope {
     val results = sc.runJob(this, (iter: Iterator[T]) => iter.toArray)
-    Array.concat(results: _*)
+    import org.apache.spark.util.ArrayImplicits._
+    Array.concat(results.toImmutableArraySeq: _*)
   }
 
   /**
@@ -1179,7 +1282,7 @@ abstract class RDD[T: ClassTag](
    * Aggregate the elements of each partition, and then the results for all the partitions, using
    * given combine functions and a neutral "zero value". This function can return a different result
    * type, U, than the type of this RDD, T. Thus, we need one operation for merging a T into an U
-   * and one operation for merging two U's, as in scala.TraversableOnce. Both of these functions are
+   * and one operation for merging two U's, as in scala.IterableOnce. Both of these functions are
    * allowed to modify and return their first argument instead of creating a new U to avoid memory
    * allocation.
    *
@@ -1194,8 +1297,7 @@ abstract class RDD[T: ClassTag](
     // Clone the zero value since we will also be serializing it as part of tasks
     var jobResult = Utils.clone(zeroValue, sc.env.serializer.newInstance())
     val cleanSeqOp = sc.clean(seqOp)
-    val cleanCombOp = sc.clean(combOp)
-    val aggregatePartition = (it: Iterator[T]) => it.aggregate(zeroValue)(cleanSeqOp, cleanCombOp)
+    val aggregatePartition = (it: Iterator[T]) => it.foldLeft(zeroValue)(cleanSeqOp)
     val mergeResult = (_: Int, taskResult: U) => jobResult = combOp(jobResult, taskResult)
     sc.runJob(this, aggregatePartition, mergeResult)
     jobResult
@@ -1233,7 +1335,7 @@ abstract class RDD[T: ClassTag](
       val cleanSeqOp = context.clean(seqOp)
       val cleanCombOp = context.clean(combOp)
       val aggregatePartition =
-        (it: Iterator[T]) => it.aggregate(zeroValue)(cleanSeqOp, cleanCombOp)
+        (it: Iterator[T]) => it.foldLeft(zeroValue)(cleanSeqOp)
       var partiallyAggregated: RDD[U] = mapPartitions(it => Iterator(aggregatePartition(it)))
       var numPartitions = partiallyAggregated.partitions.length
       val scale = math.max(math.ceil(math.pow(numPartitions, 1.0 / depth)).toInt, 2)
@@ -1249,18 +1351,12 @@ abstract class RDD[T: ClassTag](
         }.foldByKey(zeroValue, new HashPartitioner(curNumPartitions))(cleanCombOp).values
       }
       if (finalAggregateOnExecutor && partiallyAggregated.partitions.length > 1) {
-        // define a new partitioner that results in only 1 partition
-        val constantPartitioner = new Partitioner {
-          override def numPartitions: Int = 1
-
-          override def getPartition(key: Any): Int = 0
-        }
         // map the partially aggregated rdd into a key-value rdd
         // do the computation in the single executor with one partition
         // get the new RDD[U]
         partiallyAggregated = partiallyAggregated
           .map(v => (0.toByte, v))
-          .foldByKey(zeroValue, constantPartitioner)(cleanCombOp)
+          .foldByKey(zeroValue, new ConstantPartitioner)(cleanCombOp)
           .values
       }
       val copiedZeroValue = Utils.clone(zeroValue, sc.env.closureSerializer.newInstance())
@@ -1451,12 +1547,12 @@ abstract class RDD[T: ClassTag](
       while (buf.size < num && partsScanned < totalParts) {
         // The number of partitions to try in this iteration. It is ok for this number to be
         // greater than totalParts because we actually cap it at totalParts in runJob.
-        var numPartsToTry = 1L
+        var numPartsToTry = conf.get(RDD_LIMIT_INITIAL_NUM_PARTITIONS)
         val left = num - buf.size
         if (partsScanned > 0) {
-          // If we didn't find any rows after the previous iteration, quadruple and retry.
-          // Otherwise, interpolate the number of partitions we need to try, but overestimate
-          // it by 50%. We also cap the estimation in the end.
+          // If we didn't find any rows after the previous iteration, multiply by
+          // limitScaleUpFactor and retry. Otherwise, interpolate the number of partitions we need
+          // to try, but overestimate it by 50%. We also cap the estimation in the end.
           if (buf.isEmpty) {
             numPartsToTry = partsScanned * scaleUpFactor
           } else {
@@ -1466,7 +1562,7 @@ abstract class RDD[T: ClassTag](
           }
         }
 
-        val p = partsScanned.until(math.min(partsScanned + numPartsToTry, totalParts).toInt)
+        val p = partsScanned.until(math.min(partsScanned + numPartsToTry, totalParts))
         val res = sc.runJob(this, (it: Iterator[T]) => it.take(left).toArray, p)
 
         res.foreach(buf ++= _.take(num - buf.size))
@@ -1530,22 +1626,24 @@ abstract class RDD[T: ClassTag](
    * @return an array of top elements
    */
   def takeOrdered(num: Int)(implicit ord: Ordering[T]): Array[T] = withScope {
-    if (num == 0) {
+    if (num == 0 || this.getNumPartitions == 0) {
       Array.empty
     } else {
-      val mapRDDs = mapPartitions { items =>
-        // Priority keeps the largest elements, so let's reverse the ordering.
-        val queue = new BoundedPriorityQueue[T](num)(ord.reverse)
-        queue ++= collectionUtils.takeOrdered(items, num)(ord)
-        Iterator.single(queue)
-      }
-      if (mapRDDs.partitions.length == 0) {
-        Array.empty
-      } else {
-        mapRDDs.reduce { (queue1, queue2) =>
-          queue1 ++= queue2
-          queue1
-        }.toArray.sorted(ord)
+      this.mapPartitionsWithIndex { case (pid, iter) =>
+        if (iter.nonEmpty) {
+          // Priority keeps the largest elements, so let's reverse the ordering.
+          Iterator.single(collectionUtils.takeOrdered(iter, num)(ord).toArray)
+        } else if (pid == 0) {
+          // make sure partition 0 always returns an array to avoid reduce on empty RDD
+          Iterator.single(Array.empty[T])
+        } else {
+          Iterator.empty
+        }
+      }.reduce { (array1, array2) =>
+        val size = math.min(num, array1.length + array2.length)
+        val array = Array.ofDim[T](size)
+        collectionUtils.mergeOrdered[T](Seq(array1, array2))(ord).copyToArray(array, 0, size)
+        array
       }
     }
   }
@@ -1627,6 +1725,13 @@ abstract class RDD[T: ClassTag](
    * RDDs will be removed. This function must be called before any job has been
    * executed on this RDD. It is strongly recommended that this RDD is persisted in
    * memory, otherwise saving it on a file will require recomputation.
+   *
+   * The data is only checkpointed when `doCheckpoint()` is called, and this only happens at the
+   * end of the first action execution on this RDD. The final data that is checkpointed after the
+   * first action may be different from the data that was used during the action, due to
+   * non-determinism of the underlying operation and retries. If the purpose of the checkpoint is
+   * to achieve saving a deterministic snapshot of the data, an eager action may need to be called
+   * first on the RDD to trigger the checkpoint.
    */
   def checkpoint(): Unit = RDDCheckpointData.synchronized {
     // NOTE: we use a global lock here due to complexities downstream with ensuring
@@ -1656,10 +1761,17 @@ abstract class RDD[T: ClassTag](
    * `spark.dynamicAllocation.cachedExecutorIdleTimeout` to a high value.
    *
    * The checkpoint directory set through `SparkContext#setCheckpointDir` is not used.
+   *
+   * The data is only checkpointed when `doCheckpoint()` is called, and this only happens at the
+   * end of the first action execution on this RDD. The final data that is checkpointed after the
+   * first action may be different from the data that was used during the action, due to
+   * non-determinism of the underlying operation and retries. If the purpose of the checkpoint is
+   * to achieve saving a deterministic snapshot of the data, an eager action may need to be called
+   * first on the RDD to trigger the checkpoint.
    */
   def localCheckpoint(): this.type = RDDCheckpointData.synchronized {
-    if (conf.get(DYN_ALLOCATION_ENABLED) &&
-        conf.contains(DYN_ALLOCATION_CACHED_EXECUTOR_IDLE_TIMEOUT)) {
+    if (Utils.isDynamicAllocationEnabled(conf) &&
+      conf.contains(DYN_ALLOCATION_CACHED_EXECUTOR_IDLE_TIMEOUT)) {
       logWarning("Local checkpointing is NOT safe to use with dynamic allocation, " +
         "which removes executors along with their cached blocks. If you must use both " +
         "features, you are advised to set `spark.dynamicAllocation.cachedExecutorIdleTimeout` " +
@@ -1675,11 +1787,20 @@ abstract class RDD[T: ClassTag](
     // the storage level he/she specified to one that is appropriate for local checkpointing
     // (i.e. uses disk) to guarantee correctness.
 
-    if (storageLevel == StorageLevel.NONE) {
-      persist(LocalRDDCheckpointData.DEFAULT_STORAGE_LEVEL)
+    // Content verification only covers serialized blocks. When enabled together with the
+    // force-serialized flag, adapt the level to a serialized one so a plain localCheckpoint()
+    // (whose default level is deserialized) becomes verifiable.
+    val verifyCheckpointChecksumEnabled = conf.get(LOCAL_CHECKPOINT_VERIFY_CHECKSUM_ENABLED)
+    val forceCheckpointSerialized =
+      verifyCheckpointChecksumEnabled &&
+        conf.get(LOCAL_CHECKPOINT_VERIFY_CHECKSUM_FORCE_SERIALIZED)
+    val checkpointLevel = if (storageLevel == StorageLevel.NONE) {
+      LocalRDDCheckpointData.transformStorageLevel(
+        LocalRDDCheckpointData.DEFAULT_STORAGE_LEVEL, forceCheckpointSerialized)
     } else {
-      persist(LocalRDDCheckpointData.transformStorageLevel(storageLevel), allowOverride = true)
+      LocalRDDCheckpointData.transformStorageLevel(storageLevel, forceCheckpointSerialized)
     }
+    persist(checkpointLevel, allowOverride = true)
 
     // If this RDD is already checkpointed and materialized, its lineage is already truncated.
     // We must not override our `checkpointData` in this case because it is needed to recover
@@ -1696,6 +1817,14 @@ abstract class RDD[T: ClassTag](
         case _ =>
       }
       checkpointData = Some(new LocalRDDCheckpointData(this))
+      // Mark for checksum + seal only when the checkpoint's storage level is serialized: a
+      // deserialized level keeps in-memory objects with no bytes to checksum, so there is
+      // nothing to verify and marking would only add cost. (A deserialized default is expected,
+      // hence no warning; `...forceSerialized` above opts a default checkpoint into a serialized
+      // level so it can be verified.) `getStorageLevel` reflects the level set above.
+      if (verifyCheckpointChecksumEnabled && !getStorageLevel.deserialized) {
+        verifyCheckpointChecksums = true
+      }
     }
     this
   }
@@ -1727,7 +1856,7 @@ abstract class RDD[T: ClassTag](
   /**
    * Return whether this RDD is reliably checkpointed and materialized.
    */
-  private[rdd] def isReliablyCheckpointed: Boolean = {
+  private[spark] def isReliablyCheckpointed: Boolean = {
     checkpointData match {
       case Some(reliable: ReliableRDDCheckpointData[_]) if reliable.isCheckpointed => true
       case _ => false
@@ -1746,7 +1875,6 @@ abstract class RDD[T: ClassTag](
   }
 
   /**
-   * :: Experimental ::
    * Removes an RDD's shuffles and it's non-persisted ancestors.
    * When running without a shuffle service, cleaning up shuffle files enables downscaling.
    * If you use the RDD after this call, you should checkpoint and materialize it first.
@@ -1755,7 +1883,6 @@ abstract class RDD[T: ClassTag](
    *   * Tuning the driver GC to be more aggressive, so the regular context cleaner is triggered
    *   * Setting an appropriate TTL for shuffle files to be auto cleaned
    */
-  @Experimental
   @DeveloperApi
   @Since("3.1.0")
   def cleanShuffleDependencies(blocking: Boolean = false): Unit = {
@@ -1764,9 +1891,11 @@ abstract class RDD[T: ClassTag](
        * Clean the shuffles & all of its parents.
        */
       def cleanEagerly(dep: Dependency[_]): Unit = {
-        if (dep.isInstanceOf[ShuffleDependency[_, _, _]]) {
-          val shuffleId = dep.asInstanceOf[ShuffleDependency[_, _, _]].shuffleId
-          cleaner.doCleanupShuffle(shuffleId, blocking)
+        dep match {
+          case dependency: ShuffleDependency[_, _, _] =>
+            val shuffleId = dependency.shuffleId
+            cleaner.doCleanupShuffle(shuffleId, blocking)
+          case _ => // do nothing
         }
         val rdd = dep.rdd
         val rddDepsOpt = rdd.internalDependencies
@@ -1788,8 +1917,9 @@ abstract class RDD[T: ClassTag](
    * Please read the linked SPIP and design docs to understand the limitations and future plans.
    * @return an [[RDDBarrier]] instance that provides actions within a barrier stage
    * @see [[org.apache.spark.BarrierTaskContext]]
-   * @see <a href="https://jira.apache.org/jira/browse/SPARK-24374">SPIP: Barrier Execution Mode</a>
-   * @see <a href="https://jira.apache.org/jira/browse/SPARK-24582">Design Doc</a>
+   * @see <a href="https://issues.apache.org/jira/browse/SPARK-24374">
+   *        SPIP: Barrier Execution Mode</a>
+   * @see <a href="https://issues.apache.org/jira/browse/SPARK-24582">Design Doc</a>
    */
   @Experimental
   @Since("2.4.0")
@@ -1804,8 +1934,9 @@ abstract class RDD[T: ClassTag](
   @Experimental
   @Since("3.1.0")
   def withResources(rp: ResourceProfile): this.type = {
-    resourceProfile = Option(rp)
-    sc.resourceProfileManager.addResourceProfile(resourceProfile.get)
+    // Reuse an already-registered profile with equal resources if one exists so that equivalent
+    // profiles share a single id, allowing executors to be reused instead of newly allocated.
+    resourceProfile = Option(sc.resourceProfileManager.getOrAddEquivalentProfile(rp))
     this
   }
 
@@ -1816,7 +1947,7 @@ abstract class RDD[T: ClassTag](
    */
   @Experimental
   @Since("3.1.0")
-  def getResourceProfile(): ResourceProfile = resourceProfile.getOrElse(null)
+  def getResourceProfile(): ResourceProfile = resourceProfile.orNull
 
   // =======================================================================
   // Other internal methods and fields
@@ -1942,8 +2073,7 @@ abstract class RDD[T: ClassTag](
       val storageInfo = rdd.context.getRDDStorageInfo(_.id == rdd.id).map(info =>
         "    CachedPartitions: %d; MemorySize: %s; DiskSize: %s".format(
           info.numCachedPartitions, bytesToString(info.memSize), bytesToString(info.diskSize)))
-
-      s"$rdd [$persistence]" +: storageInfo
+      (s"$rdd [$persistence]" +: storageInfo).toImmutableArraySeq
     }
 
     // Apply a different rule to the last child
@@ -1970,7 +2100,7 @@ abstract class RDD[T: ClassTag](
     def firstDebugString(rdd: RDD[_]): Seq[String] = {
       val partitionStr = "(" + rdd.partitions.length + ")"
       val leftOffset = (partitionStr.length - 1) / 2
-      val nextPrefix = (" " * leftOffset) + "|" + (" " * (partitionStr.length - leftOffset))
+      val nextPrefix = " ".repeat(leftOffset) + "|" + " ".repeat(partitionStr.length - leftOffset)
 
       debugSelf(rdd).zipWithIndex.map{
         case (desc: String, 0) => s"$partitionStr $desc"
@@ -1984,7 +2114,7 @@ abstract class RDD[T: ClassTag](
       val nextPrefix = (
         thisPrefix
         + (if (isLastChild) "  " else "| ")
-        + (" " * leftOffset) + "|" + (" " * (partitionStr.length - leftOffset)))
+        + (" ".repeat(leftOffset)) + "|" + (" ".repeat(partitionStr.length - leftOffset)))
 
       debugSelf(rdd).zipWithIndex.map{
         case (desc: String, 0) => s"$thisPrefix+-$partitionStr $desc"
@@ -2155,6 +2285,7 @@ object RDD {
  * Note that, the output of an RDD usually relies on the parent RDDs. When the parent RDD's output
  * is INDETERMINATE, it's very likely the RDD's output is also INDETERMINATE.
  */
-private[spark] object DeterministicLevel extends Enumeration {
+@DeveloperApi
+object DeterministicLevel extends Enumeration {
   val DETERMINATE, UNORDERED, INDETERMINATE = Value
 }

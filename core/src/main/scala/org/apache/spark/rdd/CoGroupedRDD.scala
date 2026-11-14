@@ -110,7 +110,7 @@ class CoGroupedRDD[K: ClassTag](
 
   override def getPartitions: Array[Partition] = {
     val array = new Array[Partition](part.numPartitions)
-    for (i <- 0 until array.length) {
+    for (i <- array.indices) {
       // Each CoGroupPartition will have a dependency per contributing RDD
       array(i) = new CoGroupPartition(i, rdds.zipWithIndex.map { case (rdd, j) =>
         // Assume each RDD contributed a single dependency, and get it
@@ -143,7 +143,7 @@ class CoGroupedRDD[K: ClassTag](
       case shuffleDependency: ShuffleDependency[_, _, _] =>
         // Read map outputs of shuffle
         val metrics = context.taskMetrics().createTempShuffleReadMetrics()
-        val it = SparkEnv.get.shuffleManager
+        val it = SparkEnv.get.shuffleManagerFor(shuffleDependency)
           .getReader(
             shuffleDependency.shuffleHandle, split.index, split.index + 1, context, metrics)
           .read()

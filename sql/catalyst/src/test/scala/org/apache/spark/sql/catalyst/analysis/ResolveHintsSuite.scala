@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
-import org.apache.log4j.Level
+import org.apache.logging.log4j.Level
 
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.dsl.expressions._
@@ -73,8 +73,8 @@ class ResolveHintsSuite extends AnalysisTest {
   test("do not traverse past existing broadcast hints") {
     checkAnalysisWithoutViewWrapper(
       UnresolvedHint("MAPJOIN", Seq("table"),
-        ResolvedHint(table("table").where('a > 1), HintInfo(strategy = Some(BROADCAST)))),
-      ResolvedHint(testRelation.where('a > 1), HintInfo(strategy = Some(BROADCAST))).analyze,
+        ResolvedHint(table("table").where($"a" > 1), HintInfo(strategy = Some(BROADCAST)))),
+      ResolvedHint(testRelation.where($"a" > 1), HintInfo(strategy = Some(BROADCAST))).analyze,
       caseSensitive = false)
   }
 
@@ -85,7 +85,7 @@ class ResolveHintsSuite extends AnalysisTest {
       caseSensitive = false)
 
     checkAnalysisWithoutViewWrapper(
-      UnresolvedHint("MAPJOIN", Seq("tableAlias"), table("table").subquery('tableAlias)),
+      UnresolvedHint("MAPJOIN", Seq("tableAlias"), table("table").subquery("tableAlias")),
       ResolvedHint(testRelation, HintInfo(strategy = Some(BROADCAST))),
       caseSensitive = false)
 
@@ -98,8 +98,9 @@ class ResolveHintsSuite extends AnalysisTest {
 
   test("do not traverse past subquery alias") {
     checkAnalysisWithoutViewWrapper(
-      UnresolvedHint("MAPJOIN", Seq("table"), table("table").where('a > 1).subquery('tableAlias)),
-      testRelation.where('a > 1).analyze,
+      UnresolvedHint("MAPJOIN", Seq("table"), table("table").where($"a" > 1)
+        .subquery("tableAlias")),
+      testRelation.where($"a" > 1).analyze,
       caseSensitive = false)
   }
 
@@ -111,8 +112,8 @@ class ResolveHintsSuite extends AnalysisTest {
           |SELECT /*+ BROADCAST(ctetable) */ * FROM ctetable
         """.stripMargin
       ),
-      ResolvedHint(testRelation.where('a > 1).select('a), HintInfo(strategy = Some(BROADCAST)))
-        .select('a).analyze,
+      ResolvedHint(testRelation.where($"a" > 1).select($"a"), HintInfo(strategy = Some(BROADCAST)))
+        .select($"a").analyze,
       caseSensitive = false,
       inlineCTE = true)
   }
@@ -125,7 +126,7 @@ class ResolveHintsSuite extends AnalysisTest {
           |SELECT /*+ BROADCAST(table) */ * FROM ctetable
         """.stripMargin
       ),
-      testRelation.where('a > 1).select('a).select('a).analyze,
+      testRelation.where($"a" > 1).select($"a").select($"a").analyze,
       caseSensitive = false,
       inlineCTE = true)
   }
@@ -138,11 +139,17 @@ class ResolveHintsSuite extends AnalysisTest {
       UnresolvedHint("coalesce", Seq(Literal(20)), table("TaBlE")),
       Repartition(numPartitions = 20, shuffle = false, child = testRelation))
     checkAnalysisWithoutViewWrapper(
+      UnresolvedHint("coalesce", Seq(Literal(20.toByte)), table("TaBlE")),
+      Repartition(numPartitions = 20, shuffle = false, child = testRelation))
+    checkAnalysisWithoutViewWrapper(
       UnresolvedHint("REPARTITION", Seq(Literal(100)), table("TaBlE")),
       Repartition(numPartitions = 100, shuffle = true, child = testRelation))
     checkAnalysisWithoutViewWrapper(
       UnresolvedHint("RePARTITion", Seq(Literal(200)), table("TaBlE")),
       Repartition(numPartitions = 200, shuffle = true, child = testRelation))
+    checkAnalysisWithoutViewWrapper(
+      UnresolvedHint("REPARTITION", Seq(Literal(100.toShort)), table("TaBlE")),
+      Repartition(numPartitions = 100, shuffle = true, child = testRelation))
 
     val errMsg = "COALESCE Hint expects a partition number as a parameter"
 
@@ -193,7 +200,8 @@ class ResolveHintsSuite extends AnalysisTest {
         Seq(SortOrder(AttributeReference("a", IntegerType)(), Ascending)),
         testRelation, None))
 
-    val errMsg2 = "REPARTITION Hint parameter should include columns, but"
+    val errMsg2 = "REPARTITION Hint parameters should include an optional integral partitionNum " +
+      "and/or columns, but"
 
     assertAnalysisError(
       UnresolvedHint("REPARTITION", Seq(Literal(true)), table("TaBlE")),
@@ -205,8 +213,8 @@ class ResolveHintsSuite extends AnalysisTest {
         table("TaBlE")),
       Seq(errMsg2))
 
-    val errMsg3 = "REPARTITION_BY_RANGE Hint parameter should include columns, but"
-
+    val errMsg3 = "REPARTITION_BY_RANGE Hint parameters should include an optional " +
+      "integral partitionNum and/or columns, but"
     assertAnalysisError(
       UnresolvedHint("REPARTITION_BY_RANGE",
         Seq(Literal(1.0), AttributeReference("a", IntegerType)()),
@@ -236,7 +244,7 @@ class ResolveHintsSuite extends AnalysisTest {
     }
     assert(logAppender.loggingEvents.exists(
       e => e.getLevel == Level.WARN &&
-        e.getRenderedMessage.contains("Unrecognized hint: unknown_hint")))
+        e.getMessage.getFormattedMessage.contains("Unrecognized hint: unknown_hint")))
   }
 
   test("SPARK-30003: Do not throw stack overflow exception in non-root unknown hint resolution") {
@@ -299,10 +307,18 @@ class ResolveHintsSuite extends AnalysisTest {
     }
   }
 
-  test("SPARK-35786: Support optimize repartition by expression in AQE") {
+  test("SPARK-35786: Support optimize rebalance by expression in AQE") {
     checkAnalysisWithoutViewWrapper(
       UnresolvedHint("REBALANCE", Seq(UnresolvedAttribute("a")), table("TaBlE")),
       RebalancePartitions(Seq(AttributeReference("a", IntegerType)()), testRelation))
+
+    checkAnalysisWithoutViewWrapper(
+      UnresolvedHint("REBALANCE", Seq(1, UnresolvedAttribute("a")), table("TaBlE")),
+      RebalancePartitions(Seq(AttributeReference("a", IntegerType)()), testRelation, Some(1)))
+
+    checkAnalysisWithoutViewWrapper(
+      UnresolvedHint("REBALANCE", Seq(Literal(1), UnresolvedAttribute("a")), table("TaBlE")),
+      RebalancePartitions(Seq(AttributeReference("a", IntegerType)()), testRelation, Some(1)))
 
     checkAnalysisWithoutViewWrapper(
       UnresolvedHint("REBALANCE", Seq.empty, table("TaBlE")),
@@ -314,12 +330,94 @@ class ResolveHintsSuite extends AnalysisTest {
         testRelation)
 
       checkAnalysisWithoutViewWrapper(
+        UnresolvedHint("REBALANCE", Seq(1, UnresolvedAttribute("a")), table("TaBlE")),
+        testRelation)
+
+      checkAnalysisWithoutViewWrapper(
+        UnresolvedHint("REBALANCE", Seq(Literal(1), UnresolvedAttribute("a")), table("TaBlE")),
+        testRelation)
+
+      checkAnalysisWithoutViewWrapper(
         UnresolvedHint("REBALANCE", Seq.empty, table("TaBlE")),
+        testRelation)
+
+      checkAnalysisWithoutViewWrapper(
+        UnresolvedHint("REBALANCE", 1 :: Nil, table("TaBlE")),
         testRelation)
     }
 
+    val msg = "REBALANCE Hint parameters should include an optional integral partitionNum " +
+      "and/or columns, but \"1\" can not be recognized as either partitionNum or columns."
     assertAnalysisError(
-      UnresolvedHint("REBALANCE", Seq(Literal(1)), table("TaBlE")),
-      Seq("Hint parameter should include columns"))
+      UnresolvedHint("REBALANCE", Seq(Literal(1), Literal(1)), table("TaBlE")),
+      Seq(msg))
+
+    assertAnalysisError(
+      UnresolvedHint("REBALANCE", Seq(1, Literal(1)), table("TaBlE")),
+      Seq(msg))
+
+    assertAnalysisError(
+      UnresolvedHint("REBALANCE", Seq(1, Literal(Array[Byte](0, 1, 3))), table("TaBlE")),
+      Seq("X'000103'"))
+  }
+
+  test("SPARK-38410: Support specify initial partition number for rebalance") {
+    withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "3") {
+      Seq(
+        Nil -> 3,
+        Seq(Literal(1)) -> 1,
+        Seq(UnresolvedAttribute("a")) -> 3,
+        Seq(Literal(1), UnresolvedAttribute("a")) -> 1).foreach { case (param, numberPartitions) =>
+        assert(UnresolvedHint("REBALANCE", param, testRelation).analyze
+          .asInstanceOf[RebalancePartitions].partitioning.numPartitions == numberPartitions)
+      }
+    }
+  }
+
+  test("SPARK-57993: Support specify advisory partition size for rebalance") {
+    withSQLConf(SQLConf.ADVISORY_PARTITION_SIZE_IN_BYTES.key -> "1024") {
+      Seq(
+        Seq(Literal(2048)) -> Some(2048L),
+        Seq(Literal(4096L)) -> Some(4096L),
+        Seq(Literal("2k")) -> Some(2048L),
+        Seq(Literal("4k")) -> Some(4096L),
+        Seq(Literal("2k"), Literal("a")) -> Some(2048L)).foreach {
+        case (param, advisoryPartitionSize) =>
+          assert(
+            UnresolvedHint("REBALANCE_BY_SIZE", param, testRelation).analyze
+              .asInstanceOf[RebalancePartitions]
+              .optAdvisoryPartitionSize == advisoryPartitionSize)
+      }
+
+      // invalid parameters for REBALANCE_BY_SIZE hint
+      Seq(
+        Seq(Literal(-1)) -> "-1",
+        Seq(Literal(0)) -> "0",
+        Nil -> "empty",
+        Seq(Literal("a")) -> "a",
+        Seq(UnresolvedAttribute("a")) -> "a").foreach { case (params, advisoryPartitionSize) =>
+        checkError(
+          exception = intercept[AnalysisException] {
+            UnresolvedHint("REBALANCE_BY_SIZE", params, testRelation).analyze
+          },
+          condition = "INVALID_REBALANCE_BY_SIZE_HINT_PARAMETER",
+          parameters = Map(
+            "hintName" -> "REBALANCE_BY_SIZE",
+            "advisoryPartitionSize" -> advisoryPartitionSize))
+      }
+    }
+
+    // REBALANCE_BY_SIZE hint should be ignored when AQE is disabled
+    withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+      Seq(
+        Seq(Literal(2048)),
+        Seq(Literal(4096L)),
+        Seq(Literal("4k")),
+        Seq(Literal("2k"), Literal("a"))).foreach { params =>
+        checkAnalysisWithoutViewWrapper(
+          UnresolvedHint("REBALANCE_BY_SIZE", params, table("TaBlE")),
+          testRelation)
+      }
+    }
   }
 }

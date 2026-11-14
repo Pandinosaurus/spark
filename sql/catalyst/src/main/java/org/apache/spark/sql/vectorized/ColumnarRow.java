@@ -16,12 +16,17 @@
  */
 package org.apache.spark.sql.vectorized;
 
+import org.apache.spark.SparkUnsupportedOperationException;
 import org.apache.spark.annotation.Evolving;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
+import org.apache.spark.sql.catalyst.types.*;
 import org.apache.spark.sql.types.*;
 import org.apache.spark.unsafe.types.CalendarInterval;
+import org.apache.spark.unsafe.types.TimestampNanosVal;
 import org.apache.spark.unsafe.types.UTF8String;
+import org.apache.spark.unsafe.types.VariantVal;
+import org.apache.spark.unsafe.types.BinaryView;
 
 /**
  * Row abstraction in {@link ColumnVector}.
@@ -55,31 +60,42 @@ public final class ColumnarRow extends InternalRow {
         row.setNullAt(i);
       } else {
         DataType dt = data.getChild(i).dataType();
-        if (dt instanceof BooleanType) {
+        PhysicalDataType pdt = PhysicalDataType.apply(dt);
+        if (pdt instanceof PhysicalBooleanType) {
           row.setBoolean(i, getBoolean(i));
-        } else if (dt instanceof ByteType) {
+        } else if (pdt instanceof PhysicalByteType) {
           row.setByte(i, getByte(i));
-        } else if (dt instanceof ShortType) {
+        } else if (pdt instanceof PhysicalShortType) {
           row.setShort(i, getShort(i));
-        } else if (dt instanceof IntegerType || dt instanceof YearMonthIntervalType) {
+        } else if (pdt instanceof PhysicalIntegerType) {
           row.setInt(i, getInt(i));
-        } else if (dt instanceof LongType || dt instanceof DayTimeIntervalType) {
+        } else if (pdt instanceof PhysicalLongType) {
           row.setLong(i, getLong(i));
-        } else if (dt instanceof FloatType) {
+        } else if (pdt instanceof PhysicalFloatType) {
           row.setFloat(i, getFloat(i));
-        } else if (dt instanceof DoubleType) {
+        } else if (pdt instanceof PhysicalDoubleType) {
           row.setDouble(i, getDouble(i));
-        } else if (dt instanceof StringType) {
+        } else if (pdt instanceof PhysicalStringType) {
           row.update(i, getUTF8String(i).copy());
-        } else if (dt instanceof BinaryType) {
+        } else if (pdt instanceof PhysicalBinaryType) {
           row.update(i, getBinary(i));
-        } else if (dt instanceof DecimalType) {
-          DecimalType t = (DecimalType)dt;
+        } else if (pdt instanceof PhysicalBinaryViewType) {
+          row.update(i, getBinaryView(i).copy());
+        } else if (pdt instanceof PhysicalDecimalType t) {
           row.setDecimal(i, getDecimal(i, t.precision(), t.scale()), t.precision());
-        } else if (dt instanceof DateType) {
-          row.setInt(i, getInt(i));
-        } else if (dt instanceof TimestampType) {
-          row.setLong(i, getLong(i));
+        } else if (pdt instanceof PhysicalStructType t) {
+          row.update(i, getStruct(i, t.fields().length).copy());
+        } else if (pdt instanceof PhysicalArrayType) {
+          row.update(i, getArray(i).copy());
+        } else if (pdt instanceof PhysicalMapType) {
+          row.update(i, getMap(i).copy());
+        } else if (pdt instanceof PhysicalVariantType) {
+          row.update(i, getVariant(i));
+        } else if (pdt instanceof PhysicalTimestampNTZNanosType) {
+          // TimestampNanosVal is immutable, so it can be shared without copying.
+          row.update(i, getTimestampNTZNanos(i));
+        } else if (pdt instanceof PhysicalTimestampLTZNanosType) {
+          row.update(i, getTimestampLTZNanos(i));
         } else {
           throw new RuntimeException("Not implemented. " + dt);
         }
@@ -90,7 +106,7 @@ public final class ColumnarRow extends InternalRow {
 
   @Override
   public boolean anyNull() {
-    throw new UnsupportedOperationException();
+    throw SparkUnsupportedOperationException.apply();
   }
 
   @Override
@@ -133,8 +149,28 @@ public final class ColumnarRow extends InternalRow {
   }
 
   @Override
+  public BinaryView getBinaryView(int ordinal) {
+    return data.getChild(ordinal).getBinaryView(rowId);
+  }
+
+  @Override
   public CalendarInterval getInterval(int ordinal) {
     return data.getChild(ordinal).getInterval(rowId);
+  }
+
+  @Override
+  public TimestampNanosVal getTimestampNTZNanos(int ordinal) {
+    return data.getChild(ordinal).getTimestampNTZNanos(rowId);
+  }
+
+  @Override
+  public TimestampNanosVal getTimestampLTZNanos(int ordinal) {
+    return data.getChild(ordinal).getTimestampLTZNanos(rowId);
+  }
+
+  @Override
+  public VariantVal getVariant(int ordinal) {
+    return data.getChild(ordinal).getVariant(rowId);
   }
 
   @Override
@@ -154,6 +190,7 @@ public final class ColumnarRow extends InternalRow {
 
   @Override
   public Object get(int ordinal, DataType dataType) {
+    if (isNullAt(ordinal)) return null;
     if (dataType instanceof BooleanType) {
       return getBoolean(ordinal);
     } else if (dataType instanceof ByteType) {
@@ -172,27 +209,40 @@ public final class ColumnarRow extends InternalRow {
       return getUTF8String(ordinal);
     } else if (dataType instanceof BinaryType) {
       return getBinary(ordinal);
-    } else if (dataType instanceof DecimalType) {
-      DecimalType t = (DecimalType) dataType;
+    } else if (dataType instanceof DecimalType t) {
       return getDecimal(ordinal, t.precision(), t.scale());
     } else if (dataType instanceof DateType) {
       return getInt(ordinal);
     } else if (dataType instanceof TimestampType) {
       return getLong(ordinal);
+    } else if (dataType instanceof TimestampNTZType) {
+      return getLong(ordinal);
+    } else if (dataType instanceof TimestampNTZNanosType) {
+      return getTimestampNTZNanos(ordinal);
+    } else if (dataType instanceof TimestampLTZNanosType) {
+      return getTimestampLTZNanos(ordinal);
     } else if (dataType instanceof ArrayType) {
       return getArray(ordinal);
     } else if (dataType instanceof StructType) {
       return getStruct(ordinal, ((StructType)dataType).fields().length);
     } else if (dataType instanceof MapType) {
       return getMap(ordinal);
+    } else if (dataType instanceof VariantType) {
+      return getVariant(ordinal);
+    } else if (dataType instanceof UserDefinedType<?> udt) {
+      return get(ordinal, udt.sqlType());
     } else {
-      throw new UnsupportedOperationException("Datatype not supported " + dataType);
+      throw new SparkUnsupportedOperationException("_LEGACY_ERROR_TEMP_3155");
     }
   }
 
   @Override
-  public void update(int ordinal, Object value) { throw new UnsupportedOperationException(); }
+  public void update(int ordinal, Object value) {
+    throw SparkUnsupportedOperationException.apply();
+  }
 
   @Override
-  public void setNullAt(int ordinal) { throw new UnsupportedOperationException(); }
+  public void setNullAt(int ordinal) {
+    throw SparkUnsupportedOperationException.apply();
+  }
 }
